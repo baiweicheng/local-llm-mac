@@ -336,6 +336,63 @@ is later moved or deleted somewhere else, the pill stays on the card,
 greyed out and marked "missing", rather than vanishing from the
 record.
 
+## What's new in Phase 7
+
+**A quick panel: the same chat, one keystroke away.** While the
+app is running, press **⌘⇧Space** anywhere — in Safari, in Finder,
+in the middle of an email — and a small floating panel appears near
+the top of the screen. Type a question, press Return, and the answer
+streams right there in the panel. It's not a separate mini-app: a
+panel chat runs through exactly the same machinery as the main
+window (Auto routing, the lookups, the privacy check, the telemetry
+pill), against a real conversation that's saved in the sidebar,
+titled "Quick — …" after your first message. Follow-ups work in the
+panel like anywhere else. Esc, or clicking away, dismisses it;
+**Open in main window** (or **⌘Return**) brings the conversation up
+in the main window instead.
+
+**It quietly notes what you were in the middle of.** When the panel
+opens it shows small chips for the context it captured: which app
+was in front, whether the clipboard currently holds text, an image,
+or something else, and — only when the **Shared folders** switch in
+Settings is on — how many items Finder has selected. That context is
+written into the first message of a panel chat (only the copy sent
+to the model; your typed message is stored exactly as typed), so
+"resize this" or "summarize this" can mean the file you just
+selected. The capture follows the same switches as everything else:
+the clipboard chip only ever shows the *kind* of thing copied, and
+the clipboard's actual text is included only when the **Clipboard**
+switch is on; the Finder selection is read only when the Shared
+folders switch is on (and macOS will ask once for permission to let
+the app talk to Finder — declining simply means no chip, never an
+error). What's currently playing in other apps isn't captured —
+only the frontmost app's name.
+
+**Approvals still happen in the main window.** Read-only lookups
+run in the panel as usual, but if a panel chat proposes a file
+change (Phase 6), the panel shows the plan with a note — "This
+needs your approval in the main window" — and an **Open** button
+that takes you straight to it. Undoing a finished change is a
+main-window action too; the panel's plan cards render without the
+Undo button. Chips for files already created work in the panel like
+anywhere else.
+
+**Quick questions stay quick, but not throwaway.** Each time you
+summon the panel you get a fresh chat — unless you dismissed it less
+than two minutes ago, in which case it reopens the same chat so a
+thought you had mid-dismissal isn't orphaned. Opening a panel chat
+in the main window, or letting the two minutes lapse, ends the
+chain; the chat itself of course stays in the sidebar forever.
+
+**One switch controls it.** Settings has **Enable the quick panel
+(⌘⇧Space)**, on by default. Turning it off unregisters the shortcut
+immediately — while it's off, ⌘⇧Space does nothing — and turning it
+back on re-registers it, no relaunch either way. The hotkey is
+registered with macOS's Carbon hotkey service, so it needs no
+Accessibility permission. If the app isn't running, there's no
+panel — the main window is still home; the panel is an extra door,
+not a replacement.
+
 ## Good to know
 
 - The built-in model is small (~3 billion parameters). It's good at chat,
@@ -356,13 +413,17 @@ record.
   the tool runtime's on/off and permission gates, plus the
   file-action layer: proposal validation, the
   never-overwrite rule, undo planning, and the photo-resize
-  arithmetic) and never call the real model.
+  arithmetic, plus the quick panel's context rules (what the chips
+  show, what gets folded into a prompt, how a panel chat is titled,
+  and when a summon continues the last panel chat instead of
+  starting fresh)) and never call the real model.
 
 ## Where this is going
 
-This is phase 6 of a larger build (see the project plan): next come
-a global hotkey HUD (the same chat and tools, one keystroke away
-from any app), and an optional cloud tier via OpenRouter — which
-will inherit Phase 4's privacy check (and its habit of reusing the
-conversation summary instead of raw history) before anything leaves
-the Mac.
+This is phase 7 of a larger build (see the project plan): the main
+window and the quick panel are both in place — two front doors over
+one engine. Next comes an optional cloud tier via OpenRouter —
+which will inherit Phase 4's privacy check (and its habit of
+reusing the conversation summary instead of raw history) before
+anything leaves the Mac — followed by advanced tools and the final
+polish pass.

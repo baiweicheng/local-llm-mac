@@ -59,6 +59,8 @@ struct SettingsView: View {
                     Divider()
                     fileChangesSection
                     Divider()
+                    quickPanelSection
+                    Divider()
                     accessLogSection
                 }
                 .padding(16)
@@ -296,6 +298,25 @@ struct SettingsView: View {
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
+        }
+    }
+
+    // MARK: - Quick panel (Phase 7)
+
+    private var quickPanelSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Quick panel")
+                .font(.headline)
+            Text("A small floating panel you can summon from any app with ⌘⇧Space while this app is running. It starts a chat right there — the same models, lookups, and safeguards as the main window — and quietly notes what you were in the middle of: which app is in front, what kind of thing is on the clipboard, and (only with the Shared folders switch on, above) which files Finder has selected. The note is shown as chips in the panel, and the text is included with your message so \u{201C}resize this\u{201D} can mean the selected file. Two limits are built in: the clipboard's actual text is only ever included when the Clipboard switch above is on, and file changes are never approved from the panel — a proposed change waits for you in the main window. Chats started in the panel are saved in the sidebar like any other, titled \u{201C}Quick — …\u{201D}.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Toggle(isOn: $settings.hudEnabled) {
+                Text("Enable the quick panel (⌘⇧Space)")
+            }
+            Text("Turning this off unregisters the shortcut right away; turning it back on re-registers it. No relaunch needed.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 

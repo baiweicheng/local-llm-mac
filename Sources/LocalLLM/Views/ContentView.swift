@@ -19,6 +19,12 @@ import SwiftData
 /// scope and the permission center — and wires the engine's tool
 /// availability from the same live settings, so what a session may
 /// look at is always what the Settings panel shows.
+///
+/// Phase 7: it also configures the quick-panel coordinator (owned
+/// by the app as its delegate) with the same live objects, and takes
+/// "open this conversation" requests from it — both the live
+/// callback and the pending slot it drains on appear, which covers
+/// the main window having been closed when Open was pressed.
 struct ContentView: View {
     @State private var engine = ChatEngine()
     @State private var mlxStore = MLXModelStore()
@@ -27,6 +33,9 @@ struct ContentView: View {
     @State private var fileScopeStore = FileScopeStore()
     @State private var permissionCenter = PermissionCenter()
     @State private var selection: Conversation?
+    let hudCoordinator: HUDCoordinator
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         NavigationSplitView {
@@ -73,6 +82,31 @@ struct ContentView: View {
                     folderRootPaths: fileScopeStore.rootPaths,
                     fileWritingEnabled: settings.fileWritingEnabled)
             }
+            hudCoordinator.configure(
+                engine: engine,
+                settings: settings,
+                container: modelContext.container,
+                onOpenConversation: { conversationID in
+                    // Front (or recreate) the main window, then land
+                    // on the conversation — this is the path that
+                    // owns a real scene `openWindow`, so it works
+                    // even when the window was closed.
+                    openWindow(id: "main")
+                    selectConversation(id: conversationID)
+                })
+            if let pending = hudCoordinator.consumePendingOpenConversationID() {
+                selectConversation(id: pending)
+            }
+        }
+    }
+
+    /// Selects a conversation in the sidebar by id — the quick
+    /// panel's "open in the main window" lands here.
+    private func selectConversation(id: UUID) {
+        let descriptor = FetchDescriptor<Conversation>(
+            predicate: #Predicate { $0.id == id })
+        if let conversation = try? modelContext.fetch(descriptor).first {
+            selection = conversation
         }
     }
 }

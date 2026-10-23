@@ -98,6 +98,10 @@ struct PendingPlanCard: View {
 struct ActionPlanCard: View {
     let record: ActionPlanRecord
     let engine: ChatEngine
+    /// Phase 7: the quick panel renders these cards WITHOUT the Undo
+    /// button (the default keeps it) — reversing a file change is a
+    /// main-window decision, exactly like approving one.
+    var showsUndoButton: Bool = true
     @Environment(\.modelContext) private var modelContext
 
     private var busy: Bool {
@@ -122,7 +126,7 @@ struct ActionPlanCard: View {
             ForEach(record.items, id: \.action.id) { item in
                 itemRow(item)
             }
-            if record.status == .executed, !record.isUndone {
+            if showsUndoButton, record.status == .executed, !record.isUndone {
                 HStack {
                     Spacer()
                     if busy {

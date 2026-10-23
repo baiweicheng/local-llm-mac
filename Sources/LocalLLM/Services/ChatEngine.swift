@@ -125,6 +125,12 @@ final class ChatEngine {
     /// decided (approved / discarded / undone, and per-item results)
     /// without a fake user message entering the transcript.
     private var pendingOutcomeNotes: [UUID: String] = [:]
+    /// Phase 7: caller-supplied prompt prefixes waiting for the next
+    /// send in a conversation — currently the quick panel's captured
+    /// context ("you're in Safari; Finder has X selected"). Same
+    /// deal as outcome notes: part of the sent copy only, never a
+    /// stored message.
+    private var pendingPromptPrefixes: [UUID: String] = [:]
 
     // MARK: - Backends
 
@@ -453,6 +459,7 @@ final class ChatEngine {
         infoMessages[conversationID] = nil
         pendingPlans[conversationID] = nil
         pendingOutcomeNotes[conversationID] = nil
+        pendingPromptPrefixes[conversationID] = nil
         planBusyIDs.remove(conversationID)
     }
 
@@ -462,13 +469,21 @@ final class ChatEngine {
     /// then prepares the context — compacting first if needed — and
     /// streams the model's reply, saving it as an assistant message when
     /// the stream finishes (or partially, if stopped or interrupted).
+    ///
+    /// `promptPrefix` (Phase 7) is extra context folded into the sent
+    /// copy of the prompt — the quick panel's captured context — and
+    /// is never stored as part of the user's message.
     func send(text: String,
               attachments: [ImageAttachment] = [],
               in conversation: Conversation,
-              context: ModelContext) {
+              context: ModelContext,
+              promptPrefix: String? = nil) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty,
               !isResponding(conversation.id) else { return }
+        if let promptPrefix, !promptPrefix.isEmpty {
+            pendingPromptPrefixes[conversation.id] = promptPrefix
+        }
 
         let userMessage = Message(role: .user, text: trimmed,
                                   conversation: conversation)
@@ -724,6 +739,14 @@ final class ChatEngine {
         if let outcomeNote = pendingOutcomeNotes.removeValue(
             forKey: conversationID) {
             promptText = outcomeNote + "\n\n" + promptText
+        }
+
+        // Phase 7: the quick panel's captured context, supplied with
+        // the send, rides at the head of the prompt the same way —
+        // sent copy only, and the firewall scrub below covers it too.
+        if let promptPrefix = pendingPromptPrefixes.removeValue(
+            forKey: conversationID) {
+            promptText = promptPrefix + "\n\n" + promptText
         }
 
         // The firewall's second half: with the outgoing prompt fully

@@ -62,6 +62,15 @@ final class AppSettings {
         didSet { defaults.set(fileWritingEnabled, forKey: Self.fileWritingKey) }
     }
 
+    /// Phase 7: the quick panel's hotkey (⌘⇧Space). Default ON —
+    /// but stored via the object-presence check in `init`, because
+    /// `UserDefaults.bool` can't tell "never set" from "set to
+    /// false". The HUD coordinator watches this property and
+    /// (un)registers the Carbon hotkey the moment it changes.
+    var hudEnabled: Bool {
+        didSet { defaults.set(hudEnabled, forKey: Self.hudEnabledKey) }
+    }
+
     private let defaults: UserDefaults
 
     private static let localOnlyKey = "LocalLLM.localOnly.v1"
@@ -69,11 +78,16 @@ final class AppSettings {
     private static let kvCacheModeKey = "LocalLLM.kvCacheMode.v1"
     private static let visibilitySourcesKey = "LocalLLM.visibilitySources.v1"
     private static let fileWritingKey = "LocalLLM.fileWriting.v1"
+    private static let hudEnabledKey = "LocalLLM.hudEnabled.v1"
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         self.localOnly = defaults.bool(forKey: Self.localOnlyKey)
         self.fileWritingEnabled = defaults.bool(forKey: Self.fileWritingKey)
+        // Default ON: only an explicitly stored value can turn the
+        // quick panel off.
+        self.hudEnabled = defaults.object(forKey: Self.hudEnabledKey) as? Bool
+            ?? true
         self.kvCacheMode = KVCacheMode(
             storedValue: defaults.string(forKey: Self.kvCacheModeKey))
         if let stored = defaults.stringArray(forKey: Self.redactionTermsKey) {
