@@ -78,25 +78,65 @@ take a minute or two.
   on-device. Note that images use up model memory faster than text —
   each one is budgeted at roughly 400 tokens.
 
+## What's new in Phase 3
+
+Phase 3 adds a **model picker**: each chat can now run on the built-in
+model, on a bigger **local MLX model** you download, or on a **local
+server** (Ollama or LM Studio) if you run one. The picker is in the chat
+header, next to the status pill, and each chat remembers its own choice.
+Switching models mid-conversation is safe: the new model is handed the
+chat's summary plus the recent messages, so the thread carries over —
+and long chats are compacted against the new model's (usually bigger)
+memory.
+
+- **Downloading an MLX model.** Click the chip/CPU button in the chat
+  header → **Manage Models…**. Three models are listed, sized for a Mac
+  with 18 GB of memory: **Llama 3.2 3B** (small and fast, ≈1.9 GB),
+  **Llama 3.1 8B** (the balanced default, ≈4.9 GB), and **Qwen 2.5 14B**
+  (the strongest local option that fits, ≈8.4 GB), each with a
+  plain-English badge saying how it fits your Mac. **Download** fetches
+  it from Hugging Face with a progress bar (Cancel any time); downloaded
+  models show their exact size on disk and can be **deleted** from the
+  same panel. Only downloaded models appear in the picker. The first
+  time you pick an MLX model in a chat, expect it to take a little
+  while to load before the first reply.
+- **Using Ollama or LM Studio.** If you already run one of these apps,
+  this app can chat through the models they serve — no downloading
+  inside this app needed. In **Manage Models…**, the two presets are
+  already listed (Ollama at `localhost:11434`, LM Studio at
+  `localhost:1234`); **Edit** the preset to set the model name to one
+  your server actually has (for Ollama, `ollama list` in Terminal shows
+  them; for LM Studio, load a model there first). The server app must be
+  running when you send — if it isn't, the reply area tells you in plain
+  English instead of failing mysteriously. You can also **Add Server**
+  for any other app that serves the OpenAI chat API locally. Note:
+  local servers receive the *text* of your messages; image attachments
+  are understood only by the built-in and MLX models for now.
+- **Everything is still local.** MLX models run on your Mac's GPU;
+  servers are on `localhost`. The only network use in this phase is
+  downloading models you asked for.
+
 ## Good to know
 
 - The built-in model is small (~3 billion parameters). It's good at chat,
   summarizing, rewriting, and quick questions; Apple itself warns it's
   not the right tool for heavy math, coding, or factual deep-dives.
-  Bigger local models (MLX) and an optional cloud tier arrive in later
-  phases.
+  For harder work, switch the chat to a downloaded MLX model (Phase 3);
+  an optional cloud tier arrives in a later phase.
 - If you reopen an old chat after restarting the app, the model is
   re-seeded with the summary (if the chat was compacted) plus the recent
   messages, so the thread isn't lost.
 - To run the unit tests: in Xcode, **Product → Test** (⌘U). They cover
   the behind-the-scenes logic (instructions, token estimates, markdown
   splitting, context budgets, compaction planning, summary merging,
-  attachment storage) and never call the real model.
+  attachment storage, model-picker persistence, download planning,
+  server-request building, and stream parsing) and never call the real
+  model.
 
 ## Where this is going
 
-This is phase 1 of a larger build (see the project plan): local MLX
-models and a model picker next, then automatic routing with a privacy
-firewall, read-only tools that can see your files/calendar/photos locally,
-carefully-confirmed file actions, a global hotkey HUD, and an optional
-cloud tier via OpenRouter — all over this same chat window.
+This is phase 3 of a larger build (see the project plan): automatic
+routing with a privacy firewall next, then read-only tools that can see
+your files/calendar/photos locally, carefully-confirmed file actions,
+a global hotkey HUD, and an optional cloud tier via OpenRouter — all
+over this same chat window.

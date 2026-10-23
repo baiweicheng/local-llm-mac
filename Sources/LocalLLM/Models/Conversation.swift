@@ -29,6 +29,12 @@ final class Conversation {
     /// `sortedMessages`; the rest are the "live" turns a session still
     /// sees verbatim.
     var summarizedMessageCount: Int
+    /// Phase 3: which model backend this chat uses, as a
+    /// `ModelSelection` storage key ("onDevice", "mlx:<repo id>",
+    /// "endpoint:<uuid>"). Stored as a plain string so the on-disk
+    /// format stays obvious; the typed value is `modelSelection`. New
+    /// property with a default — existing stores migrate in place.
+    var modelSelectionRaw: String
     var createdAt: Date
     var updatedAt: Date
 
@@ -41,8 +47,19 @@ final class Conversation {
         self.systemInstructions = systemInstructions
         self.contextSummary = nil
         self.summarizedMessageCount = 0
+        self.modelSelectionRaw = ModelSelection.onDevice.storageKey
         self.createdAt = Date()
         self.updatedAt = Date()
+    }
+
+    /// The chat's chosen model backend. Setting it persists the choice;
+    /// the engine notices on the next send and rebuilds the chat's
+    /// session against the new backend, re-seeded with the summary and
+    /// recent turns (the Phase 2 machinery). An unrecognized stored
+    /// value reads back as the built-in model.
+    var modelSelection: ModelSelection {
+        get { ModelSelection(storageKey: modelSelectionRaw) }
+        set { modelSelectionRaw = newValue.storageKey }
     }
 
     /// Messages in the order they were written. (SwiftData relationships

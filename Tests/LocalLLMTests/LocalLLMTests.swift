@@ -323,4 +323,281 @@ final class LocalLLMTests: XCTestCase {
         XCTAssertEqual(ContextManager.tokens(
             for: ChatTurn(role: .user, text: "aaaa", attachmentCount: 2)), total - 1)
     }
+
+    // MARK: - Phase 3: model selection codec
+
+    func testModelSelectionStorageRoundTrip() {
+        XCTAssertEqual(ModelSelection.onDevice.storageKey, "onDevice")
+        XCTAssertEqual(ModelSelection(storageKey: "onDevice"), .onDevice)
+
+        let mlx = ModelSelection.mlx(
+            repoID: "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit")
+        XCTAssertEqual(mlx.storageKey,
+                       "mlx:mlx-community/Meta-Llama-3.1-8B-Instruct-4bit")
+        XCTAssertEqual(ModelSelection(storageKey: mlx.storageKey), mlx)
+
+        let endpointID = UUID()
+        let endpoint = ModelSelection.endpoint(id: endpointID)
+        XCTAssertEqual(ModelSelection(storageKey: endpoint.storageKey),
+                       endpoint)
+    }
+
+    func testModelSelectionUnknownKeysFallBackToOnDevice() {
+        // A value from a newer app version, a corrupt store, or a model
+        // reference this build doesn't understand must never strand a
+        // chat — it reads back as the built-in model.
+        XCTAssertEqual(ModelSelection(storageKey: ""), .onDevice)
+        XCTAssertEqual(ModelSelection(storageKey: "  "), .onDevice)
+        XCTAssertEqual(ModelSelection(storageKey: "mlx:"), .onDevice)
+        XCTAssertEqual(ModelSelection(storageKey: "endpoint:not-a-uuid"),
+                       .onDevice)
+        XCTAssertEqual(ModelSelection(storageKey: "cloud:gpt-99"), .onDevice)
+    }
+
+    func testModelSelectionBudgets() {
+        XCTAssertEqual(ModelSelection.onDevice.budget.windowTokens, 4_096)
+        XCTAssertEqual(ModelSelection.mlx(repoID: "x").budget.windowTokens,
+                       ContextBudget.mlxLocal.windowTokens)
+        XCTAssertEqual(
+            ModelSelection.endpoint(id: UUID()).budget.windowTokens,
+            ContextBudget.mlxLocal.windowTokens)
+    }
+
+    func testConversationPersistsModelSelection() {
+        let conversation = Conversation()
+        XCTAssertEqual(conversation.modelSelection, .onDevice)
+
+        let mlx = ModelSelection.mlx(repoID: "mlx-community/Qwen2.5-14B-Instruct-4bit")
+        conversation.modelSelection = mlx
+        XCTAssertEqual(conversation.modelSelectionRaw, mlx.storageKey)
+        XCTAssertEqual(conversation.modelSelection, mlx)
+
+        conversation.modelSelectionRaw = "endpoint:not-a-uuid"
+        XCTAssertEqual(conversation.modelSelection, .onDevice)
+    }
+
+    // MARK: - Phase 3: backend registry
+
+    func testRegistryOrderAndBudgets() {
+        let downloaded = [MLXCatalog.models[1], MLXCatalog.models[0]]
+        // Registry orders MLX rows as given (the store passes catalog
+        // order); endpoints follow in their saved order.
+        let rows = BackendRegistry.descriptors(
+            downloadedMLX: downloaded,
+            endpoints: EndpointConfig.defaultConfigs,
+            onDeviceReady: true)
+        XCTAssertEqual(rows.count, 1 + 2 + 2)
+        XCTAssertEqual(rows[0].selection, .onDevice)
+        XCTAssertEqual(rows[0].displayName, "Apple On-Device")
+        XCTAssertEqual(rows[0].budget.windowTokens, 4_096)
+        XCTAssertTrue(rows[0].isReady)
+        XCTAssertEqual(rows[1].selection, .mlx(repoID: downloaded[0].repoID))
+        XCTAssertEqual(rows[1].budget.windowTokens,
+                       ContextBudget.mlxLocal.windowTokens)
+        XCTAssertEqual(rows[3].selection,
+                       .endpoint(id: EndpointConfig.ollamaPresetID))
+        XCTAssertEqual(rows[4].displayName, "LM Studio")
+    }
+
+    func testRegistryOnDeviceReadinessAndLookup() {
+        let rows = BackendRegistry.descriptors(
+            downloadedMLX: [], endpoints: [], onDeviceReady: false)
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertFalse(rows[0].isReady)
+
+        // A selection for a model that isn't downloaded has no row.
+        let missing = BackendRegistry.descriptor(
+            for: .mlx(repoID: MLXCatalog.models[0].repoID),
+            downloadedMLX: [], endpoints: [], onDeviceReady: true)
+        XCTAssertNil(missing)
+
+        let found = BackendRegistry.descriptor(
+            for: .endpoint(id: EndpointConfig.lmStudioPresetID),
+            downloadedMLX: [],
+            endpoints: EndpointConfig.defaultConfigs,
+            onDeviceReady: true)
+        XCTAssertEqual(found?.displayName, "LM Studio")
+    }
+
+    // MARK: - Phase 3: MLX catalog & memory fit
+
+    func testCatalogTiersFitAn18GBMac() {
+        XCTAssertEqual(MLXCatalog.models.count, 3)
+        let sizes = MLXCatalog.models.map { $0.approximateBytes }
+        XCTAssertEqual(sizes, sizes.sorted()) // small → large
+        for info in MLXCatalog.models {
+            XCTAssertTrue(info.repoID.hasPrefix("mlx-community/"))
+            XCTAssertNotEqual(
+                MLXCatalog.fit(bytes: info.approximateBytes, totalMemoryGB: 18),
+                .tooBig, "\(info.displayName) should fit the target Mac")
+        }
+        XCTAssertEqual(
+            MLXCatalog.fit(bytes: MLXCatalog.models[0].approximateBytes,
+                           totalMemoryGB: 18), .comfortable)
+        XCTAssertEqual(
+            MLXCatalog.fit(bytes: MLXCatalog.models[2].approximateBytes,
+                           totalMemoryGB: 18), .fits)
+    }
+
+    func testMemoryFitThresholds() {
+        // 18 GB: comfortable up to 8.1 GB of weights, fits up to 10.8.
+        XCTAssertEqual(MLXCatalog.fit(bytes: 8_100_000_000, totalMemoryGB: 18),
+                       .comfortable)
+        XCTAssertEqual(MLXCatalog.fit(bytes: 8_100_000_001, totalMemoryGB: 18),
+                       .fits)
+        XCTAssertEqual(MLXCatalog.fit(bytes: 10_800_000_000, totalMemoryGB: 18),
+                       .fits)
+        XCTAssertEqual(MLXCatalog.fit(bytes: 10_800_000_001, totalMemoryGB: 18),
+                       .tooBig)
+        // The 14B pick does not fit an 8 GB machine.
+        XCTAssertEqual(MLXCatalog.fit(bytes: 8_400_000_000, totalMemoryGB: 8),
+                       .tooBig)
+        XCTAssertEqual(MLXCatalog.fit(bytes: 1_000_000_000, totalMemoryGB: 0),
+                       .tooBig)
+    }
+
+    func testFormatBytes() {
+        XCTAssertEqual(MLXCatalog.formatBytes(1_900_000_000), "1.9 GB")
+        XCTAssertEqual(MLXCatalog.formatBytes(4_900_000_000), "4.9 GB")
+        XCTAssertEqual(MLXCatalog.formatBytes(800_000_000), "0.8 GB")
+        XCTAssertEqual(MLXCatalog.formatBytes(50_000_000), "50 MB")
+        XCTAssertEqual(MLXCatalog.formatBytes(0), "0 MB")
+    }
+
+    func testDownloadPlannerFiltersAndSorts() {
+        let siblings = [
+            MLXDownloadPlanner.RemoteFile(path: "tokenizer.json", size: 10),
+            MLXDownloadPlanner.RemoteFile(path: "README.md", size: 5),
+            MLXDownloadPlanner.RemoteFile(path: "model.safetensors", size: 100),
+            MLXDownloadPlanner.RemoteFile(path: ".gitattributes", size: 1),
+            MLXDownloadPlanner.RemoteFile(path: "config.json", size: 2),
+        ]
+        let files = MLXDownloadPlanner.filesToDownload(from: siblings)
+        XCTAssertEqual(files.map { $0.path },
+                       ["config.json", "model.safetensors", "tokenizer.json"])
+        XCTAssertEqual(MLXDownloadPlanner.totalBytes(of: files), 112)
+        XCTAssertEqual(MLXCatalog.models[0].directoryName,
+                       "mlx-community--Llama-3.2-3B-Instruct-4bit")
+    }
+
+    func testDownloadPlannerParsesFileList() {
+        let json = """
+            {"id": "mlx-community/X", "siblings": [
+              {"rfilename": "config.json", "size": 42},
+              {"rfilename": "model.safetensors"},
+              {"size": 9}
+            ]}
+            """
+        let files = MLXDownloadPlanner.parseFileList(jsonData: Data(json.utf8))
+        XCTAssertEqual(files?.count, 2)
+        XCTAssertEqual(files?[0],
+                       MLXDownloadPlanner.RemoteFile(path: "config.json", size: 42))
+        XCTAssertEqual(files?[1].size, 0) // size absent → 0, not a failure
+        XCTAssertNil(MLXDownloadPlanner.parseFileList(
+            jsonData: Data("not json".utf8)))
+        XCTAssertNil(MLXDownloadPlanner.parseFileList(
+            jsonData: Data("{}".utf8)))
+    }
+
+    // MARK: - Phase 3: endpoint configs
+
+    func testEndpointPresets() {
+        let ollama = EndpointConfig.ollamaPreset
+        XCTAssertEqual(ollama.baseURL, "http://localhost:11434/v1")
+        XCTAssertEqual(ollama.chatCompletionsURL?.absoluteString,
+                       "http://localhost:11434/v1/chat/completions")
+        XCTAssertEqual(ollama.hostDescription, "localhost:11434")
+        XCTAssertEqual(ollama.pickerDetail, "llama3.1 · localhost:11434")
+
+        let lmStudio = EndpointConfig.lmStudioPreset
+        XCTAssertEqual(lmStudio.chatCompletionsURL?.absoluteString,
+                       "http://localhost:1234/v1/chat/completions")
+        XCTAssertEqual(lmStudio.pickerDetail, "localhost:1234")
+
+        // A trailing slash on the base URL doesn't double the slash.
+        var sloppy = ollama
+        sloppy.baseURL = "http://localhost:11434/v1/"
+        XCTAssertEqual(sloppy.chatCompletionsURL?.absoluteString,
+                       "http://localhost:11434/v1/chat/completions")
+        sloppy.baseURL = "   "
+        XCTAssertNil(sloppy.chatCompletionsURL)
+    }
+
+    func testEndpointConfigCodecRoundTrip() {
+        let configs = EndpointConfig.defaultConfigs
+        let data = EndpointConfigCodec.encode(configs)
+        XCTAssertEqual(EndpointConfigCodec.decode(data), configs)
+        XCTAssertEqual(EndpointConfigCodec.decode(nil), [])
+        XCTAssertEqual(EndpointConfigCodec.decode(Data()), [])
+        XCTAssertEqual(EndpointConfigCodec.decode(Data("junk".utf8)), [])
+    }
+
+    // MARK: - Phase 3: endpoint request building
+
+    func testRequestBuilderMessageOrder() {
+        let history = [ChatMessagePayload(role: "user", content: "hi"),
+                       ChatMessagePayload(role: "assistant", content: "hello")]
+        let messages = OpenAIRequestBuilder.messages(
+            instructions: "Be brief.", history: history,
+            newUserMessage: "next?")
+        XCTAssertEqual(messages.map { $0.role },
+                       ["system", "user", "assistant", "user"])
+        XCTAssertEqual(messages.first?.content, "Be brief.")
+        XCTAssertEqual(messages.last?.content, "next?")
+
+        // Empty instructions → no system message at all.
+        let noSystem = OpenAIRequestBuilder.messages(
+            instructions: "  ", history: [], newUserMessage: "hey")
+        XCTAssertEqual(noSystem, [ChatMessagePayload(role: "user", content: "hey")])
+    }
+
+    func testRequestBodyJSON() throws {
+        let body = OpenAIRequestBuilder.bodyData(
+            model: "llama3.1", instructions: "Be brief.", history: [],
+            newUserMessage: "hey")
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertEqual(object["model"] as? String, "llama3.1")
+        XCTAssertEqual(object["stream"] as? Bool, true)
+        let messages = try XCTUnwrap(object["messages"] as? [[String: String]])
+        XCTAssertEqual(messages.count, 2)
+        XCTAssertEqual(messages[0]["role"], "system")
+        XCTAssertEqual(messages[1]["content"], "hey")
+    }
+
+    // MARK: - Phase 3: SSE parsing
+
+    func testSSEAccumulatorContentDeltas() {
+        var accumulator = SSEAccumulator()
+        // Role-only first chunk: no content piece.
+        XCTAssertNil(accumulator.consume(
+            line: #"data: {"choices":[{"delta":{"role":"assistant"}}]}"#))
+        XCTAssertEqual(accumulator.consume(
+            line: #"data: {"choices":[{"delta":{"content":"Hello"}}]}"#),
+            "Hello")
+        XCTAssertEqual(accumulator.consume(
+            line: #"data: {"choices":[{"delta":{"content":" world"}}]}"#),
+            "Hello world")
+        XCTAssertEqual(accumulator.text, "Hello world")
+        XCTAssertFalse(accumulator.isDone)
+        // The [DONE] marker flips isDone and yields nothing.
+        XCTAssertNil(accumulator.consume(line: "data: [DONE]"))
+        XCTAssertTrue(accumulator.isDone)
+    }
+
+    func testSSEAccumulatorIgnoresJunk() {
+        var accumulator = SSEAccumulator()
+        XCTAssertNil(accumulator.consume(line: ""))
+        XCTAssertNil(accumulator.consume(line: ": keep-alive"))
+        XCTAssertNil(accumulator.consume(line: "event: message"))
+        XCTAssertNil(accumulator.consume(line: "data: {not json"))
+        XCTAssertNil(accumulator.consume(
+            line: #"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#))
+        XCTAssertEqual(accumulator.text, "")
+        // An explicitly empty content piece is real and returns the
+        // (unchanged) accumulated text rather than nil.
+        accumulator.consume(line: #"data: {"choices":[{"delta":{"content":"x"}}]}"#)
+        XCTAssertEqual(accumulator.consume(
+            line: #"data: {"choices":[{"delta":{"content":""}}]}"#), "x")
+    }
 }

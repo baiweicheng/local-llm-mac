@@ -3,21 +3,33 @@ import FoundationModels
 import Observation
 import SwiftData
 
-/// Runs conversations against the on-device model.
+/// Runs conversations against the model backend each chat has picked.
 ///
-/// One `LanguageModelSession` per conversation, kept alive for as long as
-/// the app runs — that's what gives the model memory within a conversation.
-/// A session's memory is finite (4,096 tokens), so Phase 2 manages it for
-/// real (see `ContextManager`):
+/// Phase 3 shape: the engine no longer talks to the on-device model
+/// directly. Every chat has a `ModelSelection` (built-in model, a
+/// downloaded MLX model, or a local server); a provider closure —
+/// configured by the app from the live model/server stores — resolves
+/// it to a `ModelBackend`, and the backend makes the live session. The
+/// Phase 2 machinery is unchanged in spirit and mostly in code:
 ///
-/// - Before each send, the conversation is checked against its context
-///   budget. If it no longer fits, the oldest turns are folded into a
-///   running summary — written by the on-device model itself — and the
-///   session is rebuilt, seeded with [summary + recent turns verbatim].
-/// - A session is also rebuilt when the chat's instructions change, and
-///   after an app relaunch (seeded from storage the same way).
-/// - Stored messages are never deleted by any of this. The summary lives
-///   on the `Conversation` record; the transcript the user sees is whole.
+/// - One live session per conversation, kept while the app runs.
+/// - Before each send, the conversation is planned against the
+///   *selected backend's* context budget; if it no longer fits, the
+///   oldest turns are folded into a running summary and the session is
+///   rebuilt, seeded with [summary + recent turns verbatim].
+/// - Switching the picker mid-conversation retires the session; the
+///   next send rebuilds it against the new backend and re-seeds it the
+///   same way, so the thread carries over and the new budget applies.
+///   (Framework backends could swap via Dynamic Profiles, but local
+///   servers aren't framework sessions — one rebuild path for every
+///   backend keeps switching behavior identical. See the README.)
+/// - Summaries are always written by the built-in on-device model,
+///   whatever backend the chat uses: it's a background chore the small
+///   model is good at, and it keeps compaction working even for a chat
+///   pointed at a server that's down. A mechanical fallback covers the
+///   on-device model being unavailable.
+/// - Stored messages are never deleted. The summary lives on the
+///   `Conversation` record; the transcript the user sees is whole.
 ///
 /// All state here is main-actor: the UI reads `streamingText`,
 /// `respondingIDs`, and `errorMessages` directly.
@@ -35,24 +47,39 @@ final class ChatEngine {
     /// Last error per conversation, in plain English, shown as a banner.
     var errorMessages: [UUID: String] = [:]
 
+    // MARK: - Backends
+
+    /// Resolves a chat's stored selection to a live backend. Configured
+    /// by the app shell from the MLX store and the server store; until
+    /// then (and for anything unknown) everything resolves to the
+    /// built-in model, which is exactly Phase 1–2 behavior.
+    private var backendProvider: (ModelSelection) -> ResolvedBackend = { _ in
+        ResolvedBackend(backend: OnDeviceBackend(),
+                        effectiveSelection: .onDevice)
+    }
+
+    func configureBackendProvider(
+        _ provider: @escaping (ModelSelection) -> ResolvedBackend
+    ) {
+        backendProvider = provider
+    }
+
     // MARK: - Sessions
 
-    private var sessions: [UUID: LanguageModelSession] = [:]
-    /// The instructions each live session was created with, so an edit in
-    /// the UI can retire the stale session instead of surprising the model.
-    private var sessionInstructions: [UUID: String] = [:]
-    /// The conversation summary each live session's context reflects
-    /// ("" when none), so a compaction retires the stale session.
-    private var sessionSummaries: [UUID: String] = [:]
-    /// Whether the live session has been seeded with the stored context
-    /// (summary + live turns). A brand-new chat needs no seed; a rebuilt
-    /// or relaunched one does, with its first prompt.
-    private var sessionSeeded: [UUID: Bool] = [:]
-    private var tasks: [UUID: Task<Void, Never>] = [:]
+    /// A conversation's live session and everything needed to know
+    /// whether it can be reused for the next send: which backend made
+    /// it, the instructions it was created with, the summary its
+    /// context reflects, and whether it has been seeded.
+    private struct LiveSession {
+        let session: ChatSession
+        let selection: ModelSelection
+        let instructions: String
+        let summaryKey: String
+        let seeded: Bool
+    }
 
-    /// The budget all Phase 2 sends plan against. Later phases pick the
-    /// row matching the selected backend (see `ContextBudget.table`).
-    private let budget = ContextBudget.onDevice
+    private var liveSessions: [UUID: LiveSession] = [:]
+    private var tasks: [UUID: Task<Void, Never>] = [:]
 
     func isResponding(_ conversationID: UUID) -> Bool {
         respondingIDs.contains(conversationID)
@@ -110,14 +137,27 @@ final class ChatEngine {
         }
     }
 
-    /// Compaction (if the plan calls for it), session selection, and the
-    /// streaming call itself. Runs inside the send task, so Stop cancels
-    /// it at any stage.
+    /// Backend resolution, compaction (if the plan calls for it),
+    /// session selection, and the streaming call itself. Runs inside
+    /// the send task, so Stop cancels it at any stage.
     private func prepareAndStream(conversation: Conversation,
                                   context: ModelContext) async {
         let conversationID = conversation.id
         let instructions = PromptHistory.mergedInstructions(
             userInstructions: conversation.systemInstructions)
+
+        let resolved = backendProvider(conversation.modelSelection)
+        let backend = resolved.backend
+        let selection = resolved.effectiveSelection
+        let budget = backend.budget
+        if selection != conversation.modelSelection {
+            // The picked model is gone (deleted MLX model, removed
+            // server). The chat falls back to the built-in model —
+            // say so once, here, rather than silently switching.
+            errorMessages[conversationID] =
+                "The model this chat was using isn't available anymore, "
+                + "so it switched back to the built-in on-device model."
+        }
 
         let stored = conversation.sortedMessages
         guard let lastMessage = stored.last,
@@ -146,15 +186,22 @@ final class ChatEngine {
         var passes = 0
         while plan.needsCompaction, passes < 4 {
             passes += 1
+            // The summarizer is the on-device model (4K window) even
+            // when the chat's backend is bigger, so cap each chunk to
+            // what the summarizer can actually read; later passes fold
+            // the rest.
+            let chunk = summarizerChunk(plan.turnsToSummarize,
+                                        existingSummary: conversation.contextSummary)
             let newSummary = await summarize(
                 existingSummary: conversation.contextSummary,
-                turns: plan.turnsToSummarize)
+                turns: chunk,
+                targetTokens: budget.summaryTargetTokens)
             if Task.isCancelled {
                 finish(conversationID: conversationID)
                 return
             }
             conversation.contextSummary = newSummary
-            conversation.summarizedMessageCount += plan.turnsToSummarize.count
+            conversation.summarizedMessageCount += chunk.count
             conversation.updatedAt = Date()
             try? context.save()
             retireSession(conversationID) // its context is now stale
@@ -165,22 +212,24 @@ final class ChatEngine {
                                        newPrompt: newPromptTurn)
         }
 
-        // Session selection and seeding.
+        // Session selection and seeding. A live session is reused only
+        // when backend, instructions, and summary all still match —
+        // anything else (first send, picker switch, instructions edit,
+        // compaction, relaunch) rebuilds and re-seeds.
         let summaryKey = conversation.contextSummary ?? ""
-        let canReuse = sessions[conversationID] != nil
-            && sessionInstructions[conversationID] == instructions
-            && sessionSummaries[conversationID] == summaryKey
-            && sessionSeeded[conversationID] == true
+        let existing = liveSessions[conversationID]
+        let canReuse = existing != nil
+            && existing!.selection == selection
+            && existing!.instructions == instructions
+            && existing!.summaryKey == summaryKey
+            && existing!.seeded
 
-        let session: LanguageModelSession
+        let session: ChatSession
         var promptText = lastMessage.text
-        if canReuse, let existing = sessions[conversationID] {
-            session = existing
+        if canReuse, let existing {
+            session = existing.session
         } else {
-            session = LanguageModelSession(instructions: instructions)
-            sessions[conversationID] = session
-            sessionInstructions[conversationID] = instructions
-            sessionSummaries[conversationID] = summaryKey
+            session = backend.makeSession(instructions: instructions)
             // The fresh session knows nothing yet: prepend the stored
             // context (summary + live turns) to this prompt. For a
             // brand-new chat the seed is empty and the prompt stands
@@ -191,12 +240,16 @@ final class ChatEngine {
             if !seed.isEmpty {
                 promptText = seed + "\n\n" + lastMessage.text
             }
-            sessionSeeded[conversationID] = true
+            liveSessions[conversationID] = LiveSession(
+                session: session, selection: selection,
+                instructions: instructions, summaryKey: summaryKey,
+                seeded: true)
         }
 
-        // Streaming. Images ride along as file attachments in the
-        // prompt; the temporary files must outlive the stream, so they
-        // are deleted only after it finishes.
+        // Streaming. Images ride along as temporary files (framework
+        // backends read them; local servers get the text only), and the
+        // files must outlive the stream, so they are deleted only after
+        // it finishes.
         let imageFiles = writeTemporaryImages(lastMessage.attachments)
         defer {
             if let dir = imageFiles.directory {
@@ -206,20 +259,11 @@ final class ChatEngine {
 
         var received = ""
         do {
-            if imageFiles.urls.isEmpty {
-                let stream = session.streamResponse(to: promptText)
-                for try await partial in stream {
-                    received = partial.content
-                    streamingText[conversationID] = received
-                }
-            } else {
-                let stream = session.streamResponse(
-                    to: multimodalPrompt(text: promptText,
-                                         imageURLs: imageFiles.urls))
-                for try await partial in stream {
-                    received = partial.content
-                    streamingText[conversationID] = received
-                }
+            let request = ChatReplyRequest(promptText: promptText,
+                                           imageURLs: imageFiles.urls)
+            for try await text in session.streamReply(to: request) {
+                received = text
+                streamingText[conversationID] = received
             }
         } catch is CancellationError {
             // Stopped by the user — whatever arrived is kept below.
@@ -241,15 +285,40 @@ final class ChatEngine {
 
     // MARK: - Compaction helpers
 
-    /// One summarization pass with a throwaway session. On any failure,
-    /// falls back to the mechanical summary so compaction — and the send
-    /// that triggered it — still succeeds.
+    /// The prefix of `turns` that fits the summarizer's own window.
+    /// The summarizer runs on the on-device model (4,096 tokens) even
+    /// for chats on bigger backends, so a pass planned against a large
+    /// budget is folded in a few chunks. Always at least one turn, so
+    /// compaction always makes progress.
+    private func summarizerChunk(_ turns: [ChatTurn],
+                                 existingSummary: String?) -> [ChatTurn] {
+        let summarizerBudget = ContextBudget.onDevice
+        let summaryTokens = existingSummary.map {
+            PromptHistory.approximateTokenCount(for: $0)
+        } ?? 0
+        let allowance = summarizerBudget.promptAllowanceTokens
+            - summaryTokens - ContextManager.summarizerOverheadTokens
+        var used = 0
+        var kept = 0
+        for turn in turns {
+            let cost = ContextManager.tokens(for: turn)
+            if kept > 0, used + cost > allowance { break }
+            used += cost
+            kept += 1
+        }
+        return Array(turns.prefix(max(1, kept)))
+    }
+
+    /// One summarization pass with a throwaway on-device session. On
+    /// any failure, falls back to the mechanical summary so compaction
+    /// — and the send that triggered it — still succeeds.
     private func summarize(existingSummary: String?,
-                           turns: [ChatTurn]) async -> String {
+                           turns: [ChatTurn],
+                           targetTokens: Int) async -> String {
         let input = ContextManager.summarizerInput(
             existingSummary: existingSummary,
             turns: turns,
-            targetTokens: budget.summaryTargetTokens)
+            targetTokens: targetTokens)
         let session = LanguageModelSession(
             instructions: ContextManager.summarizerInstructions)
         do {
@@ -265,10 +334,7 @@ final class ChatEngine {
     }
 
     private func retireSession(_ conversationID: UUID) {
-        sessions[conversationID] = nil
-        sessionInstructions[conversationID] = nil
-        sessionSummaries[conversationID] = nil
-        sessionSeeded[conversationID] = nil
+        liveSessions[conversationID] = nil
     }
 
     private func finish(conversationID: UUID) {
@@ -279,23 +345,10 @@ final class ChatEngine {
 
     // MARK: - Image attachments
 
-    /// Builds the multimodal prompt: the text, then one `Attachment` per
-    /// image file — the framework's documented route for image input
-    /// (macOS 27). The framework reads the files itself, so they must
-    /// outlive the stream; the caller deletes them afterwards.
-    private func multimodalPrompt(text: String, imageURLs: [URL]) -> Prompt {
-        Prompt {
-            text
-            for url in imageURLs {
-                Attachment(imageURL: url)
-            }
-        }
-    }
-
-    /// Writes a message's stored images to a private temporary folder so
-    /// they can be handed to the model as file URLs. Images that fail to
-    /// write are skipped; if none can be written, the caller falls back
-    /// to a text-only prompt.
+    /// Writes a message's stored images to a private temporary folder
+    /// so they can be handed to the model as file URLs. Images that
+    /// fail to write are skipped; if none can be written, the send
+    /// falls back to a text-only prompt.
     private func writeTemporaryImages(
         _ attachments: [ImageAttachment]
     ) -> (urls: [URL], directory: URL?) {

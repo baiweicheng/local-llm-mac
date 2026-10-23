@@ -3,17 +3,21 @@ import SwiftData
 import AppKit
 import UniformTypeIdentifiers
 
-/// The chat pane: header with model status, the message list, and the
-/// composer. Return sends, Shift+Return adds a line. Images can be
-/// attached with the paperclip button, by dragging files into the
-/// window, or by pasting (⌘V) while the composer is focused.
+/// The chat pane: header with the Phase 3 model picker and model
+/// status, the message list, and the composer. Return sends,
+/// Shift+Return adds a line. Images can be attached with the paperclip
+/// button, by dragging files into the window, or by pasting (⌘V) while
+/// the composer is focused.
 struct ChatView: View {
     @Bindable var conversation: Conversation
     let engine: ChatEngine
+    let mlxStore: MLXModelStore
+    let endpointStore: EndpointStore
     @Environment(\.modelContext) private var modelContext
 
     @State private var input = ""
     @State private var showingInstructions = false
+    @State private var showingModels = false
     @State private var showingFileImporter = false
     /// Images staged in the composer, waiting to go with the next send.
     @State private var pendingAttachments: [ImageAttachment] = []
@@ -35,8 +39,10 @@ struct ChatView: View {
             if let error = engine.errorMessages[conversationID] {
                 errorBanner(error)
             }
-            if !availability.canChat {
+            if conversation.modelSelection.isOnDevice, !availability.canChat {
                 availabilityBanner
+            } else if selectedDescriptor == nil {
+                modelMissingBanner
             }
             Divider()
             composer
@@ -44,6 +50,9 @@ struct ChatView: View {
         .onAppear { availability = .current }
         .sheet(isPresented: $showingInstructions) {
             instructionsSheet
+        }
+        .sheet(isPresented: $showingModels) {
+            ModelsView(mlxStore: mlxStore, endpointStore: endpointStore)
         }
         .fileImporter(isPresented: $showingFileImporter,
                       allowedContentTypes: [.image],
@@ -71,7 +80,8 @@ struct ChatView: View {
             Text(contextMeterText)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            availabilityPill
+            modelPicker
+            statusPill
             Button {
                 showingInstructions = true
             } label: {
@@ -84,18 +94,89 @@ struct ChatView: View {
         .padding(.vertical, 9)
     }
 
-    private var availabilityPill: some View {
-        HStack(spacing: 5) {
+    // MARK: - Model picker (Phase 3)
+
+    /// Every backend this chat could use right now: the built-in model,
+    /// each downloaded MLX model, and each configured local server.
+    private var descriptors: [BackendDescriptor] {
+        BackendRegistry.descriptors(
+            downloadedMLX: mlxStore.downloadedModels,
+            endpoints: endpointStore.configs,
+            onDeviceReady: availability.canChat)
+    }
+
+    /// The row for this chat's current selection — nil when the model
+    /// it points at was deleted or removed.
+    private var selectedDescriptor: BackendDescriptor? {
+        descriptors.first { $0.selection == conversation.modelSelection }
+    }
+
+    /// Whether the selected backend can take a message right now. For
+    /// the built-in model this is the Apple Intelligence state; a local
+    /// server counts as ready when configured (whether it's running is
+    /// only known at send time, and the error then says so).
+    private var canChatWithSelection: Bool {
+        selectedDescriptor?.isReady ?? false
+    }
+
+    private var modelPicker: some View {
+        Menu {
+            ForEach(descriptors) { descriptor in
+                Button {
+                    pickModel(descriptor.selection)
+                } label: {
+                    if descriptor.selection == conversation.modelSelection {
+                        Label(descriptor.displayName, systemImage: "checkmark")
+                    } else {
+                        Text(descriptor.displayName)
+                    }
+                }
+            }
+            Divider()
+            Button {
+                showingModels = true
+            } label: {
+                Label("Manage Models…", systemImage: "cpu")
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "cpu")
+                Text(selectedDescriptor?.displayName ?? "Choose a model")
+                    .font(.callout)
+                    .lineLimit(1)
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.caption2)
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Choose which model this chat uses")
+    }
+
+    private func pickModel(_ selection: ModelSelection) {
+        guard selection != conversation.modelSelection else { return }
+        conversation.modelSelection = selection
+        conversation.updatedAt = Date()
+        try? modelContext.save()
+    }
+
+    /// Status pill for the selected backend: the Apple Intelligence
+    /// state for the built-in model, the model's name for the others.
+    private var statusPill: some View {
+        let onDevice = conversation.modelSelection.isOnDevice
+        return HStack(spacing: 5) {
             Circle()
-                .fill(availability.canChat ? Color.green : Color.orange)
+                .fill(canChatWithSelection ? Color.green : Color.orange)
                 .frame(width: 8, height: 8)
-            Text(availability.headline)
+            Text(onDevice ? availability.headline
+                         : (selectedDescriptor?.displayName ?? "Model unavailable"))
                 .font(.caption)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 3)
         .background(Color.secondary.opacity(0.12), in: Capsule())
-        .help(availability.explanation)
+        .help(onDevice ? availability.explanation
+                       : (selectedDescriptor?.detail ?? ""))
     }
 
     /// A rough "how full is the model's memory" meter. The estimate is
@@ -113,7 +194,9 @@ struct ChatView: View {
         if let summary = conversation.contextSummary {
             used += PromptHistory.approximateTokenCount(for: summary)
         }
-        return "≈ \(used) / \(ContextBudget.onDevice.windowTokens) tokens"
+        let window = selectedDescriptor?.budget.windowTokens
+            ?? ContextBudget.onDevice.windowTokens
+        return "≈ \(used) / \(window) tokens"
     }
 
     // MARK: - Messages
@@ -166,7 +249,7 @@ struct ChatView: View {
                 .foregroundStyle(.secondary)
             Text("Ask anything")
                 .font(.title3)
-            Text("This chat runs on the model built into your Mac. Nothing you type leaves the machine.")
+            Text(emptyStateText)
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -200,6 +283,25 @@ struct ChatView: View {
         }
         .padding(10)
         .background(Color.orange.opacity(0.15))
+    }
+
+    private var emptyStateText: String {
+        if conversation.modelSelection.isOnDevice {
+            return "This chat runs on the model built into your Mac. Nothing you type leaves the machine."
+        }
+        let name = selectedDescriptor?.displayName ?? "a local model"
+        return "This chat runs on \(name), on this Mac. Nothing you type leaves the machine."
+    }
+
+    private var modelMissingBanner: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "info.circle")
+            Text("The model this chat was using isn't available anymore — it was deleted or removed. Pick a model in the header to keep chatting.")
+                .font(.callout)
+            Spacer()
+        }
+        .padding(10)
+        .background(Color.yellow.opacity(0.15))
     }
 
     private var availabilityBanner: some View {
@@ -262,7 +364,7 @@ struct ChatView: View {
                             .font(.title2)
                     }
                     .buttonStyle(.borderless)
-                    .disabled(!availability.canChat || !canSend)
+                    .disabled(!canChatWithSelection || !canSend)
                     .help("Send (Return)")
                 }
             }
@@ -306,7 +408,7 @@ struct ChatView: View {
     }
 
     private func send() {
-        guard availability.canChat, !isResponding, canSend else { return }
+        guard canChatWithSelection, !isResponding, canSend else { return }
         let text = input
         let attachments = pendingAttachments
         input = ""
