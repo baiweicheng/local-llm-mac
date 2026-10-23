@@ -58,13 +58,17 @@ struct MLXBackend: ModelBackend {
     var selection: ModelSelection { .mlx(repoID: info.repoID) }
     var displayName: String { info.displayName }
     var budget: ContextBudget { .mlxLocal }
+    /// Phase 5: MLX sessions take tools natively (see the tool wiring
+    /// in `MLXChatSession` / `MLXToolSupport` below).
+    var supportsTools: Bool { true }
 
     @MainActor
-    func makeSession(instructions: String) -> ChatSession {
+    func makeSession(instructions: String, tools: SessionTools?) -> ChatSession {
         MLXChatSession(
             model: MLXLanguageModel(modelID: info.repoID),
             instructions: instructions,
-            generateParameters: Self.generateParameters(for: kvCacheMode))
+            generateParameters: Self.generateParameters(for: kvCacheMode),
+            tools: tools)
     }
 
     /// Translates the pure `KVCacheMode` mapping into the library's
@@ -136,6 +140,11 @@ final class MLXChatSession: ChatSession {
     private let model: MLXLanguageModel
     private let instructions: String
     private let generateParameters: GenerateParameters
+    /// Phase 5: the session's tool set, if any. Handed to the library
+    /// session at creation (its specs + dispatch below); changing the
+    /// tool set means a new session, which is exactly how the engine
+    /// treats a settings change (the live-session signature covers it).
+    private let tools: SessionTools?
 
     /// The library session, created on first use; also the in-flight
     /// container load, shared so two first sends in a row can't load
@@ -145,10 +154,12 @@ final class MLXChatSession: ChatSession {
 
     init(model: MLXLanguageModel,
          instructions: String,
-         generateParameters: GenerateParameters) {
+         generateParameters: GenerateParameters,
+         tools: SessionTools? = nil) {
         self.model = model
         self.instructions = instructions
         self.generateParameters = generateParameters
+        self.tools = tools
     }
 
     func streamReply(to request: ChatReplyRequest)
@@ -188,9 +199,34 @@ final class MLXChatSession: ChatSession {
         let created = MLXLMCommon.ChatSession(
             container,
             instructions: instructions,
-            generateParameters: generateParameters)
+            generateParameters: generateParameters,
+            tools: toolSpecs,
+            toolDispatch: toolDispatch)
         librarySession = created
         return created
+    }
+
+    /// The library's tool specs for this session's tool set, or nil
+    /// when there is no tool set — or when spec construction fails,
+    /// which degrades this session to no-tools rather than no-chat
+    /// (the documented Phase 5 fallback; the on-device model remains
+    /// the primary tools engine).
+    private var toolSpecs: [ToolSpec]? {
+        guard let tools, !tools.descriptors.isEmpty else { return nil }
+        return MLXToolSupport.specs(for: tools.descriptors)
+    }
+
+    /// Dispatches the library's tool calls into the shared app
+    /// runtime — the same logging/gating/clamping path the framework
+    /// backend uses. Only installed when specs exist.
+    private var toolDispatch: (@Sendable (ToolCall) async throws -> String)? {
+        guard let tools, toolSpecs != nil else { return nil }
+        let runtime = tools.runtime
+        return { call in
+            await runtime.execute(
+                toolName: call.function.name,
+                arguments: MLXToolSupport.arguments(from: call))
+        }
     }
 
     private func loadContainer() async throws -> ModelContainer {
@@ -199,5 +235,78 @@ final class MLXChatSession: ChatSession {
         let task = Task { try await model.loadContainer() }
         containerTask = task
         return try await task.value
+    }
+}
+
+/// Phase 5: bridging the app's tool definitions to the MLX library's
+/// tool support.
+///
+/// The library's `ChatSession` accepts `tools: [ToolSpec]?` and a
+/// `toolDispatch` closure — and it is fail-closed: only calls naming a
+/// function declared in the specs reach the dispatch. Verified against
+/// the pinned mlx-swift-lm sources (Libraries/MLXLMCommon/
+/// ChatSession.swift): dispatch "is required for toolcalls if
+/// streaming strings rather than details", which is exactly this
+/// session's shape.
+///
+/// `ToolSpec` is Codable in the library (it's what gets rendered into
+/// the chat template), so specs are built by JSON-decoding the
+/// standard function shape rather than depending on a memberwise
+/// initializer. If that decode ever fails, `specs(for:)` returns nil
+/// and the session runs without tools — chatting is never held
+/// hostage to tool plumbing.
+enum MLXToolSupport {
+
+    static func specs(for descriptors: [ToolDescriptor]) -> [ToolSpec]? {
+        var specs: [ToolSpec] = []
+        for descriptor in descriptors {
+            var properties: [String: Any] = [:]
+            for field in descriptor.argumentFields {
+                properties[field.rawValue] = [
+                    "type": field.jsonType,
+                    "description": field.fieldDescription
+                ]
+            }
+            let object: [String: Any] = [
+                "type": "function",
+                "function": [
+                    "name": descriptor.name,
+                    "description": descriptor.modelDescription,
+                    "parameters": [
+                        "type": "object",
+                        "properties": properties,
+                        "required": [String]()
+                    ]
+                ]
+            ]
+            guard let data = try? JSONSerialization.data(withJSONObject: object),
+                  let spec = try? JSONDecoder().decode(ToolSpec.self, from: data)
+            else { return nil }
+            specs.append(spec)
+        }
+        return specs.isEmpty ? nil : specs
+    }
+
+    /// The library's call arguments (`[String: AnyCodable]`) in the
+    /// app's one argument shape.
+    static func arguments(from call: ToolCall) -> ToolArguments {
+        var values: [String: ToolArgumentValue] = [:]
+        for (key, wrapped) in call.function.arguments {
+            if let value = argumentValue(wrapped.value) {
+                values[key] = value
+            }
+        }
+        return ToolArguments(values: values)
+    }
+
+    private static func argumentValue(_ any: Any) -> ToolArgumentValue? {
+        switch any {
+        case let string as String: return .string(string)
+        case let bool as Bool: return .bool(bool)
+        case let int as Int: return .int(int)
+        case let double as Double: return .double(double)
+        case let number as NSNumber: return .double(number.doubleValue)
+        default: return nil
+        }
     }
 }

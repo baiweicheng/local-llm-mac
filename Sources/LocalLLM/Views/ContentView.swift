@@ -14,11 +14,18 @@ import SwiftData
 /// routing context (what's downloaded/configured, the Local Only
 /// lock, the custom redaction terms) from the same live sources, so
 /// routing and the factory never disagree about the world.
+///
+/// Phase 5: it also owns the visibility stores — the shared-folder
+/// scope and the permission center — and wires the engine's tool
+/// availability from the same live settings, so what a session may
+/// look at is always what the Settings panel shows.
 struct ContentView: View {
     @State private var engine = ChatEngine()
     @State private var mlxStore = MLXModelStore()
     @State private var endpointStore = EndpointStore()
     @State private var settings = AppSettings()
+    @State private var fileScopeStore = FileScopeStore()
+    @State private var permissionCenter = PermissionCenter()
     @State private var selection: Conversation?
 
     var body: some View {
@@ -29,7 +36,8 @@ struct ContentView: View {
             if let conversation = selection {
                 ChatView(conversation: conversation, engine: engine,
                          mlxStore: mlxStore, endpointStore: endpointStore,
-                         settings: settings)
+                         settings: settings, fileScopeStore: fileScopeStore,
+                         permissionCenter: permissionCenter)
                     .id(conversation.id)
             } else {
                 ContentUnavailableView(
@@ -58,6 +66,11 @@ struct ContentView: View {
                     onDeviceReady: ModelAvailabilityState.current.canChat,
                     customRedactionTerms: settings.customRedactionTerms,
                     kvCacheMode: settings.kvCacheMode)
+            }
+            engine.configureToolAvailabilityProvider {
+                ToolAvailability(
+                    enabledSources: settings.enabledVisibilitySources,
+                    folderRootPaths: fileScopeStore.rootPaths)
             }
         }
     }

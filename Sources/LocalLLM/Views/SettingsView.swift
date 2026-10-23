@@ -1,3 +1,5 @@
+import AppKit
+import SwiftData
 import SwiftUI
 
 /// Privacy settings (Phase 4): the Local Only lock and the custom
@@ -8,9 +10,23 @@ import SwiftUI
 /// default model, instructions library — arrive with the Phase 10
 /// polish pass; this sheet is the privacy page of that future
 /// settings window.)
+///
+/// Phase 5 adds the visibility panel — "What this app can see": one
+/// toggle per source, its permission state with plain-English
+/// guidance, the shared-folder picker, and the access log ("Recent
+/// lookups"). This sheet is where visibility is granted; chats only
+/// ever consume what was granted here.
 struct SettingsView: View {
     @Bindable var settings: AppSettings
+    let fileScopeStore: FileScopeStore
+    let permissionCenter: PermissionCenter
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.modelContext) private var modelContext
+
+    /// The access log, newest first. The engine rotates it to
+    /// `AccessLogPolicy.maxRecords`; the panel shows the latest few.
+    @Query(sort: \ToolActivityRecord.createdAt, order: .reverse)
+    private var recentRecords: [ToolActivityRecord]
 
     @State private var newTerm = ""
 
@@ -33,12 +49,17 @@ struct SettingsView: View {
                     redactionSection
                     Divider()
                     kvCacheSection
+                    Divider()
+                    visibilitySection
+                    Divider()
+                    accessLogSection
                 }
                 .padding(16)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .frame(width: 520, height: 520)
+        .frame(width: 520, height: 620)
+        .task { permissionCenter.refresh() }
     }
 
     // MARK: - Local Only
@@ -124,6 +145,164 @@ struct SettingsView: View {
             Text("This applies to downloaded MLX models only — the built-in model and local servers manage their own memory. Changing it restarts the current MLX chat sessions; the conversation itself is kept and re-read, so nothing is lost.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - What this app can see (Phase 5)
+
+    private var visibilitySection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("What this app can see")
+                .font(.headline)
+            Text("Turn on a source and the model in a chat can look things up on this Mac to answer you — find a file, check what's on your calendar, look up a contact. Everything here is read-only: the model can look, never change. Every lookup is written to the log below and shown as a card in the chat, so nothing it sees is invisible to you.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Text("Lookups work with the Apple On-Device model and downloaded MLX models — the models that run on this Mac. Server chats can't use them. What a lookup finds never leaves this Mac in this version; if a cloud model ever gets lookups in a later phase, its results will pass the privacy check above first, and under Local Only a network model gets no lookups at all.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            ForEach(VisibilitySource.allCases, id: \.self) { source in
+                sourceRow(source)
+            }
+        }
+    }
+
+    private func sourceRow(_ source: VisibilitySource) -> some View {
+        let enabled = settings.isSourceEnabled(source)
+        let state = permissionCenter.state(for: source)
+        return VStack(alignment: .leading, spacing: 4) {
+            Toggle(isOn: Binding(
+                get: { settings.isSourceEnabled(source) },
+                set: { newValue in
+                    settings.setSourceEnabled(source, newValue)
+                    // Asking happens when a source is first enabled —
+                    // the moment the user expects the question.
+                    if newValue, source.needsSystemPermission,
+                       permissionCenter.state(for: source) == .notDetermined {
+                        Task { await permissionCenter.request(source) }
+                    }
+                }
+            )) {
+                Label(source.displayName, systemImage: source.symbolName)
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+            }
+            Text(source.settingsBlurb)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if source.needsSystemPermission {
+                HStack(spacing: 8) {
+                    Text(state.settingsLabel)
+                        .font(.caption)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.secondary.opacity(0.12), in: Capsule())
+                    if state == .notDetermined {
+                        Button("Allow…") {
+                            Task { await permissionCenter.request(source) }
+                        }
+                        .font(.caption)
+                    }
+                }
+                if let guidance = PermissionGuidance.text(source: source, state: state) {
+                    Text(guidance)
+                        .font(.caption)
+                        .foregroundStyle(state == .denied ? .orange : .secondary)
+                }
+            } else if enabled {
+                Text("No macOS permission needed for this.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if source == .files {
+                foldersBlock
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    /// The shared-folder list: the ONLY places the file tools may
+    /// read. Folders are granted by picking them (a security-scoped
+    /// bookmark is kept), never by typing a path.
+    private var foldersBlock: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if fileScopeStore.folders.isEmpty {
+                Text("No folders shared yet — file reading can't see anything until you add one.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(fileScopeStore.folders) { folder in
+                    HStack(spacing: 8) {
+                        Image(systemName: "folder")
+                            .foregroundStyle(.secondary)
+                        Text(folder.path)
+                            .font(.caption)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer()
+                        Button {
+                            fileScopeStore.removeFolder(id: folder.id)
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Stop sharing this folder")
+                    }
+                }
+            }
+            Button("Add Folder…") { pickFolder() }
+                .font(.callout)
+        }
+        .padding(.leading, 20)
+        .padding(.top, 2)
+    }
+
+    private func pickFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Share Folder"
+        panel.message = "The app will be able to read inside this folder — and nowhere else."
+        if panel.runModal() == .OK, let url = panel.url {
+            fileScopeStore.addFolder(url: url)
+        }
+    }
+
+    // MARK: - Access log (Phase 5)
+
+    private var accessLogSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Recent lookups")
+                    .font(.headline)
+                Spacer()
+                if !recentRecords.isEmpty {
+                    Button("Clear Log", role: .destructive) {
+                        for record in recentRecords {
+                            modelContext.delete(record)
+                        }
+                        try? modelContext.save()
+                    }
+                    .font(.callout)
+                }
+            }
+            Text("Every lookup a model makes is recorded here — what it used, what it asked, and a summary of what it found. The newest \(AccessLogPolicy.maxRecords) are kept; older ones fall off.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            if recentRecords.isEmpty {
+                Text("Nothing has been looked up yet.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(recentRecords.prefix(12)) { record in
+                    ToolActivityCard(record: record)
+                }
+                if recentRecords.count > 12 {
+                    Text("… and \(recentRecords.count - 12) more in the full log.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
     }
 }

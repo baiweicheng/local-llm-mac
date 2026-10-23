@@ -46,11 +46,18 @@ final class AppSettings {
     /// the list stays trimmed and duplicate-free.
     private(set) var customRedactionTerms: [String]
 
+    /// Phase 5: which visibility sources the user has turned on —
+    /// the "What this app can see" toggles. Every source starts OFF
+    /// and nothing is ever looked at until the user enables it;
+    /// persisted as the set of source raw values.
+    private(set) var enabledVisibilitySources: Set<VisibilitySource>
+
     private let defaults: UserDefaults
 
     private static let localOnlyKey = "LocalLLM.localOnly.v1"
     private static let redactionTermsKey = "LocalLLM.redactionTerms.v1"
     private static let kvCacheModeKey = "LocalLLM.kvCacheMode.v1"
+    private static let visibilitySourcesKey = "LocalLLM.visibilitySources.v1"
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -62,6 +69,32 @@ final class AppSettings {
         } else {
             self.customRedactionTerms = []
         }
+        let storedSources = defaults.stringArray(forKey: Self.visibilitySourcesKey) ?? []
+        self.enabledVisibilitySources = Set(
+            storedSources.compactMap(VisibilitySource.init(rawValue:)))
+    }
+
+    // MARK: - Visibility sources (Phase 5)
+
+    func isSourceEnabled(_ source: VisibilitySource) -> Bool {
+        enabledVisibilitySources.contains(source)
+    }
+
+    /// Toggle one source. Turning a source on is what makes its tools
+    /// exist for new chat sessions (the Settings panel requests the
+    /// system permission at the same moment, when the source has one).
+    func setSourceEnabled(_ source: VisibilitySource, _ enabled: Bool) {
+        if enabled {
+            enabledVisibilitySources.insert(source)
+        } else {
+            enabledVisibilitySources.remove(source)
+        }
+        defaults.set(enabledVisibilitySources.map(\.rawValue).sorted(),
+                     forKey: Self.visibilitySourcesKey)
+    }
+
+    var anyVisibilitySourceEnabled: Bool {
+        !enabledVisibilitySources.isEmpty
     }
 
     /// Adds a term (trimmed; blank entries and duplicates — ignoring

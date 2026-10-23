@@ -14,7 +14,32 @@ struct ChatView: View {
     let mlxStore: MLXModelStore
     let endpointStore: EndpointStore
     let settings: AppSettings
+    let fileScopeStore: FileScopeStore
+    let permissionCenter: PermissionCenter
     @Environment(\.modelContext) private var modelContext
+
+    /// Phase 5: this conversation's tool-lookup records, oldest
+    /// first, merged into the transcript by time (see
+    /// `transcriptItems`). The access log is global; the predicate
+    /// keeps this chat's cards to this chat.
+    @Query private var toolRecords: [ToolActivityRecord]
+
+    init(conversation: Conversation, engine: ChatEngine,
+         mlxStore: MLXModelStore, endpointStore: EndpointStore,
+         settings: AppSettings, fileScopeStore: FileScopeStore,
+         permissionCenter: PermissionCenter) {
+        self.conversation = conversation
+        self.engine = engine
+        self.mlxStore = mlxStore
+        self.endpointStore = endpointStore
+        self.settings = settings
+        self.fileScopeStore = fileScopeStore
+        self.permissionCenter = permissionCenter
+        let id = conversation.id
+        _toolRecords = Query(
+            filter: #Predicate<ToolActivityRecord> { $0.conversationID == id },
+            sort: \ToolActivityRecord.createdAt)
+    }
 
     @State private var input = ""
     @State private var showingInstructions = false
@@ -48,6 +73,9 @@ struct ChatView: View {
             if let info = engine.infoMessages[conversationID] {
                 infoBanner(info)
             }
+            if showsToolsNote {
+                toolsNoteBanner
+            }
             if showsAvailabilityBanner {
                 availabilityBanner
             } else if selectedDescriptor == nil {
@@ -61,7 +89,8 @@ struct ChatView: View {
             instructionsSheet
         }
         .sheet(isPresented: $showingSettings) {
-            SettingsView(settings: settings)
+            SettingsView(settings: settings, fileScopeStore: fileScopeStore,
+                         permissionCenter: permissionCenter)
         }
         .sheet(isPresented: $showingModels) {
             ModelsView(mlxStore: mlxStore, endpointStore: endpointStore)
@@ -110,7 +139,7 @@ struct ChatView: View {
                 Image(systemName: "gearshape")
             }
             .buttonStyle(.borderless)
-            .help("Privacy settings (Local Only, privacy check)")
+            .help("Settings (privacy, what this app can see)")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
@@ -249,6 +278,53 @@ struct ChatView: View {
 
     // MARK: - Messages
 
+    /// One row of the merged transcript: a message, a tool-lookup
+    /// card, or the summarized divider. Phase 5 merges messages and
+    /// tool records by time so a lookup appears exactly where it
+    /// happened in the conversation. The divider keeps its Phase 2
+    /// semantics — it belongs to the message sequence (tool records
+    /// are not messages and never affect the compaction prefix), so
+    /// it's placed by message position within the merged list.
+    private enum TranscriptItem: Identifiable {
+        case message(Message)
+        case tool(ToolActivityRecord)
+        case divider
+
+        var id: String {
+            switch self {
+            case .message(let message): return "message-\(message.id.uuidString)"
+            case .tool(let record): return "tool-\(record.id.uuidString)"
+            case .divider: return "summarized-divider"
+            }
+        }
+    }
+
+    private var transcriptItems: [TranscriptItem] {
+        let messages = conversation.sortedMessages
+        let summarized = conversation.summarizedMessageCount
+        var items: [TranscriptItem] = []
+        var recordIndex = 0
+        for (index, message) in messages.enumerated() {
+            while recordIndex < toolRecords.count,
+                  toolRecords[recordIndex].createdAt <= message.createdAt {
+                items.append(.tool(toolRecords[recordIndex]))
+                recordIndex += 1
+            }
+            if index == summarized, summarized > 0 {
+                items.append(.divider)
+            }
+            items.append(.message(message))
+        }
+        if summarized > 0, summarized >= messages.count {
+            items.append(.divider)
+        }
+        while recordIndex < toolRecords.count {
+            items.append(.tool(toolRecords[recordIndex]))
+            recordIndex += 1
+        }
+        return items
+    }
+
     private var messageList: some View {
         ScrollViewReader { proxy in
             ScrollView {
@@ -256,22 +332,16 @@ struct ChatView: View {
                     if conversation.sortedMessages.isEmpty && !isResponding {
                         emptyState
                     }
-                    ForEach(Array(conversation.sortedMessages.enumerated()),
-                            id: \.element.id) { index, message in
-                        // The summarized prefix ends here: everything
-                        // above the divider has been folded into the
-                        // model's running summary.
-                        if index == conversation.summarizedMessageCount,
-                           conversation.summarizedMessageCount > 0 {
+                    ForEach(transcriptItems) { item in
+                        switch item {
+                        case .message(let message):
+                            MessageBubble(message: message)
+                                .id(message.id)
+                        case .tool(let record):
+                            ToolActivityCard(record: record)
+                        case .divider:
                             SummarizedDivider()
                         }
-                        MessageBubble(message: message)
-                            .id(message.id)
-                    }
-                    if conversation.summarizedMessageCount > 0,
-                       conversation.summarizedMessageCount
-                        >= conversation.sortedMessages.count {
-                        SummarizedDivider()
                     }
                     if isResponding {
                         StreamingBubble(text: engine.streamingText[conversationID] ?? "")
@@ -282,6 +352,9 @@ struct ChatView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .onChange(of: conversation.sortedMessages.count) {
+                scrollToBottom(proxy)
+            }
+            .onChange(of: toolRecords.count) {
                 scrollToBottom(proxy)
             }
             .onChange(of: engine.streamingText[conversationID]) {
@@ -361,6 +434,26 @@ struct ChatView: View {
         }
         .padding(10)
         .background(Color.blue.opacity(0.12))
+    }
+
+    /// Phase 5: the honest gap, stated where the user will see it —
+    /// visibility sources are enabled, but this chat's model is a
+    /// local server, and server chats can't make lookups this phase.
+    private var showsToolsNote: Bool {
+        guard settings.anyVisibilitySourceEnabled else { return false }
+        if case .endpoint = conversation.modelSelection { return true }
+        return false
+    }
+
+    private var toolsNoteBanner: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "eye.slash")
+            Text("Lookups are off for this chat: they work with the Apple On-Device model and downloaded MLX models for now — a server chat like this one can't look things up on your Mac.")
+                .font(.callout)
+            Spacer()
+        }
+        .padding(10)
+        .background(Color.secondary.opacity(0.12))
     }
 
     /// When the Apple Intelligence banner matters: the built-in model

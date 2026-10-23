@@ -179,6 +179,81 @@ could ever leave this Mac.
   answered, how long it took, and what it cost. Under Auto this is
   where you can see which model handled each message.
 
+## What's new in Phase 5
+
+The local visibility layer: the model can now *look things up on your
+Mac* to answer you — and only ever where you've said it may. This is
+the app's main idea, so it's built like a bank vault door: everything
+is off until you turn it on, everything is read-only, and everything
+it looks at is written down where you can see it.
+
+**Turning it on.** Open the gear (Privacy) sheet and scroll to
+**What this app can see**. Each source has its own switch, off by
+default:
+
+- **File search (Spotlight)** — find files by name or by words inside
+  them.
+- **Shared folders** — read text files and list folders, *only inside
+  folders you pick* with the Add Folder button below the switch. A
+  folder is granted by picking it (macOS keeps a security bookmark);
+  there is no way to type in a path and widen it. Nothing outside
+  those folders can be read — not by path tricks (`..`), not by a
+  differently-spelled sibling folder, not through a symlink pointing
+  out.
+- **Calendar** and **Reminders** — upcoming events; unfinished
+  reminders.
+- **Contacts** — look up a name, get the phone/email as stored.
+- **Photos** — list recent photos (date and size only — never the
+  pictures) and read the text in one specific recent photo.
+- **Music library** — search songs by title, artist, or album.
+  One honest gap: *what's playing right now* can't be done — macOS
+  gives apps no public way to see what another app is playing (the
+  old private route was locked down in macOS 15.4), so the tool says
+  exactly that instead of guessing.
+- **About this Mac** — model, chip, memory, free storage, battery,
+  macOS version, uptime, open apps.
+- **Clipboard** — read what's copied, and copy text for you. Copying
+  happens right away (it's the quick bridge from a chat to your other
+  apps), but like every lookup it is always in the log.
+
+Two small utilities ride along whenever any source is on: a
+calculator (a small hand-written parser — it can't run anything but
+arithmetic) and the current date & time.
+
+**Permissions.** Calendar, Reminders, Contacts, Photos, and Music
+also need macOS's permission. The app asks when you first flip the
+switch; if you said no (or want to change your mind), the switch row
+shows the state and the exact place to fix it (System Settings →
+Privacy & Security). One wrinkle: macOS shows those prompts based on
+the packaged app's permission notes, which arrive with the Phase 10
+app bundle — when you run from Xcode in the meantime, macOS
+attributes access to Xcode, and the panel will tell you if a grant
+isn't landing.
+
+**The access log.** Every lookup is recorded — when, which tool, what
+it asked, a one-line summary of what it found — and shown two ways:
+as a small card in the chat, right where it happened, and in the
+gear sheet under **Recent lookups**. The newest 300 are kept. If a
+model ever looks at something, there is a card saying so; there is no
+silent looking.
+
+**Which models can look.** Lookups work with the Apple On-Device
+model and downloaded MLX models — on an Auto chat, "do something on
+my Mac" questions already route to the on-device model, which is the
+tools engine. Server chats (Ollama / LM Studio) can't make lookups
+yet; if you've turned sources on, a server chat shows a short note
+saying so rather than pretending.
+
+**Privacy rules for what a lookup finds.** Lookup results are your
+local data, and in this version they never leave the Mac: the only
+models that can use tools run locally. The rule is wired for the
+future cloud tier anyway — tool results will pass the Phase 4 privacy
+check before a cloud model can see them, and under **Local Only** a
+network backend gets no tools at all. Results are also kept small on
+purpose (a file search returns a handful of lines, trimmed with a
+note if longer), because the on-device model's memory window is
+small and a 200-line search result would crowd out your conversation.
+
 ## Good to know
 
 - The built-in model is small (~3 billion parameters). It's good at chat,
@@ -194,14 +269,16 @@ could ever leave this Mac.
   splitting, context budgets, compaction planning, summary merging,
   attachment storage, model-picker persistence, download planning,
   server-request building, stream parsing, routing decisions, the
-  privacy check, and the telemetry pill) and never call the real
-  model.
+  privacy check, the telemetry pill, the calculator, the
+  shared-folder scope check, tool arguments and result trimming, and
+  the tool runtime's on/off and permission gates) and never call the
+  real model.
 
 ## Where this is going
 
-This is phase 4 of a larger build (see the project plan): next come
-read-only tools that can see your files/calendar/photos locally,
-carefully-confirmed file actions, a global hotkey HUD, and an optional
+This is phase 5 of a larger build (see the project plan): next come
+carefully-confirmed file actions (built on the same shared-folder
+scope the read tools use), a global hotkey HUD, and an optional
 cloud tier via OpenRouter — which will inherit Phase 4's privacy check
 (and its habit of reusing the conversation summary instead of raw
 history) before anything leaves the Mac.

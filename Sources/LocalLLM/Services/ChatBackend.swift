@@ -32,7 +32,17 @@ protocol ModelBackend: Sendable {
     var selection: ModelSelection { get }
     var displayName: String { get }
     var budget: ContextBudget { get }
-    @MainActor func makeSession(instructions: String) -> ChatSession
+    /// Phase 5: whether this backend's sessions can call the app's
+    /// visibility tools. The on-device framework and MLX backends can;
+    /// local servers can't (Phase 5 ships no tool protocol for them),
+    /// so their chats simply never receive a tool set and the UI says
+    /// so plainly.
+    var supportsTools: Bool { get }
+    @MainActor func makeSession(instructions: String, tools: SessionTools?) -> ChatSession
+}
+
+extension ModelBackend {
+    var supportsTools: Bool { false }
 }
 
 /// Backend failures with explanations written for the user, not for a
@@ -118,15 +128,29 @@ final class FrameworkChatSession: ChatSession {
 }
 
 /// The built-in on-device model — Phase 1's backend, unchanged: a
-/// `LanguageModelSession` over `SystemLanguageModel`.
+/// `LanguageModelSession` over `SystemLanguageModel`. Phase 5 makes
+/// it the primary tools engine (the brief's triage already routes
+/// "do something on my Mac" intents here): when the session carries a
+/// tool set, the wrappers are bound at construction, as the framework
+/// requires, and the framework itself invokes them.
 struct OnDeviceBackend: ModelBackend {
     var selection: ModelSelection { .onDevice }
     var displayName: String { "Apple On-Device" }
     var budget: ContextBudget { .onDevice }
+    var supportsTools: Bool { true }
 
     @MainActor
-    func makeSession(instructions: String) -> ChatSession {
-        FrameworkChatSession(
+    func makeSession(instructions: String, tools: SessionTools?) -> ChatSession {
+        if let tools, !tools.descriptors.isEmpty {
+            let frameworkTools: [any Tool] = tools.descriptors.map { descriptor in
+                FrameworkTool(name: descriptor.name,
+                              description: descriptor.modelDescription,
+                              runtime: tools.runtime)
+            }
+            return FrameworkChatSession(session: LanguageModelSession(
+                tools: frameworkTools, instructions: instructions))
+        }
+        return FrameworkChatSession(
             session: LanguageModelSession(instructions: instructions))
     }
 }

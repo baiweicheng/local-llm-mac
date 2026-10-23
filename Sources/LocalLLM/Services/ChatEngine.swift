@@ -60,6 +60,26 @@ import SwiftData
 ///   estimated tokens) on its `Message` for the pill in the
 ///   transcript.
 ///
+/// Phase 5 adds the local visibility layer on that shape:
+///
+/// - When the user has enabled any visibility source ("What this app
+///   can see" in Settings), sessions on tool-capable backends
+///   (on-device, MLX) are created with a `ToolRuntime` tool set; the
+///   tool set is part of the live-session signature, so toggling a
+///   source or a shared folder retires sessions and the next send
+///   rebuilds them, re-seeded as always. Endpoint chats get no tools
+///   this phase, and Local Only changes nothing for them — they never
+///   had any.
+/// - Tool results never pass through this engine: the backends invoke
+///   the runtime inside their own sessions. What the engine owns is
+///   the *record*: runtime events arrive on a static sink and are
+///   persisted here as `ToolActivityRecord`s (the access log),
+///   rotated to `AccessLogPolicy`'s cap.
+/// - Tool results and the privacy firewall: every tool-capable
+///   backend in this phase runs on this Mac, so results stay local
+///   and no redaction applies. The runtime carries the redaction flag
+///   Phase 8's cloud tier will set; see `ToolRuntime`.
+///
 /// All state here is main-actor: the UI reads `streamingText`,
 /// `respondingIDs`, and `errorMessages` directly.
 @MainActor
@@ -117,6 +137,55 @@ final class ChatEngine {
         routingContextProvider = provider
     }
 
+    /// Phase 5: what the tool layer may look at right now — enabled
+    /// sources and shared-folder roots, snapshotted from Settings and
+    /// the folder store by the app shell. Until configured, nothing
+    /// (every toggle off, Phase 4 behavior).
+    private var toolAvailabilityProvider: () -> ToolAvailability = {
+        ToolAvailability.none
+    }
+
+    func configureToolAvailabilityProvider(
+        _ provider: @escaping () -> ToolAvailability
+    ) {
+        toolAvailabilityProvider = provider
+    }
+
+    // MARK: - Tool activity log (Phase 5)
+
+    /// The model context of the send currently in flight. Tool calls
+    /// happen deep inside a backend's session, far from any context;
+    /// the runtime's events come back through the sink below and are
+    /// written with this. Tool calls only ever happen during a send,
+    /// and `prepareAndStream` sets this before streaming starts.
+    private static var activityLogContext: ModelContext?
+
+    /// The runtime's event sink: hop to the main actor and persist.
+    private static let toolEventSink: @Sendable (ToolEvent) async -> Void = { event in
+        await MainActor.run {
+            ChatEngine.recordToolEvent(event)
+        }
+    }
+
+    /// Persists one tool event as an access-log record, rotating the
+    /// oldest entries away past the policy cap.
+    private static func recordToolEvent(_ event: ToolEvent) {
+        guard let context = activityLogContext else { return }
+        context.insert(ToolActivityRecord(event: event))
+        let total = (try? context.fetchCount(
+            FetchDescriptor<ToolActivityRecord>())) ?? 0
+        let excess = AccessLogPolicy.excessCount(totalRecords: total)
+        if excess > 0 {
+            var oldest = FetchDescriptor<ToolActivityRecord>(
+                sortBy: [SortDescriptor(\.createdAt)])
+            oldest.fetchLimit = excess
+            for record in (try? context.fetch(oldest)) ?? [] {
+                context.delete(record)
+            }
+        }
+        try? context.save()
+    }
+
     // MARK: - Sessions
 
     /// A conversation's live session and everything needed to know
@@ -133,6 +202,12 @@ final class ChatEngine {
         let summaryKey: String
         let seeded: Bool
         let kvCacheMode: KVCacheMode
+        /// Phase 5: the tool-availability signature the session's
+        /// tool set was built from ("none" for tool-less backends).
+        /// Tools are bound at session creation on every backend, so
+        /// a changed toggle or folder list must retire the session
+        /// exactly like an instructions edit does.
+        let toolsSignature: String
     }
 
     private var liveSessions: [UUID: LiveSession] = [:]
@@ -203,6 +278,9 @@ final class ChatEngine {
     private func prepareAndStream(conversation: Conversation,
                                   context: ModelContext) async {
         let conversationID = conversation.id
+        // Tool executions during this send report to the access log
+        // through the sink; give it this send's context to write with.
+        Self.activityLogContext = context
         let instructions = PromptHistory.mergedInstructions(
             userInstructions: conversation.systemInstructions)
 
@@ -341,6 +419,19 @@ final class ChatEngine {
         // Note the session identity uses the *effective* instructions
         // (the scrubbed copy for a remote destination), so a session
         // is never reused across a change in what would be sent.
+        // Phase 5: the tool set for this send. Tool-capable backends
+        // (on-device, MLX) get one when the user has enabled any
+        // visibility source; endpoint chats never do. The signature
+        // joins the reuse check below, so a toggled source or changed
+        // folder list rebuilds the session with the new tool set.
+        // `redactResults` is false: every tool-capable backend in
+        // this phase runs on this Mac. Phase 8's cloud tier is where
+        // it turns on — see `ToolRuntime`.
+        let toolAvailability = toolAvailabilityProvider()
+        let toolsSignature = backend.supportsTools
+            ? toolAvailability.signature
+            : "none"
+
         let summaryKey = conversation.contextSummary ?? ""
         let existing = liveSessions[conversationID]
         let selectionIsMLX: Bool = {
@@ -352,6 +443,7 @@ final class ChatEngine {
             && existing!.instructions == effectiveInstructions
             && existing!.summaryKey == summaryKey
             && existing!.seeded
+            && existing!.toolsSignature == toolsSignature
             && KVCacheMode.sessionReusable(
                 sessionMode: existing!.kvCacheMode,
                 currentMode: routingInputs.kvCacheMode,
@@ -362,7 +454,26 @@ final class ChatEngine {
         if canReuse, let existing {
             session = existing.session
         } else {
-            session = backend.makeSession(instructions: effectiveInstructions)
+            let sessionTools: SessionTools?
+            if backend.supportsTools, toolAvailability.hasTools {
+                let runtime = ToolRuntime(
+                    configuration: ToolRuntime.Configuration(
+                        conversationID: conversationID,
+                        enabledSources: toolAvailability.enabledSources,
+                        folderRootPaths: toolAvailability.folderRootPaths,
+                        redactResults: false,
+                        redactionTerms: []),
+                    sink: Self.toolEventSink,
+                    permissionProvider: { source in
+                        PermissionStatusReader.currentState(for: source)
+                    })
+                sessionTools = SessionTools(
+                    runtime: runtime, descriptors: await runtime.descriptors)
+            } else {
+                sessionTools = nil
+            }
+            session = backend.makeSession(instructions: effectiveInstructions,
+                                          tools: sessionTools)
             // The fresh session knows nothing yet: prepend the stored
             // context (summary + live turns) to this prompt. For a
             // brand-new chat the seed is empty and the prompt stands
@@ -376,7 +487,8 @@ final class ChatEngine {
             liveSessions[conversationID] = LiveSession(
                 session: session, selection: selection,
                 instructions: effectiveInstructions, summaryKey: summaryKey,
-                seeded: true, kvCacheMode: routingInputs.kvCacheMode)
+                seeded: true, kvCacheMode: routingInputs.kvCacheMode,
+                toolsSignature: toolsSignature)
         }
 
         // The firewall's second half: with the outgoing prompt fully

@@ -21,8 +21,14 @@ struct EndpointBackend: ModelBackend {
     var displayName: String { config.name }
     var budget: ContextBudget { .mlxLocal } // conservative local default
 
+    // Phase 5: local servers get no tools — the OpenAI-compatible
+    // protocol this backend speaks has no tool-calling in this app
+    // yet, and pretending otherwise would be worse than saying so
+    // (the chat UI shows a plain note when tools are enabled here).
+    // `supportsTools` stays false (the protocol default), so the
+    // engine never builds a tool set for this backend at all.
     @MainActor
-    func makeSession(instructions: String) -> ChatSession {
+    func makeSession(instructions: String, tools: SessionTools?) -> ChatSession {
         EndpointChatSession(config: config, instructions: instructions)
     }
 }
