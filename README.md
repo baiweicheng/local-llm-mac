@@ -465,6 +465,77 @@ the difference between models. **Continue with this one** under an
 answer turns that exchange into a normal chat on the winning model
 and switches you to it, question and answer already in place.
 
+## What's new in Phase 9
+
+Phase 9 adds the **power tools** — the app's riskiest capabilities,
+kept for last on purpose and **off by default**: running shell
+commands, and calling tools on your own local MCP servers. They sit
+behind one master switch (Settings → **Power tools**) and, exactly
+like file changes, they are **propose-only**: a model's call just
+adds an item to the chat's approval list, and nothing runs until you
+press Approve there. Proposals, approvals, skips, and results are
+all written to the activity log, like everything else.
+
+**Running commands.** The model can propose a `zsh` command — the
+approval card shows the **exact command text** (monospaced) and the
+folder it would run in, which must be one of your shared folders
+(there's no way to propose a command that runs somewhere else). On
+approval it runs with a plain environment (a standard PATH and your
+home folder; your shell profile is *not* loaded, so the command
+behaves the same every time), it gets **at most 30 seconds** before
+the app stops it, and the card records how it ended — exit code and
+duration — plus what it printed (the model is told the same; very
+long output is trimmed to its last part, with a note saying so).
+Good uses: looking at a git diff, querying a local SQLite database,
+running a script you've saved in a shared folder.
+
+Extra care for dangerous commands: a built-in check scans each
+proposed command for obviously destructive patterns — force-deleting
+recursively (`rm -rf`), running as root (`sudo`), raw disk writes
+(`dd`, writing to `/dev/disk…`), erasing or formatting a disk,
+recursively changing permissions on system folders, unloading
+system background services, force-quitting apps, shutting the Mac
+down, and piping a download straight into a shell (`curl … | sh`).
+A command that matches lands on the list **unchecked, with the
+reason shown**; it only runs if you deliberately check its box
+first. (Any item on the list can be unchecked the same way — an
+unchecked item is recorded as skipped, and the model is told it was
+deliberately left out.)
+
+**MCP servers.** MCP (Model Context Protocol) servers are programs
+that offer their own tools to a model — a filesystem server, a
+database server, and so on. Add your own in Settings → Power tools:
+a name, the launch command (like `npx` or `uvx`), and its arguments.
+The app starts a server **lazily** — the first time a chat needs its
+tools — talks to it over its standard input and output (stdio), and
+stops it when you switch it off, remove it, or quit the app. Each
+server's tools appear in chats under the server's name, and calling
+one is **propose-only** too: the approval list shows the server, the
+tool, and the exact arguments (as JSON), and the call runs only on
+your Approve, with the server's answer shown on the card. If a
+server won't start or stops answering, its tools quietly disappear
+and Settings shows what happened, with a **Try Again** button — a
+broken server never blocks a chat. Only local stdio servers are
+supported in this phase; hosted or HTTP MCP servers are not.
+
+**The honest limits.** There is **no sandbox** around an approved
+command or server call beyond the shared-folder rule and your
+approval: a command you approve runs with *your own full
+permissions*, starting in the folder shown — where it goes from
+there is up to the command. Commands and server calls **cannot be
+undone** (the card says so before you approve; Undo still covers
+any file changes in the same list). The dangerous-pattern check is
+a seatbelt, not a vault: it catches the obvious disasters, it can't
+understand everything a shell can do, and it never replaces reading
+the command yourself — that's why the approval card shows the exact
+text. Two smaller limits: a server's arguments are typed separated
+by spaces (an argument containing a space can't be entered yet),
+and MCP results are shown as text (a tool that returns an image
+gets a placeholder line instead).
+
+To try it: turn on **Power tools** in Settings, share a folder if
+you haven't, and ask the model to run `git status` in it.
+
 ## Good to know
 
 - The built-in model is small (~3 billion parameters). It's good at chat,
@@ -488,13 +559,17 @@ and switches you to it, question and answer already in place.
   arithmetic, plus the quick panel's context rules (what the chips
   show, what gets folded into a prompt, how a panel chat is titled,
   and when a summon continues the last panel chat instead of
-  starting fresh)) and never call the real model.
+  starting fresh), plus the power tools: which commands get
+  flagged as dangerous, how command output is trimmed, MCP server
+  naming and settings, and the MCP wire format itself) and never
+  call the real model.
 
 ## Where this is going
 
-This is phase 8 of a larger build (see the project plan): the main
+This is phase 9 of a larger build (see the project plan): the main
 window and the quick panel are both in place — two front doors over
-one engine — and the cloud tier (Apple Private Cloud + OpenRouter)
-now sits behind Phase 4's privacy check, so local stays the default
-and the cloud is a labeled, costed choice. What remains is the
-optional power-tools phase and the final polish pass.
+one engine — the cloud tier (Apple Private Cloud + OpenRouter) sits
+behind Phase 4's privacy check, so local stays the default and the
+cloud is a labeled, costed choice, and the power tools (shell + MCP)
+now sit behind the same propose-and-approve gate as everything
+that acts. What remains is the final polish pass.

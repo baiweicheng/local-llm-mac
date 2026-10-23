@@ -24,6 +24,12 @@ import Foundation
 ///    in `FileActionService`. The proposal itself is logged like any
 ///    other call, so proposals and executions both appear in the
 ///    audit log.
+///  - Phase 9: the power tools follow the file actions exactly —
+///    a `run_command` call or an MCP server tool call is validated
+///    (the command's folder against the same scope; an MCP call's
+///    arguments canonicalized) and proposed through the same sink.
+///    Execution lives in `ShellCommandService` / `MCPServerManager`,
+///    reached only from the engine's approve path.
 ///
 /// PRIVACY: tool results are local data. While every tool-capable
 /// backend was local (Phases 5–7), results never left the machine
@@ -52,6 +58,15 @@ actor ToolRuntime {
         /// offered only while it's on, and a call that arrives with
         /// it off (a stale session) is refused here.
         var fileWritingEnabled: Bool = false
+        /// Phase 9: the power-tools master switch, snapshotted the
+        /// same way, plus the MCP tools the manager discovered for
+        /// this session (already namespaced; their descriptors join
+        /// the catalog's for as long as the switch is on). A call
+        /// naming a tool the snapshot doesn't know — a server that
+        /// stopped, a session built before a server was added — is
+        /// answered plainly, never guessed at.
+        var powerToolsEnabled: Bool = false
+        var mcpTools: [MCPToolInfo] = []
         /// Phase 6: where validated proposals go — the engine's
         /// pending approval list for the conversation. Returns false
         /// when the identical change is already on the list (and for
@@ -71,10 +86,29 @@ actor ToolRuntime {
         self.permissionProvider = permissionProvider
     }
 
-    /// The tools this session may offer its model.
+    /// The tools this session may offer its model: the static
+    /// catalog (gated by sources + the writing and power switches)
+    /// plus this snapshot's MCP server tools.
     var descriptors: [ToolDescriptor] {
-        ToolCatalog.descriptors(enabledSources: configuration.enabledSources,
-                                fileWritingEnabled: configuration.fileWritingEnabled)
+        var result = ToolCatalog.descriptors(
+            enabledSources: configuration.enabledSources,
+            fileWritingEnabled: configuration.fileWritingEnabled,
+            powerToolsEnabled: configuration.powerToolsEnabled)
+        if configuration.powerToolsEnabled {
+            result += configuration.mcpTools.map(\.descriptor)
+        }
+        return result
+    }
+
+    /// Looks a called tool up in the same merged set `descriptors`
+    /// offers — static catalog first, then the MCP snapshot (whose
+    /// names are namespaced and can't collide with the catalog's).
+    private func descriptor(named name: String) -> ToolDescriptor? {
+        if let descriptor = ToolCatalog.descriptor(named: name) {
+            return descriptor
+        }
+        return configuration.mcpTools
+            .first { $0.namespacedName == name }?.descriptor
     }
 
     /// Run one tool call and return the text the model sees. Never
@@ -82,7 +116,7 @@ actor ToolRuntime {
     /// relay, because a 3B model handles "the calendar is turned off"
     /// far better than an exception.
     func execute(toolName: String, arguments: ToolArguments) async -> String {
-        guard let descriptor = ToolCatalog.descriptor(named: toolName) else {
+        guard let descriptor = descriptor(named: toolName) else {
             return "That tool doesn't exist."
         }
         let result: String
@@ -101,8 +135,13 @@ actor ToolRuntime {
             // toggle is off, but a session built earlier could still
             // try one.
             result = "File changes are turned off. The user can turn them on in Settings → File changes — every proposed change still needs their approval before anything happens."
+        } else if descriptor.isPowerAction, !configuration.powerToolsEnabled {
+            // Same defense in depth for the power switch.
+            result = "Power tools are turned off. The user can turn them on in Settings → Power tools — every command and server call still needs their approval before anything runs."
         } else if descriptor.isWriteAction {
             result = await propose(descriptor: descriptor, arguments: arguments)
+        } else if descriptor.isPowerAction {
+            result = await proposePower(descriptor: descriptor, arguments: arguments)
         } else {
             result = await run(descriptor: descriptor, arguments: arguments)
         }
@@ -209,17 +248,57 @@ actor ToolRuntime {
                 byteCeiling: arguments.maxBytesClamped)
         }
 
-        switch ActionProposal.make(kind: kind, inputs: inputs, roots: roots,
-                                   probe: FileActionService.probe,
-                                   home: NSHomeDirectory()) {
+        let outcome = ActionProposal.make(
+            kind: kind, inputs: inputs, roots: roots,
+            probe: FileActionService.probe, home: NSHomeDirectory())
+        return await submit(outcome, nothingYet: "NOTHING has been changed yet")
+    }
+
+    /// Hands a validated proposal to the engine's approval list
+    /// and words the answer for the model: proposed means PENDING,
+    /// in terms a small model won't misread as done.
+    private func submit(_ outcome: ProposalOutcome,
+                        nothingYet: String) async -> String {
+        switch outcome {
         case .refused(let reason):
             return reason
         case .proposed(let action):
             if await configuration.proposalSink(configuration.conversationID, action) {
-                return "Added to the list for the user's approval — NOTHING has been changed yet: \(action.summary) The user sees the list in the chat with Approve and Discard buttons. Do not say it is done; what the user decides comes back in a later message."
+                return "Added to the list for the user's approval — \(nothingYet): \(action.summary) The user sees the list in the chat with Approve and Discard buttons. Do not say it is done; what the user decides comes back in a later message."
             }
-            return "That exact change is already on the approval list — the user hasn't decided yet, so nothing new was added."
+            return "That exact item is already on the approval list — the user hasn't decided yet, so nothing new was added."
         }
+    }
+
+    // MARK: - Phase 9: power-tool proposals
+
+    /// The same propose-only path for the power tools: a shell
+    /// command, or a call to one of the session's MCP servers. The
+    /// only "execution" here is validation — resolving the folder a
+    /// command would run in, canonicalizing an MCP call's
+    /// arguments. Nothing runs; nothing is called.
+    private func proposePower(descriptor: ToolDescriptor,
+                              arguments: ToolArguments) async -> String {
+        let roots = configuration.folderRootPaths
+        if descriptor.name == "run_command" {
+            let inputs = ActionInputs(
+                commandText: arguments.command,
+                workingDirectory: resolved(arguments.path))
+            let outcome = ActionProposal.make(
+                kind: .runCommand, inputs: inputs, roots: roots,
+                probe: FileActionService.probe, home: NSHomeDirectory())
+            return await submit(outcome, nothingYet: "NOTHING has been run yet")
+        }
+        guard let tool = configuration.mcpTools.first(
+            where: { $0.namespacedName == descriptor.name }) else {
+            return "That tool isn't available — its MCP server may be off or may have stopped. The user can check it in Settings → Power tools."
+        }
+        let inputs = ActionInputs(mcpTool: tool,
+                                  mcpArgumentsRaw: arguments.argumentsJSON)
+        let outcome = ActionProposal.make(
+            kind: .mcpCall, inputs: inputs, roots: roots,
+            probe: FileActionService.probe, home: NSHomeDirectory())
+        return await submit(outcome, nothingYet: "NOTHING has been run yet")
     }
 
     /// The resolved absolute form of a path the model named (nil for

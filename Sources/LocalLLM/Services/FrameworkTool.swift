@@ -41,6 +41,10 @@ struct ToolCallArguments {
     var maxWidth: Int?
     @Guide(description: "For resize_photo: the largest the output JPEG may be, in bytes (default 512000).")
     var maxBytes: Int?
+    @Guide(description: "For run_command: the exact shell command to propose running.")
+    var command: String?
+    @Guide(description: "For an MCP server's tool: its arguments as one JSON object string, like {\"path\": \"/some/file\"} — {} when it takes none.")
+    var argumentsJSON: String?
 }
 
 extension ToolCallArguments {
@@ -48,7 +52,8 @@ extension ToolCallArguments {
         ToolArguments(query: query, path: path, expression: expression,
                       text: text, days: days, limit: limit, index: index,
                       newName: newName, destination: destination,
-                      append: append, maxWidth: maxWidth, maxBytes: maxBytes)
+                      append: append, maxWidth: maxWidth, maxBytes: maxBytes,
+                      command: command, argumentsJSON: argumentsJSON)
     }
 }
 

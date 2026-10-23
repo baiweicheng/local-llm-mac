@@ -9,6 +9,15 @@ import SwiftUI
 /// button, and Approve / Discard. Nothing in the app runs a file
 /// change except through this card's Approve.
 ///
+/// Phase 9 widens the same gate to the power tools: a proposed
+/// command shows its EXACT text (monospaced) and an MCP call its
+/// arguments — approving means approving precisely what's printed.
+/// Every row also carries a checkbox: checked items are what Approve
+/// runs. Ordinary items start checked; a command the
+/// dangerous-pattern check flagged starts UNCHECKED with its warning
+/// showing, and takes a deliberate check to include. Commands and
+/// MCP calls are labeled "can't be undone" right on the card.
+///
 /// `ActionPlanCard` is the decided plan in the transcript: what ran,
 /// what each item did (or why it failed), the artifact chips for
 /// files it created, and — while the plan can still be reversed — an
@@ -16,46 +25,41 @@ import SwiftUI
 struct PendingPlanCard: View {
     let actions: [PlannedAction]
     let busy: Bool
+    /// Phase 9: the unchecked set (flagged commands start here).
+    let excludedIDs: Set<UUID>
+    let onToggleIncluded: (UUID, Bool) -> Void
     let onRemove: (UUID) -> Void
     let onApprove: () -> Void
     let onDiscard: () -> Void
+
+    private var hasPowerItems: Bool {
+        actions.contains { !$0.kind.isUndoable }
+    }
+
+    private var includedCount: Int {
+        actions.filter { !excludedIDs.contains($0.id) }.count
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
                 Image(systemName: "checklist")
                     .foregroundStyle(.orange)
-                Text(actions.count == 1
-                     ? "1 file change needs your OK"
-                     : "\(actions.count) file changes need your OK")
+                Text(titleText)
                     .font(.callout)
                     .fontWeight(.semibold)
                 Spacer()
-                Text("Nothing has changed yet")
+                Text("Nothing has changed or run yet")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             ForEach(actions) { action in
-                HStack(alignment: .top, spacing: 8) {
-                    Image(systemName: ToolCatalog.descriptor(
-                        named: action.kind.toolName)?.symbolName ?? "doc")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .frame(width: 14)
-                    Text(action.summary)
-                        .font(.callout)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer()
-                    Button {
-                        onRemove(action.id)
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Take this one off the list")
-                    .disabled(busy)
-                }
+                actionRow(action)
+            }
+            if excludedIDs.count > 0 {
+                Text("Unchecked items won't run — approving records them as skipped.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             HStack(spacing: 8) {
                 Button(role: .destructive) {
@@ -75,12 +79,12 @@ struct PendingPlanCard: View {
                 Button {
                     onApprove()
                 } label: {
-                    Text(actions.count == 1
-                         ? "Approve 1 change"
-                         : "Approve \(actions.count) changes")
+                    Text(includedCount == 1
+                         ? "Approve 1 item"
+                         : "Approve \(includedCount) items")
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(busy)
+                .disabled(busy || includedCount == 0)
             }
         }
         .padding(12)
@@ -91,6 +95,85 @@ struct PendingPlanCard: View {
                 .strokeBorder(Color.orange.opacity(0.35), lineWidth: 1))
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+    }
+
+    private var titleText: String {
+        if hasPowerItems {
+            return actions.count == 1
+                ? "1 proposed action needs your OK"
+                : "\(actions.count) proposed actions need your OK"
+        }
+        return actions.count == 1
+            ? "1 file change needs your OK"
+            : "\(actions.count) file changes need your OK"
+    }
+
+    @ViewBuilder
+    private func actionRow(_ action: PlannedAction) -> some View {
+        let included = !excludedIDs.contains(action.id)
+        HStack(alignment: .top, spacing: 8) {
+            Toggle(isOn: Binding(
+                get: { included },
+                set: { onToggleIncluded(action.id, $0) }
+            )) {
+                EmptyView()
+            }
+            .toggleStyle(.checkbox)
+            .labelsHidden()
+            .help(included
+                  ? "Checked: this runs when you approve"
+                  : "Unchecked: this will be skipped")
+            .disabled(busy)
+            Image(systemName: action.kind.symbolName)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 14)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(action.summary)
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .opacity(included ? 1 : 0.55)
+                if action.kind == .runCommand, let command = action.commandText {
+                    Text(command)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 4)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.primary.opacity(0.06),
+                                    in: RoundedRectangle(cornerRadius: 6))
+                }
+                if action.kind == .mcpCall, let arguments = action.mcpArgumentsJSON {
+                    Text(arguments)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let warning = action.dangerWarning {
+                    Label("Flagged: \(warning). It starts unchecked — check its box only if you mean it.",
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if !action.kind.isUndoable {
+                    Text("Can't be undone.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            Button {
+                onRemove(action.id)
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Take this one off the list")
+            .disabled(busy)
+        }
     }
 }
 
@@ -160,16 +243,20 @@ struct ActionPlanCard: View {
 
     private var headerText: String {
         let count = record.items.count
+        // Phase 9: a plan holding commands or server calls speaks
+        // of "actions", and its discards promise nothing RAN either.
+        let hasPowerItems = record.items.contains { !$0.action.kind.isUndoable }
+        let noun = hasPowerItems
+            ? (count == 1 ? "action" : "actions")
+            : (count == 1 ? "file change" : "file changes")
         if record.status == .discarded {
-            return count == 1
-                ? "File change discarded — nothing was changed"
-                : "\(count) file changes discarded — nothing was changed"
+            return "\(count) \(noun) discarded — nothing was changed or run"
         }
         let done = record.items.filter { $0.outcome == .done }.count
         if done == count {
-            return count == 1 ? "File change done" : "\(count) file changes done"
+            return count == 1 ? "\(noun.capitalized) done" : "\(count) \(noun) done"
         }
-        return "\(done) of \(count) file changes done"
+        return "\(done) of \(count) \(noun) done"
     }
 
     @ViewBuilder
@@ -186,6 +273,20 @@ struct ActionPlanCard: View {
                     Text(item.resultNote)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    if let detail = item.modelDetail, !detail.isEmpty {
+                        // Phase 9: what the command printed / what
+                        // the server answered — the substance of
+                        // the item, in a quiet monospaced block.
+                        Text(detail)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .lineLimit(15)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 4)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color.primary.opacity(0.05),
+                                        in: RoundedRectangle(cornerRadius: 6))
+                    }
                     if let undoNote = item.undoNote {
                         Text(undoNote)
                             .font(.caption)

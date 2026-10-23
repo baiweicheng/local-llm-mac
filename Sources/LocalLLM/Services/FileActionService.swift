@@ -57,6 +57,12 @@ enum FileActionService {
             return trashItem(action)
         case .resizePhoto:
             return await resizePhoto(action)
+        case .runCommand, .mcpCall:
+            // Phase 9: power-tool items are executed by their own
+            // services from the engine's approve path — never here.
+            // Reaching this case would be an engine wiring mistake;
+            // fail the item plainly rather than touching anything.
+            return failed(action, "That item was routed to the wrong executor.")
         }
     }
 

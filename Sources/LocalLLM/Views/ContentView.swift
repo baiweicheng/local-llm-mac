@@ -33,6 +33,13 @@ import SwiftData
 /// and whether Private Cloud Compute is offered right now. The
 /// same resolver serves the engine and compare mode, so both
 /// resolve selections identically.
+///
+/// Phase 9: it also owns the MCP server store and manager, and
+/// wires the power tools into the engine three ways: the tool
+/// availability (the master switch + the discovered-tool
+/// signature), the tools provider a session build fetches (the one
+/// moment servers launch), and the executor an approved MCP plan
+/// item runs through.
 struct ContentView: View {
     @State private var engine = ChatEngine()
     @State private var mlxStore = MLXModelStore()
@@ -41,6 +48,8 @@ struct ContentView: View {
     @State private var fileScopeStore = FileScopeStore()
     @State private var permissionCenter = PermissionCenter()
     @State private var openRouterKeyStore = OpenRouterKeyStore()
+    @State private var mcpServerStore = MCPServerStore()
+    @State private var mcpManager = MCPServerManager()
     @State private var selection: Conversation?
     let hudCoordinator: HUDCoordinator
     @Environment(\.modelContext) private var modelContext
@@ -73,7 +82,9 @@ struct ContentView: View {
                          backendResolver: resolveBackend,
                          onCompareContinue: { conversation in
                              selection = conversation
-                         })
+                         },
+                         mcpServerStore: mcpServerStore,
+                         mcpManager: mcpManager)
                     .id(conversation.id)
             } else {
                 ContentUnavailableView(
@@ -105,7 +116,16 @@ struct ContentView: View {
                 ToolAvailability(
                     enabledSources: settings.enabledVisibilitySources,
                     folderRootPaths: fileScopeStore.rootPaths,
-                    fileWritingEnabled: settings.fileWritingEnabled)
+                    fileWritingEnabled: settings.fileWritingEnabled,
+                    powerToolsEnabled: settings.powerToolsEnabled,
+                    mcpToolsSignature: mcpManager.toolSignature)
+            }
+            mcpManager.configure { mcpServerStore.configs }
+            engine.configureMCPToolsProvider {
+                await mcpManager.availableTools()
+            }
+            engine.configureMCPExecutorProvider { action in
+                await mcpManager.executeApprovedCall(action)
             }
             hudCoordinator.configure(
                 engine: engine,

@@ -62,6 +62,17 @@ final class AppSettings {
         didSet { defaults.set(fileWritingEnabled, forKey: Self.fileWritingKey) }
     }
 
+    /// Phase 9: the power-tools master switch — default OFF, and
+    /// separate from every other switch in this file. While off,
+    /// the shell tool and every MCP server tool don't exist for any
+    /// model. While on, they exist but only PROPOSE: each command
+    /// and each server call still lands on the chat's approval list
+    /// and runs only when the user approves it there — and neither
+    /// can be undone, which the approval list says up front.
+    var powerToolsEnabled: Bool {
+        didSet { defaults.set(powerToolsEnabled, forKey: Self.powerToolsKey) }
+    }
+
     /// Phase 7: the quick panel's hotkey (⌘⇧Space). Default ON —
     /// but stored via the object-presence check in `init`, because
     /// `UserDefaults.bool` can't tell "never set" from "set to
@@ -87,6 +98,7 @@ final class AppSettings {
     private static let kvCacheModeKey = "LocalLLM.kvCacheMode.v1"
     private static let visibilitySourcesKey = "LocalLLM.visibilitySources.v1"
     private static let fileWritingKey = "LocalLLM.fileWriting.v1"
+    private static let powerToolsKey = "LocalLLM.powerTools.v1"
     private static let hudEnabledKey = "LocalLLM.hudEnabled.v1"
     private static let openRouterCustomModelKey = "LocalLLM.openRouterCustomModel.v1"
 
@@ -94,6 +106,7 @@ final class AppSettings {
         self.defaults = defaults
         self.localOnly = defaults.bool(forKey: Self.localOnlyKey)
         self.fileWritingEnabled = defaults.bool(forKey: Self.fileWritingKey)
+        self.powerToolsEnabled = defaults.bool(forKey: Self.powerToolsKey)
         self.openRouterCustomModelID =
             defaults.string(forKey: Self.openRouterCustomModelKey) ?? ""
         // Default ON: only an explicitly stored value can turn the

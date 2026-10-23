@@ -105,6 +105,21 @@ import SwiftData
 ///   sent none — never a fake $0.00 on a paid route. PCC reports
 ///   $0.00, labeled as Apple's cloud; Apple includes it.
 ///
+/// Phase 9 adds the power tools on that shape:
+///
+/// - Behind the master Power tools switch, sessions gain the shell
+///   tool and any MCP server tools (the manager's servers launch
+///   lazily at session build — the only moment a process starts).
+///   Both kinds are propose-only through the very same pending plan
+///   as file changes: `executePlanItem` dispatches an approved item
+///   to its executor, the audit log records proposals and results,
+///   and the outcome note quotes a command's output or a server's
+///   answer via the item's `modelDetail`.
+/// - Flagged dangerous commands start UNCHECKED on the list
+///   (`excludedPlanItems`): approving runs the checked remainder
+///   and records the rest as declined. Commands and MCP calls are
+///   never undoable, and their undo steps say so.
+///
 /// All state here is main-actor: the UI reads `streamingText`,
 /// `respondingIDs`, and `errorMessages` directly.
 @MainActor
@@ -141,6 +156,13 @@ final class ChatEngine {
     /// Proposals are cheap for the model to make again; silently
     /// keeping half-approved file changes around is not.
     private(set) var pendingPlans: [UUID: [PlannedAction]] = [:]
+    /// Phase 9: pending items the user has NOT (yet) agreed to run —
+    /// the approval list's unchecked set. A flagged dangerous
+    /// command lands here the moment it's proposed (opt-in-only);
+    /// the user can uncheck/re-check any item. Approve runs only
+    /// the checked remainder; unchecked items are recorded as
+    /// declined, like a discard, item by item.
+    private(set) var excludedPlanItems: [UUID: Set<UUID>] = [:]
     /// Phase 6: conversations whose plan is being executed or undone
     /// right now (the card shows a spinner state and locks its
     /// buttons).
@@ -204,6 +226,32 @@ final class ChatEngine {
         toolAvailabilityProvider = provider
     }
 
+    // MARK: - MCP providers (Phase 9)
+
+    /// The MCP servers' currently offered tools, fetched when a
+    /// tool-capable session is built with power tools on — the one
+    /// moment server processes are launched. Configured by the app
+    /// shell from the MCP manager; until then, no MCP tools.
+    private var mcpToolsProvider: () async -> [MCPToolInfo] = { [] }
+
+    func configureMCPToolsProvider(
+        _ provider: @escaping () async -> [MCPToolInfo]
+    ) {
+        mcpToolsProvider = provider
+    }
+
+    /// Executes ONE approved MCP call. The shell hands the manager
+    /// in through here, so plan approval can reach it without the
+    /// engine knowing what an MCP server is. A nil return (no
+    /// provider configured) becomes a plain failure item.
+    private var mcpExecutorProvider: (PlannedAction) async -> ExecutedActionItem? = { _ in nil }
+
+    func configureMCPExecutorProvider(
+        _ provider: @escaping (PlannedAction) async -> ExecutedActionItem?
+    ) {
+        mcpExecutorProvider = provider
+    }
+
     // MARK: - Tool activity log (Phase 5)
 
     /// The model context of the send currently in flight. Tool calls
@@ -257,6 +305,9 @@ final class ChatEngine {
     /// One validated proposal from the tool runtime. Identical
     /// changes already pending are refused, so a chatty model can't
     /// stack duplicates the user then has to wade through.
+    /// Phase 9: a proposal carrying a danger warning (a flagged
+    /// command) starts out in the unchecked set — the user must
+    /// deliberately check it before Approve can run it.
     @discardableResult
     func recordProposedAction(_ action: PlannedAction,
                               conversationID: UUID) -> Bool {
@@ -265,6 +316,9 @@ final class ChatEngine {
             return false
         }
         pendingPlans[conversationID] = existing + [action]
+        if action.requiresExplicitOptIn {
+            excludedPlanItems[conversationID, default: []].insert(action.id)
+        }
         return true
     }
 
@@ -279,26 +333,61 @@ final class ChatEngine {
         guard var plan = pendingPlans[conversationID] else { return }
         plan.removeAll { $0.id == actionID }
         pendingPlans[conversationID] = plan.isEmpty ? nil : plan
+        excludedPlanItems[conversationID]?.remove(actionID)
     }
 
-    /// The user pressed Approve: run every item in order, persist
-    /// the decided plan (the transcript card), audit-log each item,
-    /// and queue the outcome note for the model's next turn. A
-    /// per-item failure is recorded on that item; the rest still run.
+    /// The unchecked set for a conversation's pending list — the
+    /// card renders these rows unchecked (see `recordProposedAction`
+    /// for how an item lands there).
+    func excludedPendingItems(for conversationID: UUID) -> Set<UUID> {
+        excludedPlanItems[conversationID] ?? []
+    }
+
+    /// Checks or unchecks one pending item. An unchecked item is
+    /// not removed — Approve records it as declined, so the model
+    /// learns it was deliberately left out.
+    func setPendingActionIncluded(_ actionID: UUID, included: Bool,
+                                  conversationID: UUID) {
+        if included {
+            excludedPlanItems[conversationID]?.remove(actionID)
+        } else {
+            excludedPlanItems[conversationID, default: []].insert(actionID)
+        }
+    }
+
+    /// The user pressed Approve: run every CHECKED item in order,
+    /// persist the decided plan (the transcript card), audit-log
+    /// each item, and queue the outcome note for the model's next
+    /// turn. A per-item failure is recorded on that item; the rest
+    /// still run. Items left unchecked (Phase 9's opt-in rule for
+    /// flagged commands — or any item the user unchecked) don't
+    /// run; they're recorded as declined, so the model learns they
+    /// were deliberately left out rather than forgotten.
     func approvePlan(conversationID: UUID, context: ModelContext) {
         guard let plan = pendingPlans[conversationID], !plan.isEmpty,
               !planBusyIDs.contains(conversationID) else { return }
         pendingPlans[conversationID] = nil
+        let excluded = excludedPlanItems[conversationID] ?? []
+        excludedPlanItems[conversationID] = nil
         planBusyIDs.insert(conversationID)
         Self.activityLogContext = context
         let roots = toolAvailabilityProvider().folderRootPaths
+        let mcpExecutor = mcpExecutorProvider
         let planKey = UUID()
         Task { [weak self] in
             let backupDirectory = Self.backupDirectory(for: planKey)
             var executed: [ExecutedActionItem] = []
             for action in plan {
-                executed.append(await FileActionService.execute(
-                    action, roots: roots, backupDirectory: backupDirectory))
+                if excluded.contains(action.id) {
+                    executed.append(ExecutedActionItem(
+                        action: action, outcome: .declined,
+                        resultNote: "Not run — it was left unchecked when the list was approved."))
+                } else {
+                    executed.append(await Self.executePlanItem(
+                        action, roots: roots,
+                        backupDirectory: backupDirectory,
+                        mcpExecutor: mcpExecutor))
+                }
             }
             await MainActor.run {
                 guard let self else { return }
@@ -310,8 +399,8 @@ final class ChatEngine {
                 for item in executed {
                     Self.recordToolEvent(ToolEvent(
                         conversationID: conversationID,
-                        toolName: item.action.kind.toolName,
-                        source: item.action.kind == .resizePhoto ? .photos : .files,
+                        toolName: Self.auditToolName(for: item.action),
+                        source: Self.auditSource(for: item.action.kind),
                         querySummary: item.action.summary,
                         resultSummary: ToolResultText.summary(
                             of: item.resultNote),
@@ -324,6 +413,59 @@ final class ChatEngine {
         }
     }
 
+    /// Runs one approved item through the executor for its kind:
+    /// file changes in `FileActionService`, commands in
+    /// `ShellCommandService`, MCP calls through the shell-provided
+    /// executor. Every path applies the same pure pre-check first —
+    /// the world may have changed since the proposal.
+    private static func executePlanItem(
+        _ action: PlannedAction, roots: [String], backupDirectory: URL,
+        mcpExecutor: (PlannedAction) async -> ExecutedActionItem?
+    ) async -> ExecutedActionItem {
+        if let refusal = ActionExecution.preCheck(
+            action, roots: roots, probe: FileActionService.probe) {
+            return ExecutedActionItem(action: action,
+                                      outcome: .failed(refusal),
+                                      resultNote: refusal)
+        }
+        switch action.kind {
+        case .runCommand:
+            return await ShellCommandService.execute(action)
+        case .mcpCall:
+            if let item = await mcpExecutor(action) { return item }
+            let note = "That MCP server isn't available — it may have been removed from Settings."
+            return ExecutedActionItem(action: action,
+                                      outcome: .failed(note),
+                                      resultNote: note)
+        default:
+            return await FileActionService.execute(
+                action, roots: roots, backupDirectory: backupDirectory)
+        }
+    }
+
+    /// The audit log's tool name for an item: an MCP call logs
+    /// under its concrete namespaced name; everything else under
+    /// its kind's tool.
+    private static func auditToolName(for action: PlannedAction) -> String {
+        if action.kind == .mcpCall, let namespaced = action.mcpNamespacedName {
+            return namespaced
+        }
+        return action.kind.toolName
+    }
+
+    /// The audit log's source for an item: photo resizes belong to
+    /// Photos, file changes to Files, and the power tools to no
+    /// source at all (they're gated by their own switch, not a
+    /// visibility source).
+    private static func auditSource(for kind: PlannedActionKind)
+        -> VisibilitySource? {
+        switch kind {
+        case .resizePhoto: return .photos
+        case .runCommand, .mcpCall: return nil
+        default: return .files
+        }
+    }
+
     /// The user pressed Discard: nothing runs, the decision is still
     /// recorded (card + audit), and the model is told plainly — so it
     /// doesn't quietly re-propose the same changes next turn.
@@ -331,6 +473,7 @@ final class ChatEngine {
         guard let plan = pendingPlans[conversationID], !plan.isEmpty,
               !planBusyIDs.contains(conversationID) else { return }
         pendingPlans[conversationID] = nil
+        excludedPlanItems[conversationID] = nil
         Self.activityLogContext = context
         let record = ActionPlanRecord(
             conversationID: conversationID, status: .discarded,
@@ -344,16 +487,16 @@ final class ChatEngine {
         for action in plan {
             Self.recordToolEvent(ToolEvent(
                 conversationID: conversationID,
-                toolName: action.kind.toolName,
-                source: action.kind == .resizePhoto ? .photos : .files,
+                toolName: Self.auditToolName(for: action),
+                source: Self.auditSource(for: action.kind),
                 querySummary: action.summary,
-                resultSummary: "Discarded by the user — nothing was changed.",
+                resultSummary: "Discarded by the user — nothing was changed or run.",
                 date: Date()))
         }
         pendingOutcomeNotes[conversationID] =
-            "The user discarded the list of \(plan.count) file "
-            + "change(s) you proposed — NOTHING was changed. Do not "
-            + "re-propose them unless the user asks again."
+            "The user discarded the list of \(plan.count) "
+            + "change(s) you proposed — NOTHING was changed or run. "
+            + "Do not re-propose them unless the user asks again."
     }
 
     /// The user pressed Undo on an executed plan's card: reverse
@@ -388,9 +531,8 @@ final class ChatEngine {
                 for entry in results {
                     Self.recordToolEvent(ToolEvent(
                         conversationID: conversationID,
-                        toolName: entry.item.action.kind.toolName,
-                        source: entry.item.action.kind == .resizePhoto
-                            ? .photos : .files,
+                        toolName: Self.auditToolName(for: entry.item.action),
+                        source: Self.auditSource(for: entry.item.action.kind),
                         querySummary: "Undo: \(entry.item.action.summary)",
                         resultSummary: ToolResultText.summary(of: entry.note),
                         date: Date()))
@@ -400,28 +542,37 @@ final class ChatEngine {
                     "• \($0.item.action.summary) — \($0.note)"
                 }
                 self.pendingOutcomeNotes[conversationID] =
-                    "The user undid the file changes from the approved "
-                    + "list. Results:\n" + lines.joined(separator: "\n")
+                    "The user undid what could be undone from the "
+                    + "approved list. Results:\n" + lines.joined(separator: "\n")
             }
         }
     }
 
     /// The note the model sees after an approval: per-item results,
-    /// in the conversation's own terms.
+    /// in the conversation's own terms. Phase 9: a command or MCP
+    /// item's substance (what it printed / what the server
+    /// answered) rides along as the item's detail — for those
+    /// kinds the output is the whole reason the item ran.
     private static func approvalOutcomeNote(
         items: [ExecutedActionItem]) -> String {
         let lines = items.map { item -> String in
+            let detail = item.modelDetail.map { "\n\($0)" } ?? ""
             switch item.outcome {
             case .done:
-                return "• \(item.action.summary) — done. \(item.resultNote)"
+                return "• \(item.action.summary) — done. \(item.resultNote)\(detail)"
             case .failed(let reason):
-                return "• \(item.action.summary) — FAILED. \(reason)"
+                return "• \(item.action.summary) — FAILED. \(reason)\(detail)"
             case .declined:
-                return "• \(item.action.summary) — not done."
+                return "• \(item.action.summary) — not run. \(item.resultNote)"
             }
         }
-        return "The user approved the list of file changes you "
-            + "proposed. Results:\n" + lines.joined(separator: "\n")
+        let allFileChanges = items.allSatisfy {
+            $0.action.kind != .runCommand && $0.action.kind != .mcpCall
+        }
+        let heading = allFileChanges
+            ? "The user approved the list of file changes you proposed."
+            : "The user approved the list of changes and actions you proposed."
+        return heading + " Results:\n" + lines.joined(separator: "\n")
     }
 
     /// Where pre-edit backups live: one folder per approved plan,
@@ -483,6 +634,7 @@ final class ChatEngine {
         routingNotes[conversationID] = nil
         infoMessages[conversationID] = nil
         pendingPlans[conversationID] = nil
+        excludedPlanItems[conversationID] = nil
         pendingOutcomeNotes[conversationID] = nil
         pendingPromptPrefixes[conversationID] = nil
         planBusyIDs.remove(conversationID)
@@ -747,6 +899,14 @@ final class ChatEngine {
         } else {
             let sessionTools: SessionTools?
             if backend.supportsTools, toolAvailability.hasTools {
+                // Phase 9: with power tools on, the MCP servers'
+                // tools join this session's set — fetched here, at
+                // session build, which is the one moment that may
+                // launch a server process (lazily; a failed server
+                // simply contributes nothing).
+                let mcpTools = toolAvailability.powerToolsEnabled
+                    ? await mcpToolsProvider()
+                    : []
                 let runtime = ToolRuntime(
                     configuration: ToolRuntime.Configuration(
                         conversationID: conversationID,
@@ -760,6 +920,8 @@ final class ChatEngine {
                         redactResults: isRemoteDestination,
                         redactionTerms: routingInputs.customRedactionTerms,
                         fileWritingEnabled: toolAvailability.fileWritingEnabled,
+                        powerToolsEnabled: toolAvailability.powerToolsEnabled,
+                        mcpTools: mcpTools,
                         proposalSink: Self.proposalSink),
                     sink: Self.toolEventSink,
                     permissionProvider: { source in

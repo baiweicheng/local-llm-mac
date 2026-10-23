@@ -172,10 +172,15 @@ enum ToolArgumentField: String, CaseIterable, Sendable {
     case append
     case maxWidth
     case maxBytes
+    // Phase 9: the power-tool fields — the shell command itself, and
+    // the generic JSON carrier for MCP tools' own argument shapes.
+    case command
+    case argumentsJSON
 
     var jsonType: String {
         switch self {
-        case .query, .path, .expression, .text, .newName, .destination:
+        case .query, .path, .expression, .text, .newName, .destination,
+             .command, .argumentsJSON:
             return "string"
         case .days, .limit, .index, .maxWidth, .maxBytes: return "integer"
         case .append: return "boolean"
@@ -196,6 +201,8 @@ enum ToolArgumentField: String, CaseIterable, Sendable {
         case .append: return "True to add the text at the end of the file instead of replacing its contents, for the edit tool."
         case .maxWidth: return "The widest the resized photo may be, in pixels, for the photo-resize tool."
         case .maxBytes: return "The largest JPEG file size allowed, in bytes, for the photo-resize tool."
+        case .command: return "The exact shell command to run, for the run_command tool."
+        case .argumentsJSON: return "For an MCP server's tool: its arguments as one JSON object string, like {\"path\": \"/some/file\"} — {} when it takes none."
         }
     }
 }
@@ -224,12 +231,16 @@ struct ToolArguments: Sendable, Equatable {
     var append: Bool?
     var maxWidth: Int?
     var maxBytes: Int?
+    // Phase 9: power-tool fields.
+    var command: String?
+    var argumentsJSON: String?
 
     init(query: String? = nil, path: String? = nil,
          expression: String? = nil, text: String? = nil,
          days: Int? = nil, limit: Int? = nil, index: Int? = nil,
          newName: String? = nil, destination: String? = nil,
-         append: Bool? = nil, maxWidth: Int? = nil, maxBytes: Int? = nil) {
+         append: Bool? = nil, maxWidth: Int? = nil, maxBytes: Int? = nil,
+         command: String? = nil, argumentsJSON: String? = nil) {
         self.query = query
         self.path = path
         self.expression = expression
@@ -242,6 +253,8 @@ struct ToolArguments: Sendable, Equatable {
         self.append = append
         self.maxWidth = maxWidth
         self.maxBytes = maxBytes
+        self.command = command
+        self.argumentsJSON = argumentsJSON
     }
 
     /// From backend values (the MLX dispatch path). Strings that look
@@ -283,7 +296,9 @@ struct ToolArguments: Sendable, Equatable {
                   days: int(.days), limit: int(.limit), index: int(.index),
                   newName: string(.newName), destination: string(.destination),
                   append: bool(.append), maxWidth: int(.maxWidth),
-                  maxBytes: int(.maxBytes))
+                  maxBytes: int(.maxBytes),
+                  command: string(.command),
+                  argumentsJSON: string(.argumentsJSON))
     }
 
     /// Days ahead for calendar lookups: default a week, at most 60.
@@ -302,6 +317,11 @@ struct ToolArguments: Sendable, Equatable {
     /// The short human summary of what was asked, for the access log
     /// and the transcript card.
     func summary(for toolName: String) -> String {
+        // Phase 9: MCP tool names are per-server, so they're matched
+        // by prefix rather than by case.
+        if toolName.hasPrefix(MCPToolNaming.prefix) {
+            return String((argumentsJSON ?? "{}").prefix(60))
+        }
         switch toolName {
         case "search_files", "search_contacts", "search_music":
             return query.map { "“\($0)”" } ?? "search"
@@ -327,6 +347,8 @@ struct ToolArguments: Sendable, Equatable {
             return path ?? "a path"
         case "resize_photo":
             return path ?? "photo #\(indexClamped + 1) from most recent"
+        case "run_command":
+            return command ?? "a command"
         default:
             return ""
         }
@@ -355,6 +377,13 @@ struct ToolDescriptor: Sendable, Equatable, Identifiable {
     /// separate file-writing Settings toggle is on. Declared last with
     /// a default so every read-tool literal above stays unchanged.
     let isWriteAction: Bool = false
+    /// Phase 9: a power tool — the shell command, and every MCP
+    /// server tool. Same propose-only contract as the file actions
+    /// (a call proposes; nothing runs before the user's Approve),
+    /// behind the master Power tools switch instead of the writing
+    /// one. MCP descriptors are built per server in `PowerTools.swift`,
+    /// not in the static catalog below; only `run_command` is static.
+    let isPowerAction: Bool = false
 
     var id: String { name }
 }
@@ -533,6 +562,23 @@ enum ToolCatalog {
             argumentFields: [.path, .index, .destination, .maxWidth, .maxBytes],
             symbolName: "arrow.down.right.and.arrow.up.left",
             isWriteAction: true),
+
+        // MARK: Phase 9 — power tools (propose-only)
+        //
+        // The shell half of the power tools (the MCP half is
+        // per-server and joins at runtime). Same propose-only deal,
+        // stated to the model in so many words, under the Power
+        // tools master switch. A command is never undoable, and the
+        // description says that too.
+
+        ToolDescriptor(
+            name: "run_command",
+            displayName: "Run command",
+            modelDescription: "Propose running a shell command (zsh) on the user's Mac. Set command to the EXACT command text, and optionally path to the folder it should run in — the folder must be one of the user's shared folders (Settings → What this app can see → Shared folders); omit path to run in the first shared folder. This runs NOTHING yet: it adds the command to a list the user must approve before anything happens, and they see the exact text. Commands cannot be undone. The command gets at most 30 seconds, runs with a plain environment (no shell profile), and you will be told its exit code and what it printed. Never say a command has run until the user has approved it.",
+            source: nil,
+            argumentFields: [.command, .path],
+            symbolName: "terminal",
+            isPowerAction: true),
     ]
 
     static func descriptor(named name: String) -> ToolDescriptor? {
@@ -548,11 +594,21 @@ enum ToolCatalog {
     /// the set only while the file-writing toggle is also on. The
     /// default (toggle off) keeps every Phase 5 call site behaving
     /// exactly as before.
+    ///
+    /// Phase 9: power tools carry their own master gate
+    /// (`powerToolsEnabled`). The static catalog holds only
+    /// `run_command`; the MCP servers' tools are dynamic and are
+    /// merged in by the runtime, not here. The early return widens
+    /// by exactly one case: power tools on is enough for a tool set
+    /// to exist even with every visibility source off (the source-
+    /// less utilities ride along, as they do with any source).
     static func descriptors(enabledSources: Set<VisibilitySource>,
-                            fileWritingEnabled: Bool = false) -> [ToolDescriptor] {
-        guard !enabledSources.isEmpty else { return [] }
+                            fileWritingEnabled: Bool = false,
+                            powerToolsEnabled: Bool = false) -> [ToolDescriptor] {
+        guard !enabledSources.isEmpty || powerToolsEnabled else { return [] }
         return all.filter { descriptor in
             if descriptor.isWriteAction, !fileWritingEnabled { return false }
+            if descriptor.isPowerAction, !powerToolsEnabled { return false }
             guard let source = descriptor.source else { return true }
             return enabledSources.contains(source)
         }
@@ -561,6 +617,11 @@ enum ToolCatalog {
     /// Just the file-action tools (Phase 6), in catalog order.
     static var writeActions: [ToolDescriptor] {
         all.filter { $0.isWriteAction }
+    }
+
+    /// Just the static power tools (Phase 9) — `run_command`.
+    static var powerActions: [ToolDescriptor] {
+        all.filter { $0.isPowerAction }
     }
 }
 
@@ -632,14 +693,24 @@ struct ToolAvailability: Equatable, Sendable {
     /// them with (or without) the file-action tools — the same deal
     /// as toggling a source.
     var fileWritingEnabled: Bool = false
+    /// Phase 9: the power-tools master switch, same deal. The MCP
+    /// half also carries a signature of the tool set the manager
+    /// last discovered ("serverSlug:tool,tool;…") — when a server's
+    /// tools change (first launch, a restart, an edit), sessions
+    /// retire and rebuild with the fresh list, exactly as when any
+    /// other part of the tool set changes.
+    var powerToolsEnabled: Bool = false
+    var mcpToolsSignature: String = ""
 
     static let none = ToolAvailability(enabledSources: [], folderRootPaths: [])
 
-    var hasTools: Bool { !enabledSources.isEmpty }
+    var hasTools: Bool { !enabledSources.isEmpty || powerToolsEnabled }
 
     var signature: String {
         let sources = enabledSources.map(\.rawValue).sorted().joined(separator: ",")
         return sources + "|" + folderRootPaths.sorted().joined(separator: ",")
             + "|" + (fileWritingEnabled ? "write" : "read")
+            + "|" + (powerToolsEnabled ? "power" : "nopower")
+            + "|" + mcpToolsSignature
     }
 }

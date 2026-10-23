@@ -25,6 +25,10 @@ struct ChatView: View {
     /// Phase 8: compare mode's "continue with this one" lands here —
     /// the shell selects the seeded conversation.
     let onCompareContinue: (Conversation) -> Void
+    /// Phase 9: the MCP server list + manager, passed through to
+    /// the Settings sheet's Power tools section.
+    let mcpServerStore: MCPServerStore
+    let mcpManager: MCPServerManager
     @Environment(\.modelContext) private var modelContext
 
     /// Phase 5: this conversation's tool-lookup records, oldest
@@ -43,7 +47,8 @@ struct ChatView: View {
          permissionCenter: PermissionCenter,
          openRouterKeyStore: OpenRouterKeyStore,
          backendResolver: @escaping (ModelSelection) -> ResolvedBackend,
-         onCompareContinue: @escaping (Conversation) -> Void) {
+         onCompareContinue: @escaping (Conversation) -> Void,
+         mcpServerStore: MCPServerStore, mcpManager: MCPServerManager) {
         self.conversation = conversation
         self.engine = engine
         self.mlxStore = mlxStore
@@ -54,6 +59,8 @@ struct ChatView: View {
         self.openRouterKeyStore = openRouterKeyStore
         self.backendResolver = backendResolver
         self.onCompareContinue = onCompareContinue
+        self.mcpServerStore = mcpServerStore
+        self.mcpManager = mcpManager
         let id = conversation.id
         _toolRecords = Query(
             filter: #Predicate<ToolActivityRecord> { $0.conversationID == id },
@@ -108,6 +115,13 @@ struct ChatView: View {
                 PendingPlanCard(
                     actions: engine.pendingPlan(for: conversationID),
                     busy: engine.planBusyIDs.contains(conversationID),
+                    excludedIDs: engine.excludedPendingItems(
+                        for: conversationID),
+                    onToggleIncluded: { actionID, included in
+                        engine.setPendingActionIncluded(
+                            actionID, included: included,
+                            conversationID: conversationID)
+                    },
                     onRemove: { actionID in
                         engine.removePendingAction(actionID,
                                                    conversationID: conversationID)
@@ -131,7 +145,9 @@ struct ChatView: View {
         .sheet(isPresented: $showingSettings) {
             SettingsView(settings: settings, fileScopeStore: fileScopeStore,
                          permissionCenter: permissionCenter,
-                         openRouterKeyStore: openRouterKeyStore)
+                         openRouterKeyStore: openRouterKeyStore,
+                         mcpServerStore: mcpServerStore,
+                         mcpManager: mcpManager)
         }
         .sheet(isPresented: $showingCompare) {
             CompareView(descriptors: descriptors,

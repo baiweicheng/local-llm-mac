@@ -26,11 +26,19 @@ import SwiftUI
 /// OpenRouter key field (the key goes straight to the Mac's
 /// Keychain — this view never displays it back), the curated model
 /// list, and the custom model id.
+///
+/// Phase 9 adds "Power tools": the master switch for the shell tool
+/// and the MCP client, the plain-English warnings that belong with
+/// it, and the MCP server list (add/remove/enable, per-server
+/// status, retry) — servers are configured here; starting them
+/// happens lazily, from chats.
 struct SettingsView: View {
     @Bindable var settings: AppSettings
     let fileScopeStore: FileScopeStore
     let permissionCenter: PermissionCenter
     let openRouterKeyStore: OpenRouterKeyStore
+    let mcpServerStore: MCPServerStore
+    let mcpManager: MCPServerManager
     @Environment(\.dismiss) private var dismiss
     @Environment(\.modelContext) private var modelContext
 
@@ -44,6 +52,10 @@ struct SettingsView: View {
     /// to the Keychain; the field then clears. The saved key is
     /// never read back into this field.
     @State private var keyDraft = ""
+    /// Phase 9: the MCP add-server form's drafts.
+    @State private var mcpName = ""
+    @State private var mcpCommand = ""
+    @State private var mcpArguments = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -70,6 +82,8 @@ struct SettingsView: View {
                     visibilitySection
                     Divider()
                     fileChangesSection
+                    Divider()
+                    powerToolsSection
                     Divider()
                     quickPanelSection
                     Divider()
@@ -383,6 +397,141 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - Power tools (Phase 9)
+
+    private var powerToolsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Power tools")
+                .font(.headline)
+            Text("The riskiest tools in the app — off by default, and off means they don't exist for any model. With this on, the model can also PROPOSE two more kinds of action, on the same approval list as file changes:")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("• Run a shell command (zsh) in one of your shared folders — things like inspecting a git diff or querying a local database. You see the exact command text before anything runs; it gets at most 30 seconds.\n• Call a tool on an MCP server you've added below — programs on this Mac that offer their own tools (a filesystem server, a database server) to the model.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("Approving is the real safeguard, and it has limits worth knowing: there is no sandbox around an approved command or call. A command you approve runs with your own full permissions, from inside the folder shown — what it does from there is up to the command. Commands and server calls CANNOT be undone, and the list says so before you approve. Commands that look obviously destructive (force-deleting, running as root, erasing a disk, piping a download into a shell) start UNCHECKED on the list, with the reason shown — they take a deliberate extra check from you before they can run. Everything proposed, approved, skipped, or discarded is written to the log below.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Toggle(isOn: $settings.powerToolsEnabled) {
+                Text("Let the model propose commands and server calls")
+            }
+            if settings.powerToolsEnabled {
+                mcpServersBlock
+            }
+        }
+    }
+
+    /// The MCP server list: the user's own servers, each with its
+    /// launch recipe, an enable switch, its live status, and a
+    /// remove button — plus the add form. Servers start lazily from
+    /// chats; nothing here launches one.
+    private var mcpServersBlock: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("MCP servers")
+                .font(.subheadline)
+                .fontWeight(.semibold)
+            Text("MCP (Model Context Protocol) servers are programs that offer tools to models. This app talks to LOCAL servers over their standard input and output (called stdio) — you give the command that launches one, and the app starts it when a chat first needs its tools, and stops it when you switch it off, remove it, or quit the app. Hosted or HTTP MCP servers aren't supported yet.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if mcpServerStore.configs.isEmpty {
+                Text("No servers added yet.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(mcpServerStore.configs) { config in
+                    mcpServerRow(config)
+                }
+            }
+            Divider()
+            Text("Add a server")
+                .font(.subheadline)
+                .fontWeight(.medium)
+            TextField("Name (e.g. Files)", text: $mcpName)
+                .textFieldStyle(.roundedBorder)
+            TextField("Launch command (e.g. npx, or /usr/local/bin/uvx)", text: $mcpCommand)
+                .textFieldStyle(.roundedBorder)
+            TextField("Arguments, separated by spaces", text: $mcpArguments)
+                .textFieldStyle(.roundedBorder)
+            HStack {
+                Button("Add Server") { addMCPServer() }
+                    .disabled(mcpName.trimmingCharacters(in: .whitespaces).isEmpty
+                              || mcpCommand.trimmingCharacters(in: .whitespaces).isEmpty)
+                Spacer()
+            }
+            Text("Example: name \u{201C}Files\u{201D}, command \u{201C}npx\u{201D}, arguments \u{201C}-y @modelcontextprotocol/server-filesystem /Users/you/Shared\u{201D}. One limit: because arguments are separated by spaces, an argument that itself contains a space can't be entered yet.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.top, 4)
+    }
+
+    private func mcpServerRow(_ config: MCPServerConfig) -> some View {
+        let status = mcpManager.status(for: config.id)
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 8) {
+                Toggle(isOn: Binding(
+                    get: { config.isEnabled },
+                    set: { newValue in
+                        mcpServerStore.setEnabled(newValue, id: config.id)
+                        if newValue {
+                            // A re-enabled server deserves a fresh
+                            // start (clears a recorded failure too).
+                            mcpManager.resetServer(id: config.id)
+                        } else {
+                            mcpManager.stopServer(id: config.id)
+                        }
+                    }
+                )) {
+                    Text(config.name)
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+                }
+                Spacer()
+                if status.isFailed {
+                    Button("Try Again") {
+                        mcpManager.resetServer(id: config.id)
+                    }
+                    .font(.caption)
+                }
+                Button(role: .destructive) {
+                    mcpManager.stopServer(id: config.id)
+                    mcpServerStore.remove(id: config.id)
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless)
+                .help("Remove this server")
+            }
+            Text(config.launchSummary)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+            Text(status.settingsText)
+                .font(.caption)
+                .foregroundStyle(status.isFailed ? .orange : .secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func addMCPServer() {
+        let name = mcpName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let command = mcpCommand.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, !command.isEmpty else { return }
+        mcpServerStore.add(MCPServerConfig(
+            name: name, command: command,
+            arguments: MCPArgumentsField.parse(mcpArguments),
+            isEnabled: true))
+        mcpName = ""
+        mcpCommand = ""
+        mcpArguments = ""
+    }
+
     // MARK: - Quick panel (Phase 7)
 
     private var quickPanelSection: some View {
@@ -420,7 +569,7 @@ struct SettingsView: View {
                     .font(.callout)
                 }
             }
-            Text("Everything a model does is recorded here — every lookup, and every proposed, approved, discarded, or undone file change. The newest \(AccessLogPolicy.maxRecords) are kept; older ones fall off.")
+            Text("Everything a model does is recorded here — every lookup, and every proposed, approved, discarded, or undone file change, command, and server call. The newest \(AccessLogPolicy.maxRecords) are kept; older ones fall off.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
             if recentRecords.isEmpty {

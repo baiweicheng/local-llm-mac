@@ -83,8 +83,19 @@ enum PlannedActionKind: String, Codable, Sendable, CaseIterable {
     case editText
     case trash
     case resizePhoto
+    /// Phase 9: run a shell command (propose-only, like everything
+    /// here — see `Core/PowerTools.swift`). Not undoable.
+    case runCommand
+    /// Phase 9: call a tool on one of the user's MCP servers.
+    /// Not undoable.
+    case mcpCall
 
-    /// The tool whose call proposes this kind of action.
+    /// The tool whose call proposes this kind of action. MCP calls
+    /// have no single tool name (each server tool is its own), so
+    /// this is the fallback identity used for icons and the audit
+    /// log when the concrete name isn't at hand — the runtime's
+    /// events and the decided record carry the real namespaced
+    /// name from the action itself.
     var toolName: String {
         switch self {
         case .rename: return "rename_file"
@@ -94,6 +105,8 @@ enum PlannedActionKind: String, Codable, Sendable, CaseIterable {
         case .editText: return "edit_text_file"
         case .trash: return "trash_file"
         case .resizePhoto: return "resize_photo"
+        case .runCommand: return "run_command"
+        case .mcpCall: return "mcp_tool"
         }
     }
 
@@ -103,6 +116,33 @@ enum PlannedActionKind: String, Codable, Sendable, CaseIterable {
             return
         }
         return nil
+    }
+
+    /// Icon for plan cards. File kinds match their tool's icon;
+    /// the power kinds have their own.
+    var symbolName: String {
+        switch self {
+        case .rename: return "pencil"
+        case .move: return "arrow.right.square"
+        case .copy: return "doc.on.doc"
+        case .createFolder: return "folder.badge.plus"
+        case .editText: return "square.and.pencil"
+        case .trash: return "trash"
+        case .resizePhoto: return "arrow.down.right.and.arrow.up.left"
+        case .runCommand: return "terminal"
+        case .mcpCall: return "puzzlepiece.extension"
+        }
+    }
+
+    /// Whether executing this kind can be taken back with Undo.
+    /// File changes can; a command that has run, or a call another
+    /// program has answered, has already happened — the cards say
+    /// so up front rather than pretending otherwise.
+    var isUndoable: Bool {
+        switch self {
+        case .runCommand, .mcpCall: return false
+        default: return true
+        }
     }
 }
 
@@ -128,6 +168,27 @@ struct PlannedAction: Codable, Sendable, Equatable, Identifiable {
     /// resizePhoto only: the caps the user approved seeing.
     var maxWidthPx: Int?
     var byteCeiling: Int?
+    /// runCommand only (Phase 9): the EXACT command text and the
+    /// folder it runs in (already scope-checked + resolved). The
+    /// card renders the command verbatim — approval means "run
+    /// precisely this".
+    var commandText: String?
+    var workingDirectory: String?
+    /// Any kind, set when a proposal needs extra care: for a
+    /// command, the `DangerousCommandClassifier`'s reason. A
+    /// non-nil warning means the item starts UNCHECKED on the
+    /// approval list — the user must deliberately check it before
+    /// Approve can run it — and renders with a warning marker.
+    var dangerWarning: String?
+    /// mcpCall only (Phase 9): the server (by id and display name),
+    /// the tool's own name, its full namespaced name, and the
+    /// arguments in canonical JSON — everything the card shows and
+    /// the executor sends.
+    var mcpServerID: UUID?
+    var mcpServerName: String?
+    var mcpToolName: String?
+    var mcpNamespacedName: String?
+    var mcpArgumentsJSON: String?
     var summary: String
 
     init(id: UUID = UUID(),
@@ -139,6 +200,14 @@ struct PlannedAction: Codable, Sendable, Equatable, Identifiable {
          appendEdit: Bool = false,
          maxWidthPx: Int? = nil,
          byteCeiling: Int? = nil,
+         commandText: String? = nil,
+         workingDirectory: String? = nil,
+         dangerWarning: String? = nil,
+         mcpServerID: UUID? = nil,
+         mcpServerName: String? = nil,
+         mcpToolName: String? = nil,
+         mcpNamespacedName: String? = nil,
+         mcpArgumentsJSON: String? = nil,
          summary: String) {
         self.id = id
         self.kind = kind
@@ -149,8 +218,20 @@ struct PlannedAction: Codable, Sendable, Equatable, Identifiable {
         self.appendEdit = appendEdit
         self.maxWidthPx = maxWidthPx
         self.byteCeiling = byteCeiling
+        self.commandText = commandText
+        self.workingDirectory = workingDirectory
+        self.dangerWarning = dangerWarning
+        self.mcpServerID = mcpServerID
+        self.mcpServerName = mcpServerName
+        self.mcpToolName = mcpToolName
+        self.mcpNamespacedName = mcpNamespacedName
+        self.mcpArgumentsJSON = mcpArgumentsJSON
         self.summary = summary
     }
+
+    /// Whether this item must be explicitly opted in on the
+    /// approval list before it can run (see `dangerWarning`).
+    var requiresExplicitOptIn: Bool { dangerWarning != nil }
 }
 
 /// The raw material for a proposal, as the runtime assembles it from
@@ -169,6 +250,17 @@ struct ActionInputs: Sendable, Equatable {
     var libraryPhotoName: String?
     var maxWidthPx: Int = 1200
     var byteCeiling: Int = 512_000
+    // Phase 9: shell + MCP raw material.
+    /// runCommand: the exact command text.
+    var commandText: String?
+    /// runCommand: the requested working folder (already resolved);
+    /// nil means "the first shared folder".
+    var workingDirectory: String?
+    /// mcpCall: the tool, as the runtime resolved it from the
+    /// namespaced tool name the model called — server identity plus
+    /// the raw arguments string the model supplied.
+    var mcpTool: MCPToolInfo?
+    var mcpArgumentsRaw: String?
 }
 
 /// A proposal attempt's outcome: an action ready for the list, or
@@ -199,6 +291,8 @@ enum ActionProposal {
         case .editText: return editText(inputs: inputs, roots: roots, probe: probe, home: home)
         case .trash: return trash(inputs: inputs, roots: roots, probe: probe, home: home)
         case .resizePhoto: return resizePhoto(inputs: inputs, roots: roots, probe: probe, home: home)
+        case .runCommand: return runCommand(inputs: inputs, roots: roots, probe: probe, home: home)
+        case .mcpCall: return mcpCall(inputs: inputs, roots: roots, probe: probe, home: home)
         }
     }
 
@@ -455,6 +549,72 @@ enum ActionProposal {
             maxWidthPx: inputs.maxWidthPx, byteCeiling: inputs.byteCeiling,
             summary: summary))
     }
+
+    // MARK: Phase 9 — power tools
+
+    /// A shell command. The scope rule is about where it RUNS: the
+    /// working folder must be inside a shared folder (defaulting to
+    /// the first one). What the command then does from there is the
+    /// command's own business — that's exactly why it sits behind
+    /// the power-tools switch plus this approval, and why the card
+    /// shows the exact text. A dangerous-pattern hit doesn't refuse
+    /// the proposal; it marks it opt-in-only (see `dangerWarning`).
+    private static func runCommand(inputs: ActionInputs, roots: [String],
+                                   probe: FileSystemProbe, home: String) -> ProposalOutcome {
+        let command = (inputs.commandText ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !command.isEmpty else {
+            return .refused("Running a command needs the command itself (command) — none was given.")
+        }
+        guard !roots.isEmpty else {
+            return .refused("Commands run inside a shared folder, and no folders are shared with the app yet. The user can share folders in Settings → What this app can see → Shared folders.")
+        }
+        let workingDirectory: String
+        if let requested = inputs.workingDirectory, !requested.isEmpty {
+            guard inScope(requested, roots: roots) else {
+                return .refused(outsideScopeMessage(roots: roots))
+            }
+            guard probe.isDirectory(atPath: requested) else {
+                return .refused("The folder \(PathDisplay.shortened(requested, home: home)) doesn't exist, so the command can't run there.")
+            }
+            workingDirectory = requested
+        } else {
+            workingDirectory = roots[0]
+        }
+        let warning = DangerousCommandClassifier.assess(command).reason
+        let oneLine = command
+            .split(whereSeparator: { $0 == "\n" })
+            .joined(separator: " ⏎ ")
+        let summary = "Run in \(PathDisplay.shortened(workingDirectory, home: home)): \(String(oneLine.prefix(140)))"
+        return .proposed(PlannedAction(
+            kind: .runCommand, commandText: command,
+            workingDirectory: workingDirectory,
+            dangerWarning: warning, summary: summary))
+    }
+
+    /// A call to one of the user's MCP servers. The runtime has
+    /// already resolved the namespaced tool name to the server's
+    /// tool (`inputs.mcpTool`); what's validated here is the
+    /// arguments — canonicalized once, so the card, the dedupe, and
+    /// the wire all carry the identical text.
+    private static func mcpCall(inputs: ActionInputs, roots: [String],
+                                probe: FileSystemProbe, home: String) -> ProposalOutcome {
+        guard let tool = inputs.mcpTool else {
+            return .refused("That tool isn't available — its MCP server may be off or may have stopped. The user can check it in Settings → Power tools.")
+        }
+        switch MCPArguments.canonicalize(inputs.mcpArgumentsRaw) {
+        case .refused(let reason):
+            return .refused(reason)
+        case .ok(let canonical):
+            let summary = "Ask \(tool.serverName) to run “\(tool.toolName)”"
+            return .proposed(PlannedAction(
+                kind: .mcpCall, mcpServerID: tool.serverID,
+                mcpServerName: tool.serverName,
+                mcpToolName: tool.toolName,
+                mcpNamespacedName: tool.namespacedName,
+                mcpArgumentsJSON: canonical, summary: summary))
+        }
+    }
 }
 
 // MARK: - Execution pre-check
@@ -530,6 +690,30 @@ enum ActionExecution {
                 return "Something is already at the destination, and a change never overwrites it."
             }
             return nil
+        case .runCommand:
+            // Phase 9: the folder it runs in must still be shared
+            // and still there. (What the command itself does is not
+            // re-judged — the user approves the exact text.)
+            guard let command = action.commandText, !command.isEmpty else {
+                return "The command text is missing."
+            }
+            guard let directory = action.workingDirectory, scoped(directory) else {
+                return "The folder it was to run in is no longer shared."
+            }
+            guard probe.isDirectory(atPath: directory) else {
+                return "The folder it was to run in isn't there anymore."
+            }
+            return nil
+        case .mcpCall:
+            // Phase 9: the pure pre-check can only confirm the
+            // proposal is complete; whether the server is still
+            // configured, enabled, and running is the executor's
+            // live check (it fails just this item if not).
+            guard action.mcpServerID != nil, action.mcpToolName != nil,
+                  action.mcpArgumentsJSON != nil else {
+                return "The call is missing its server, tool, or arguments."
+            }
+            return nil
         }
     }
 }
@@ -569,11 +753,17 @@ struct ExecutedActionItem: Codable, Sendable, Equatable {
     var trashResultPath: String?
     /// What undo did with this item, once undo has run.
     var undoNote: String?
+    /// Phase 9: the substance of what happened, beyond the one-line
+    /// note — a command's output (tail-capped for the model) or an
+    /// MCP call's result text. Shown on the decided card and quoted
+    /// in the note the model gets, since for these two kinds the
+    /// output IS the point.
+    var modelDetail: String?
 
     init(action: PlannedAction, outcome: Outcome, resultNote: String,
          artifactPath: String? = nil, artifactBytes: Int? = nil,
          backupPath: String? = nil, trashResultPath: String? = nil,
-         undoNote: String? = nil) {
+         undoNote: String? = nil, modelDetail: String? = nil) {
         self.action = action
         self.outcome = outcome
         self.resultNote = resultNote
@@ -582,6 +772,7 @@ struct ExecutedActionItem: Codable, Sendable, Equatable {
         self.backupPath = backupPath
         self.trashResultPath = trashResultPath
         self.undoNote = undoNote
+        self.modelDetail = modelDetail
     }
 
     var succeeded: Bool { outcome == .done }
@@ -620,6 +811,10 @@ enum ActionPlanRules {
                 && existing.destinationPath == candidate.destinationPath
                 && existing.editText == candidate.editText
                 && existing.appendEdit == candidate.appendEdit
+                && existing.commandText == candidate.commandText
+                && existing.workingDirectory == candidate.workingDirectory
+                && existing.mcpNamespacedName == candidate.mcpNamespacedName
+                && existing.mcpArgumentsJSON == candidate.mcpArgumentsJSON
         }
     }
 }
@@ -716,6 +911,20 @@ enum ActionUndo {
                     itemID: item.action.id,
                     kind: .trashFile(path: destination),
                     description: "Move the resized copy \(name(destination)) to the Trash (the original is untouched)")
+            case .runCommand:
+                // Phase 9: a command that has run can't be un-run.
+                // The step exists so the card SAYS that (rather than
+                // the item silently having no undo), and
+                // `hasUndoableSteps` correctly ignores it.
+                return UndoStep(
+                    itemID: item.action.id,
+                    kind: .notUndoable(reason: "a command that has run can't be un-run"),
+                    description: "Can't undo — the command already ran.")
+            case .mcpCall:
+                return UndoStep(
+                    itemID: item.action.id,
+                    kind: .notUndoable(reason: "the server already answered the call"),
+                    description: "Can't undo — \(action.mcpServerName ?? "the server") already ran the call.")
             }
         }
     }

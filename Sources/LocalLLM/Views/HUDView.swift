@@ -267,30 +267,35 @@ struct HUDConversationView: View {
 
     // MARK: - Approval deferral
 
-    /// A pending file-change list, shown WITHOUT an Approve button:
-    /// the changes are listed so the user knows they're waiting, and
+    /// A pending approval list, shown WITHOUT an Approve button:
+    /// the items are listed so the user knows they're waiting, and
     /// the only action offered is opening the main window, where
-    /// the real approval card lives.
+    /// the real approval card lives. Phase 9: the same deferral
+    /// covers proposed commands and MCP calls — including the
+    /// warning marker on a flagged command, so the danger is
+    /// visible here even though the decision happens there.
     private var approvalDeferralCard: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 Image(systemName: "checklist")
                     .foregroundStyle(.orange)
                 Text(pendingActions.count == 1
-                     ? "1 file change needs your approval in the main window"
-                     : "\(pendingActions.count) file changes need your approval in the main window")
+                     ? "1 proposed action needs your approval in the main window"
+                     : "\(pendingActions.count) proposed actions need your approval in the main window")
                     .font(.callout)
                     .fontWeight(.semibold)
                 Spacer()
             }
             ForEach(pendingActions) { action in
-                Text("• \(action.summary)")
+                Text(action.requiresExplicitOptIn
+                     ? "• ⚠ \(action.summary)"
+                     : "• \(action.summary)")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             HStack {
-                Text("Nothing has changed yet — approving always happens in the main window, never from this panel.")
+                Text("Nothing has changed or run yet — approving always happens in the main window, never from this panel.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()

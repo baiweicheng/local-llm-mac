@@ -124,8 +124,13 @@ final class VisibilityToolsTests: XCTestCase {
     }
 
     func testAllSourcesEnabledMeansTheWholeCatalog() {
+        // "The whole catalog" now means every gate open: the action
+        // tools (Phase 6) and the power tools (Phase 9) sit behind
+        // their own toggles, so both are enabled here on purpose.
         let descriptors = ToolCatalog.descriptors(
-            enabledSources: Set(VisibilitySource.allCases))
+            enabledSources: Set(VisibilitySource.allCases),
+            fileWritingEnabled: true,
+            powerToolsEnabled: true)
         XCTAssertEqual(descriptors.count, ToolCatalog.all.count)
     }
 
