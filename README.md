@@ -55,6 +55,29 @@ take a minute or two.
   its "context window" — is 4,096 tokens, shared between instructions and
   the conversation). The count is an estimate, labeled with ≈.
 
+## What's new in Phase 2
+
+- **Long conversations that manage themselves.** The model's memory is
+  only 4,096 tokens, so before each message the app checks whether the
+  conversation still fits. When it gets close to full, the oldest
+  messages are **summarized by the on-device model itself** into a
+  running summary, and the newest messages stay word-for-word. Your
+  system instructions are never summarized away. In the transcript, a
+  divider — *"Earlier messages were summarized to fit the model's
+  memory"* — marks where the summary takes over. **Nothing is deleted:**
+  the full history stays in the app; only the model's working memory is
+  compacted. If summarizing itself ever fails, the app falls back to a
+  plain note of the topics covered, so a long chat never just breaks.
+- **Image attachments.** Attach pictures to a message with the paperclip
+  button, by dragging image files into the window, or by pasting (⌘V)
+  with the composer focused — up to 4 per message. Images are shrunk to
+  a sensible size before they're stored, shown as thumbnails in the
+  transcript (click one to see it full-size in Preview), and sent to the
+  model with your message so you can ask about them ("What's in this
+  screenshot?", "Transcribe this receipt"). Everything still happens
+  on-device. Note that images use up model memory faster than text —
+  each one is budgeted at roughly 400 tokens.
+
 ## Good to know
 
 - The built-in model is small (~3 billion parameters). It's good at chat,
@@ -62,13 +85,13 @@ take a minute or two.
   not the right tool for heavy math, coding, or factual deep-dives.
   Bigger local models (MLX) and an optional cloud tier arrive in later
   phases.
-- If you reopen an old chat after restarting the app, the model gets a
-  short written recap of the earlier conversation with your next message,
-  so the thread isn't lost. Real long-conversation handling (summarizing
-  and compacting) is Phase 2.
+- If you reopen an old chat after restarting the app, the model is
+  re-seeded with the summary (if the chat was compacted) plus the recent
+  messages, so the thread isn't lost.
 - To run the unit tests: in Xcode, **Product → Test** (⌘U). They cover
   the behind-the-scenes logic (instructions, token estimates, markdown
-  splitting) and never call the real model.
+  splitting, context budgets, compaction planning, summary merging,
+  attachment storage) and never call the real model.
 
 ## Where this is going
 
