@@ -25,24 +25,26 @@ import Foundation
 ///    other call, so proposals and executions both appear in the
 ///    audit log.
 ///
-/// PRIVACY: tool results are local data. In this phase every
-/// tool-capable backend is local (the on-device model and MLX models
-/// run on this Mac; endpoint chats get no tools), so results never
-/// leave the machine and `redactResults` is false. The flag exists
-/// for Phase 8's cloud tier: when a framework cloud backend (Private
-/// Cloud Compute / OpenRouter) ever hosts tools, the engine sets it
-/// and results pass through the Phase 4 `Redactor` here, before
-/// returning — the one choke point no result can bypass. Tools are
-/// likewise disabled entirely under Local Only for any network backend
-/// (today: endpoint chats have no tools at all, under any setting).
+/// PRIVACY: tool results are local data. While every tool-capable
+/// backend was local (Phases 5–7), results never left the machine
+/// and `redactResults` stayed false. Phase 8 turns the flag ON for
+/// the one tool host that is remote — Private Cloud Compute: the
+/// engine builds a PCC session's runtime with `redactResults` set
+/// and the user's custom terms attached, and every result passes
+/// through the Phase 4 `Redactor` HERE, before returning — the one
+/// choke point no result can bypass, whichever tool produced it.
+/// (OpenRouter, like the Phase 3 servers, hosts no tools at all;
+/// and under Local Only the factory refuses cloud backends before
+/// a session can exist.)
 actor ToolRuntime {
 
     struct Configuration: Sendable {
         var conversationID: UUID
         var enabledSources: Set<VisibilitySource>
         var folderRootPaths: [String]
-        /// Phase 8 hook — see the type comment. False for every
-        /// tool-capable backend that exists in Phase 5.
+        /// Phase 8: on when this session's tool host is remote
+        /// (Private Cloud Compute) — results are scrubbed before
+        /// returning. False for local hosts (on-device, MLX).
         var redactResults: Bool
         var redactionTerms: [String]
         /// Phase 6: the file-writing Settings toggle, snapshotted

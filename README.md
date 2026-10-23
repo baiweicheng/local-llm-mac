@@ -393,6 +393,78 @@ Accessibility permission. If the app isn't running, there's no
 panel — the main window is still home; the panel is an extra door,
 not a replacement.
 
+## What's new in Phase 8
+
+**The cloud tier: two ways to reach a bigger brain, both behind
+the privacy check.** The model picker gains two cloud destinations,
+and a chat using one wears a **Cloud** badge in its header so it's
+never a surprise. Local models remain the default for almost
+everything — the cloud is there for the prompts that genuinely
+outgrow this Mac.
+
+**Apple Private Cloud** is Apple's own cloud model: it runs on
+Apple's servers under Apple's privacy design (requests aren't
+stored or used for training), has a much bigger memory than the
+built-in model, and needs no key or account — macOS decides whether
+it's available on your Mac, and the picker says so when it isn't.
+It costs nothing beyond having the Mac. It can also make lookups
+(calendar, files, photos…): because the answers would leave the
+Mac, **every lookup result passes the privacy check before it's
+sent** — the one door results can't slip around. Note that Private
+Cloud is *not* "local": while **Local Only** is on, it's refused
+like any other off-Mac destination, because Local Only means
+nothing leaves the machine.
+
+**OpenRouter** is one key that opens the frontier models from
+every major lab, billed per reply to your own OpenRouter account.
+The shortlist in the picker was checked against OpenRouter's live
+model list when this version was built (October 2026): **Claude
+Opus 5.5** and **Claude Sonnet 5.5** (Anthropic), **GPT-6 Astra**
+and **GPT-6.1 Sol** (OpenAI), **Gemini 3.8 Flash** (Google's most
+capable model there at the time), and **Kimi K3.1 Pro** (Moonshot's
+open-weight flagship). Any other model on OpenRouter can be added
+from Settings → **Cloud models** by typing its model id. OpenRouter
+chats are text-only for now: no lookups, no file changes — the same
+deal server chats have always had.
+
+**Your key, your Keychain.** The app ships with **no key**, and
+everything local works without one. When you're ready, paste your
+OpenRouter key into Settings → Cloud models: it's stored in this
+Mac's **Keychain** — nowhere else, never in a settings file — and
+is only ever sent to OpenRouter itself, as the sign-in for your
+requests. Add it whenever you like (today, next month, never);
+until then the OpenRouter rows in the picker simply say they need
+your key. Removing the key is one button in the same place.
+
+**Auto's cloud route is live.** Before Phase 8, a prompt Auto
+judged "needs a frontier cloud model" went to the best local
+stand-in, with a note. Now it goes to the cloud for real: to
+OpenRouter's strongest shortlisted model when your key is saved,
+otherwise to Apple Private Cloud, and only if neither is available
+does a local model stand in — with the note now telling you what
+would unlock the real route. Under Local Only, Auto never routes
+to the cloud at all. Either way, the header note says which model
+got the message, and the **privacy check runs first, always**: the
+instructions, the message, and any folded-in history are scrubbed
+of secrets and personal details before anything leaves, and a
+banner tells you when something was hidden.
+
+**Honest costs.** A cloud reply's pill (under the answer) shows
+the real cost OpenRouter reported for that reply — usually a
+fraction of a cent, shown as $0.0042 rather than rounded away. If
+OpenRouter doesn't report a cost, the pill says **cost unknown**
+instead of pretending the reply was free. Private Cloud replies
+show $0.00 (Apple includes it), labeled as Apple's cloud.
+
+**Compare two models, side by side.** The new split-rectangle
+button in the chat header opens compare mode: pick any two models
+— local or cloud — type one question, and both answers stream in
+together, each with its own pill. It's a single fresh question (no
+chat history, no lookups), which makes it the cleanest way to feel
+the difference between models. **Continue with this one** under an
+answer turns that exchange into a normal chat on the winning model
+and switches you to it, question and answer already in place.
+
 ## Good to know
 
 - The built-in model is small (~3 billion parameters). It's good at chat,
@@ -420,10 +492,9 @@ not a replacement.
 
 ## Where this is going
 
-This is phase 7 of a larger build (see the project plan): the main
+This is phase 8 of a larger build (see the project plan): the main
 window and the quick panel are both in place — two front doors over
-one engine. Next comes an optional cloud tier via OpenRouter —
-which will inherit Phase 4's privacy check (and its habit of
-reusing the conversation summary instead of raw history) before
-anything leaves the Mac — followed by advanced tools and the final
-polish pass.
+one engine — and the cloud tier (Apple Private Cloud + OpenRouter)
+now sits behind Phase 4's privacy check, so local stays the default
+and the cloud is a labeled, costed choice. What remains is the
+optional power-tools phase and the final polish pass.

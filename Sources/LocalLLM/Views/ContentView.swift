@@ -25,6 +25,14 @@ import SwiftData
 /// "open this conversation" requests from it — both the live
 /// callback and the pending slot it drains on appear, which covers
 /// the main window having been closed when Open was pressed.
+///
+/// Phase 8: it also owns the OpenRouter key store (the Keychain —
+/// the shell reads the key value in exactly one place, the backend
+/// resolver below, and hands it to the factory) and wires the
+/// cloud facts into routing: whether a key exists (never the key)
+/// and whether Private Cloud Compute is offered right now. The
+/// same resolver serves the engine and compare mode, so both
+/// resolve selections identically.
 struct ContentView: View {
     @State private var engine = ChatEngine()
     @State private var mlxStore = MLXModelStore()
@@ -32,10 +40,24 @@ struct ContentView: View {
     @State private var settings = AppSettings()
     @State private var fileScopeStore = FileScopeStore()
     @State private var permissionCenter = PermissionCenter()
+    @State private var openRouterKeyStore = OpenRouterKeyStore()
     @State private var selection: Conversation?
     let hudCoordinator: HUDCoordinator
     @Environment(\.modelContext) private var modelContext
     @Environment(\.openWindow) private var openWindow
+
+    /// The one backend-resolution path: a stored selection plus the
+    /// live world (downloads, servers, the lock, the KV mode, the
+    /// Keychain key) → a live backend.
+    private func resolveBackend(_ selection: ModelSelection) -> ResolvedBackend {
+        BackendFactory.resolve(
+            selection: selection,
+            downloadedMLXRepoIDs: mlxStore.downloadedRepoIDs,
+            endpoints: endpointStore.configs,
+            localOnly: settings.localOnly,
+            kvCacheMode: settings.kvCacheMode,
+            openRouterAPIKey: openRouterKeyStore.currentKey())
+    }
 
     var body: some View {
         NavigationSplitView {
@@ -46,7 +68,12 @@ struct ContentView: View {
                 ChatView(conversation: conversation, engine: engine,
                          mlxStore: mlxStore, endpointStore: endpointStore,
                          settings: settings, fileScopeStore: fileScopeStore,
-                         permissionCenter: permissionCenter)
+                         permissionCenter: permissionCenter,
+                         openRouterKeyStore: openRouterKeyStore,
+                         backendResolver: resolveBackend,
+                         onCompareContinue: { conversation in
+                             selection = conversation
+                         })
                     .id(conversation.id)
             } else {
                 ContentUnavailableView(
@@ -59,19 +86,17 @@ struct ContentView: View {
         .frame(minWidth: 760, minHeight: 480)
         .onAppear {
             engine.configureBackendProvider { selection in
-                BackendFactory.resolve(
-                    selection: selection,
-                    downloadedMLXRepoIDs: mlxStore.downloadedRepoIDs,
-                    endpoints: endpointStore.configs,
-                    localOnly: settings.localOnly,
-                    kvCacheMode: settings.kvCacheMode)
+                resolveBackend(selection)
             }
             engine.configureRoutingContextProvider {
                 RoutingInputs(
                     downloadedMLX: mlxStore.downloadedModels,
                     endpoints: endpointStore.configs,
                     localOnly: settings.localOnly,
-                    cloudAvailable: false, // Phase 8 brings cloud backends
+                    // Phase 8: routing learns THAT a key exists and
+                    // whether PCC is offered — never the key itself.
+                    openRouterKeyPresent: openRouterKeyStore.hasKey,
+                    pccReady: PCCAvailabilityReader.isReady,
                     onDeviceReady: ModelAvailabilityState.current.canChat,
                     customRedactionTerms: settings.customRedactionTerms,
                     kvCacheMode: settings.kvCacheMode)

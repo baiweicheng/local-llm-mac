@@ -46,9 +46,10 @@ struct MessageBubble: View {
 
 /// The Phase 4 execution-telemetry pill under an assistant reply:
 /// which backend actually answered, how long it took, roughly how
-/// many tokens the reply is, and what it cost — $0.00 while every
-/// backend is local. Subtle on purpose; the details are in the help
-/// text.
+/// many tokens the reply is, and what it cost. Phase 8: cloud
+/// replies carry their real reported cost (or "cost unknown" when
+/// the provider reported none). Subtle on purpose; the details are
+/// in the help text.
 struct TelemetryPill: View {
     let telemetry: MessageTelemetry
 
@@ -59,7 +60,24 @@ struct TelemetryPill: View {
             .padding(.horizontal, 7)
             .padding(.vertical, 2)
             .background(Color.secondary.opacity(0.10), in: Capsule())
-            .help("Handled by \(telemetry.backendLabel) in \(TelemetryFormat.durationText(telemetry.seconds)) · about \(telemetry.estimatedTokens) tokens (estimated) · local models are always free")
+            .help(helpText)
+    }
+
+    private var helpText: String {
+        let base = "Handled by \(telemetry.backendLabel) in "
+            + "\(TelemetryFormat.durationText(telemetry.seconds)) · "
+            + "about \(telemetry.estimatedTokens) tokens (estimated)"
+        if !telemetry.costKnown {
+            return base + " · OpenRouter didn't report what this "
+                + "reply cost"
+        }
+        if telemetry.costUSD > 0 {
+            return base + " · cost as reported by OpenRouter"
+        }
+        if telemetry.backendLabel.hasPrefix("Cloud") {
+            return base + " · included with Apple — no charge"
+        }
+        return base + " · local models are always free"
     }
 }
 

@@ -390,7 +390,11 @@ final class LocalLLMTests: XCTestCase {
             endpoints: EndpointConfig.defaultConfigs,
             onDeviceReady: true)
         // Phase 4: Auto leads the picker, then the built-in model.
-        XCTAssertEqual(rows.count, 1 + 1 + 2 + 2)
+        // Phase 8: Apple Private Cloud follows the built-in model,
+        // and the OpenRouter shortlist closes the list (default
+        // cloud inputs: no key, PCC not ready — rows exist but
+        // report not-ready).
+        XCTAssertEqual(rows.count, 1 + 1 + 1 + 2 + 2 + OpenRouterCatalog.models.count)
         XCTAssertEqual(rows[0].selection, .auto)
         XCTAssertEqual(rows[0].displayName, "Auto")
         XCTAssertTrue(rows[0].isReady)
@@ -398,12 +402,19 @@ final class LocalLLMTests: XCTestCase {
         XCTAssertEqual(rows[1].displayName, "Apple On-Device")
         XCTAssertEqual(rows[1].budget.windowTokens, 4_096)
         XCTAssertTrue(rows[1].isReady)
-        XCTAssertEqual(rows[2].selection, .mlx(repoID: downloaded[0].repoID))
+        XCTAssertEqual(rows[2].selection, .privateCloudCompute)
         XCTAssertEqual(rows[2].budget.windowTokens,
+                       ContextBudget.privateCloudCompute.windowTokens)
+        XCTAssertFalse(rows[2].isReady)
+        XCTAssertEqual(rows[3].selection, .mlx(repoID: downloaded[0].repoID))
+        XCTAssertEqual(rows[3].budget.windowTokens,
                        ContextBudget.mlxLocal.windowTokens)
-        XCTAssertEqual(rows[4].selection,
+        XCTAssertEqual(rows[5].selection,
                        .endpoint(id: EndpointConfig.ollamaPresetID))
-        XCTAssertEqual(rows[5].displayName, "LM Studio")
+        XCTAssertEqual(rows[6].displayName, "LM Studio")
+        XCTAssertEqual(rows[7].selection,
+                       .openRouter(modelID: OpenRouterCatalog.best.modelID))
+        XCTAssertFalse(rows[7].isReady)
     }
 
     func testRegistryOnDeviceReadinessAndLookup() {
@@ -411,7 +422,10 @@ final class LocalLLMTests: XCTestCase {
             downloadedMLX: [], endpoints: [], onDeviceReady: false)
         // Phase 4: Auto + the built-in model; Auto stays "ready" (it
         // falls back gracefully), the on-device row reports the truth.
-        XCTAssertEqual(rows.count, 2)
+        // Phase 8: the PCC row and the OpenRouter shortlist are
+        // always listed too — with default cloud inputs (no key, PCC
+        // not ready) they report not-ready rather than vanishing.
+        XCTAssertEqual(rows.count, 2 + 1 + OpenRouterCatalog.models.count)
         XCTAssertEqual(rows[0].selection, .auto)
         XCTAssertTrue(rows[0].isReady)
         XCTAssertFalse(rows[1].isReady)
@@ -646,7 +660,8 @@ final class LocalLLMTests: XCTestCase {
     private func bareInputs(localOnly: Bool = false,
                             onDeviceReady: Bool = true) -> RoutingInputs {
         RoutingInputs(downloadedMLX: [], endpoints: [],
-                      localOnly: localOnly, cloudAvailable: false,
+                      localOnly: localOnly, openRouterKeyPresent: false,
+                      pccReady: false,
                       onDeviceReady: onDeviceReady)
     }
 
@@ -709,8 +724,11 @@ final class LocalLLMTests: XCTestCase {
         let viaServer = RoutingPolicy.decide(intent: .frontierCloud, inputs: inputs)
         XCTAssertEqual(viaServer.selection,
                        .endpoint(id: EndpointConfig.ollamaPresetID))
-        XCTAssertTrue(viaServer.reason.contains("later phase"))
+        // Phase 8: cloud backends exist — the stand-in now says no
+        // cloud ROUTE is ready and the note names the missing key.
+        XCTAssertTrue(viaServer.reason.contains("no cloud route is ready"))
         XCTAssertTrue(viaServer.reason.contains("stands in"))
+        XCTAssertTrue(viaServer.note?.contains("OpenRouter key") == true)
 
         // …then the biggest local model…
         inputs.endpoints = []
@@ -722,7 +740,7 @@ final class LocalLLMTests: XCTestCase {
         let viaOnDevice = RoutingPolicy.decide(intent: .frontierCloud,
                                                inputs: bareInputs())
         XCTAssertEqual(viaOnDevice.selection, .onDevice)
-        XCTAssertTrue(viaOnDevice.reason.contains("later phase"))
+        XCTAssertTrue(viaOnDevice.reason.contains("no cloud route is ready"))
     }
 
     func testRoutingFrontierCloudLocalOnlyNeverPicksEndpoint() {

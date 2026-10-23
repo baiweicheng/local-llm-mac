@@ -16,6 +16,15 @@ struct ChatView: View {
     let settings: AppSettings
     let fileScopeStore: FileScopeStore
     let permissionCenter: PermissionCenter
+    /// Phase 8: whether an OpenRouter key is saved (the picker reads
+    /// it for its cloud rows — never the key itself).
+    let openRouterKeyStore: OpenRouterKeyStore
+    /// Phase 8: backend resolution for compare mode — the same
+    /// factory path the engine uses, supplied by the app shell.
+    let backendResolver: (ModelSelection) -> ResolvedBackend
+    /// Phase 8: compare mode's "continue with this one" lands here —
+    /// the shell selects the seeded conversation.
+    let onCompareContinue: (Conversation) -> Void
     @Environment(\.modelContext) private var modelContext
 
     /// Phase 5: this conversation's tool-lookup records, oldest
@@ -31,7 +40,10 @@ struct ChatView: View {
     init(conversation: Conversation, engine: ChatEngine,
          mlxStore: MLXModelStore, endpointStore: EndpointStore,
          settings: AppSettings, fileScopeStore: FileScopeStore,
-         permissionCenter: PermissionCenter) {
+         permissionCenter: PermissionCenter,
+         openRouterKeyStore: OpenRouterKeyStore,
+         backendResolver: @escaping (ModelSelection) -> ResolvedBackend,
+         onCompareContinue: @escaping (Conversation) -> Void) {
         self.conversation = conversation
         self.engine = engine
         self.mlxStore = mlxStore
@@ -39,6 +51,9 @@ struct ChatView: View {
         self.settings = settings
         self.fileScopeStore = fileScopeStore
         self.permissionCenter = permissionCenter
+        self.openRouterKeyStore = openRouterKeyStore
+        self.backendResolver = backendResolver
+        self.onCompareContinue = onCompareContinue
         let id = conversation.id
         _toolRecords = Query(
             filter: #Predicate<ToolActivityRecord> { $0.conversationID == id },
@@ -52,6 +67,7 @@ struct ChatView: View {
     @State private var showingInstructions = false
     @State private var showingModels = false
     @State private var showingSettings = false
+    @State private var showingCompare = false
     @State private var showingFileImporter = false
     /// Images staged in the composer, waiting to go with the next send.
     @State private var pendingAttachments: [ImageAttachment] = []
@@ -114,7 +130,13 @@ struct ChatView: View {
         }
         .sheet(isPresented: $showingSettings) {
             SettingsView(settings: settings, fileScopeStore: fileScopeStore,
-                         permissionCenter: permissionCenter)
+                         permissionCenter: permissionCenter,
+                         openRouterKeyStore: openRouterKeyStore)
+        }
+        .sheet(isPresented: $showingCompare) {
+            CompareView(descriptors: descriptors,
+                        resolver: backendResolver,
+                        onContinue: onCompareContinue)
         }
         .sheet(isPresented: $showingModels) {
             ModelsView(mlxStore: mlxStore, endpointStore: endpointStore)
@@ -147,9 +169,19 @@ struct ChatView: View {
                 .foregroundStyle(.secondary)
             modelPicker
             statusPill
+            if conversation.modelSelection.isCloud {
+                cloudBadge
+            }
             if settings.localOnly {
                 lockBadge
             }
+            Button {
+                showingCompare = true
+            } label: {
+                Image(systemName: "rectangle.split.2x1")
+            }
+            .buttonStyle(.borderless)
+            .help("Compare two models on one prompt, side by side")
             Button {
                 showingInstructions = true
             } label: {
@@ -167,6 +199,19 @@ struct ChatView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
+    }
+
+    /// Phase 8: this chat's model runs in the cloud — said out loud
+    /// in the header, not just implied by the picker. (Auto chats
+    /// don't wear it: their route changes per message, and each
+    /// reply's pill names the backend that actually answered.)
+    private var cloudBadge: some View {
+        Label("Cloud", systemImage: "cloud")
+            .font(.caption)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(Color.purple.opacity(0.15), in: Capsule())
+            .help("This chat's model runs in the cloud, not on this Mac. What you send passes the privacy check first — secrets and personal details are hidden before anything leaves. Pick a local model above to keep everything on this Mac.")
     }
 
     /// The Local Only lock, visible wherever a chat is open so the
@@ -197,13 +242,18 @@ struct ChatView: View {
 
     // MARK: - Model picker (Phase 3)
 
-    /// Every backend this chat could use right now: the built-in model,
-    /// each downloaded MLX model, and each configured local server.
+    /// Every backend this chat could use right now: the built-in
+    /// model, Apple Private Cloud, each downloaded MLX model, each
+    /// configured local server, and the OpenRouter cloud models.
     private var descriptors: [BackendDescriptor] {
         BackendRegistry.descriptors(
             downloadedMLX: mlxStore.downloadedModels,
             endpoints: endpointStore.configs,
-            onDeviceReady: availability.canChat)
+            onDeviceReady: availability.canChat,
+            cloud: CloudPickerInputs(
+                pccReady: PCCAvailabilityReader.isReady,
+                openRouterKeyPresent: openRouterKeyStore.hasKey,
+                customOpenRouterModelID: settings.openRouterCustomModelID))
     }
 
     /// The row for this chat's current selection — nil when the model
@@ -459,10 +509,17 @@ struct ChatView: View {
 
     private var emptyStateText: String {
         if conversation.modelSelection.isAuto {
-            return "This chat is on Auto: each message is sorted on your Mac and given to the best local model for the job — the built-in model for quick things, a bigger downloaded model for hard ones. Nothing you type leaves the machine."
+            return "This chat is on Auto: each message is sorted on your Mac and given to the best model for the job — the built-in model for quick things, a bigger downloaded model for hard ones, and a cloud model when a prompt really needs one and a cloud route is set up. The note under the header always says which model got each message."
         }
         if conversation.modelSelection.isOnDevice {
             return "This chat runs on the model built into your Mac. Nothing you type leaves the machine."
+        }
+        if conversation.modelSelection.isCloud {
+            let name = selectedDescriptor?.displayName ?? "a cloud model"
+            if conversation.modelSelection == .privateCloudCompute {
+                return "This chat runs on \(name) — Apple's servers, under Apple's privacy design, at no charge. Before anything is sent, the privacy check hides secrets and personal details, and lookup results get the same check before they leave this Mac."
+            }
+            return "This chat runs on \(name) in the cloud. Before anything is sent, the privacy check hides secrets and personal details — and each reply's pill shows what it cost. Lookups on this Mac don't run in an OpenRouter chat."
         }
         let name = selectedDescriptor?.displayName ?? "a local model"
         return "This chat runs on \(name), on this Mac. Nothing you type leaves the machine."
@@ -490,16 +547,21 @@ struct ChatView: View {
     /// Phase 5: the honest gap, stated where the user will see it —
     /// visibility sources are enabled, but this chat's model is a
     /// local server, and server chats can't make lookups this phase.
+    /// Phase 8 adds the same gap for OpenRouter chats (Apple Private
+    /// Cloud CAN make lookups — its results pass the privacy check
+    /// first — so it never shows this note).
     private var showsToolsNote: Bool {
         guard settings.anyVisibilitySourceEnabled else { return false }
-        if case .endpoint = conversation.modelSelection { return true }
-        return false
+        switch conversation.modelSelection {
+        case .endpoint, .openRouter: return true
+        case .auto, .onDevice, .mlx, .privateCloudCompute: return false
+        }
     }
 
     private var toolsNoteBanner: some View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: "eye.slash")
-            Text("Lookups are off for this chat: they work with the Apple On-Device model and downloaded MLX models for now — a server chat like this one can't look things up on your Mac.")
+            Text(toolsNoteText)
                 .font(.callout)
             Spacer()
         }
@@ -507,16 +569,26 @@ struct ChatView: View {
         .background(Color.secondary.opacity(0.12))
     }
 
+    private var toolsNoteText: String {
+        if case .openRouter = conversation.modelSelection {
+            return "Lookups are off for this chat: they work with the models that run on this Mac and with Apple Private Cloud — a cloud chat like this one can't look things up on your Mac."
+        }
+        return "Lookups are off for this chat: they work with the Apple On-Device model and downloaded MLX models for now — a server chat like this one can't look things up on your Mac."
+    }
+
     /// When the Apple Intelligence banner matters: the built-in model
     /// is down AND this chat depends on it — an explicitly on-device
     /// chat always does; an Auto chat only when it has nothing else
-    /// (no downloaded MLX model and no server configured) to route to.
+    /// (no downloaded MLX model, no server configured, and no cloud
+    /// route — Phase 8) to route to.
     private var showsAvailabilityBanner: Bool {
         guard !availability.canChat else { return false }
         if conversation.modelSelection.isOnDevice { return true }
         if conversation.modelSelection.isAuto {
             return mlxStore.downloadedModels.isEmpty
                 && endpointStore.configs.isEmpty
+                && !openRouterKeyStore.hasKey
+                && !PCCAvailabilityReader.isReady
         }
         return false
     }

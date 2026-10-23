@@ -37,12 +37,18 @@ struct RoutingInputs: Equatable, Sendable {
     /// The Local Only lock (Settings). When on, no server backend may
     /// be used at all — only models that run on this Mac.
     var localOnly: Bool = false
-    /// Whether a frontier cloud backend exists yet. False throughout
-    /// Phase 4 — cloud arrives in Phase 8, which will add a cloud case
-    /// to `ModelSelection` and flip this on; until then a
-    /// `frontier_cloud` prompt routes to the best local stand-in and
-    /// says so, rather than pretending a cloud call happened.
-    var cloudAvailable: Bool = false
+    /// Phase 8: whether the user has saved an OpenRouter API key
+    /// (in the Keychain — routing only ever learns THAT one exists,
+    /// never the key itself). With a key, a `frontier_cloud` prompt
+    /// routes to OpenRouter's best curated model for real.
+    var openRouterKeyPresent: Bool = false
+    /// Phase 8: whether Private Cloud Compute is offered by the OS
+    /// right now. PCC is Auto's second cloud choice: no key needed,
+    /// but eligibility is Apple's call.
+    var pccReady: Bool = false
+    /// Whether any cloud route exists at all (derived from the two
+    /// inputs above). Never stored, so it can't drift out of sync.
+    var cloudAvailable: Bool { openRouterKeyPresent || pccReady }
     /// Whether the built-in on-device model can chat right now
     /// (Apple Intelligence on and ready). Routing avoids it when it's
     /// known to be down and something else can stand in.
@@ -155,38 +161,64 @@ enum RoutingPolicy {
             return decision
 
         case .frontierCloud:
-            // No cloud backend exists until Phase 8 — never fake one.
+            // Phase 8: cloud routes are real now. Preference order:
+            // OpenRouter's best curated model when a key exists
+            // (the strongest frontier route), then Private Cloud
+            // Compute (no key — Apple's own cloud), then the best
+            // local stand-in, said plainly. Under Local Only the
+            // cloud is off the table entirely, key or no key — the
+            // factory enforces the same refusal for manual picks.
+            if !inputs.localOnly {
+                if inputs.openRouterKeyPresent {
+                    let best = OpenRouterCatalog.best
+                    return RoutingDecision(
+                        selection: .openRouter(modelID: best.modelID),
+                        reason: "Auto: this one wants a frontier cloud "
+                            + "model — \(best.displayName) on OpenRouter "
+                            + "has it. The privacy check runs first, and "
+                            + "the reply shows what it cost.")
+                }
+                if inputs.pccReady {
+                    return RoutingDecision(
+                        selection: .privateCloudCompute,
+                        reason: "Auto: this one wants a frontier cloud "
+                            + "model — Apple Private Cloud has it: "
+                            + "Apple's servers under Apple's privacy "
+                            + "design, and the privacy check runs first "
+                            + "anyway.")
+                }
+            }
             // Stand in with the strongest network-adjacent option:
             // a configured server first (it's the closest thing to a
             // bigger brain), then the largest MLX model, then the
             // built-in model — and say plainly what happened.
             let why = "Auto: this one really wants a frontier cloud "
-                + "model, and cloud models arrive in a later phase — "
+                + "model, but no cloud route is ready — "
+            let cloudNote: String? = inputs.localOnly
+                ? "Local Only is on, so cloud models are off-limits "
+                    + "while the lock is on — nothing leaves this Mac."
+                : "To use a cloud model for prompts like this, add "
+                    + "your OpenRouter key in Settings → Cloud models; "
+                    + "Apple Private Cloud also joins on its own when "
+                    + "macOS offers it."
             if let firstEndpoint {
                 return RoutingDecision(
                     selection: .endpoint(id: firstEndpoint.id),
                     reason: why + "for now \(firstEndpoint.name) "
-                        + "stands in.")
+                        + "stands in.",
+                    note: cloudNote)
             }
             if let largestMLX {
-                var decision = RoutingDecision(
+                return RoutingDecision(
                     selection: .mlx(repoID: largestMLX.repoID),
                     reason: why + "for now \(largestMLX.displayName), "
-                        + "your biggest local model, stands in.")
-                if inputs.localOnly, !inputs.endpoints.isEmpty {
-                    decision.note = "Local Only is on, so nothing "
-                        + "leaves this Mac regardless."
-                }
-                return decision
+                        + "your biggest local model, stands in.",
+                    note: cloudNote)
             }
-            var decision = RoutingDecision(
+            return RoutingDecision(
                 selection: .onDevice,
-                reason: why + "for now Apple On-Device does its best.")
-            if inputs.localOnly, !inputs.endpoints.isEmpty {
-                decision.note = "Local Only is on, so nothing leaves "
-                    + "this Mac regardless."
-            }
-            return decision
+                reason: why + "for now Apple On-Device does its best.",
+                note: cloudNote)
         }
     }
 }

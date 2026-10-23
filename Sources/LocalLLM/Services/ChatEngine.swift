@@ -49,8 +49,8 @@ import SwiftData
 ///   turns] (Phase 2), never the raw stored history, and an endpoint
 ///   session's memory is exactly the seeded prompt chain it was fed —
 ///   so a compacted chat's older turns reach a remote destination
-///   only as their summary. Phase 8's cloud backend consumes this
-///   same hook: it will be a `ModelBackend` like any other, seeded
+///   only as their summary. Phase 8's cloud backends consume this
+///   same hook: they are `ModelBackend`s like any other, seeded
 ///   the same way, with `Redactor` applied on the same
 ///   remote-destination check.
 /// - The Local Only lock is enforced in `BackendFactory`: a server
@@ -77,8 +77,33 @@ import SwiftData
 ///   rotated to `AccessLogPolicy`'s cap.
 /// - Tool results and the privacy firewall: every tool-capable
 ///   backend in this phase runs on this Mac, so results stay local
-///   and no redaction applies. The runtime carries the redaction flag
-///   Phase 8's cloud tier will set; see `ToolRuntime`.
+///   and no redaction applies. The runtime carries the redaction
+///   flag Phase 8's cloud tier sets for its one remote tool host
+///   (Private Cloud Compute); see the Phase 8 notes below.
+///
+/// Phase 8 adds the cloud tier on that shape:
+///
+/// - Two cloud backends join the factory: Private Cloud Compute (a
+///   framework backend — tools and all) and OpenRouter (an HTTP
+///   backend like Phase 3's servers, plus the user's Keychain key
+///   and real per-reply costs). Auto's `frontier_cloud` route is
+///   live: OpenRouter's best curated model when a key exists, else
+///   PCC, else the local stand-in with an honest note.
+/// - Both clouds count as REMOTE destinations here: the privacy
+///   firewall scrubs instructions + prompt (seeded history, Phase 6
+///   outcome notes, and Phase 7 prompt prefixes included) before
+///   anything is sent, and the user is told when it hid something.
+/// - Tool results follow the same rule through the runtime's one
+///   choke point: a PCC session's tool set is built with
+///   `redactResults` on and the user's custom terms attached, so a
+///   lookup's findings are scrubbed before they can enter a cloud
+///   prompt. Local tool hosts (on-device, MLX) keep raw results —
+///   nothing leaves the Mac there. OpenRouter sessions, like server
+///   sessions, get no tools at all this phase.
+/// - Telemetry grows up: an OpenRouter reply's pill shows the real
+///   cost from its usage report, or "cost unknown" when the service
+///   sent none — never a fake $0.00 on a paid route. PCC reports
+///   $0.00, labeled as Apple's cloud; Apple includes it.
 ///
 /// All state here is main-actor: the UI reads `streamingText`,
 /// `respondingIDs`, and `errorMessages` directly.
@@ -558,15 +583,30 @@ final class ChatEngine {
         let budget = backend.budget
         if selection != targetSelection {
             // The picked (or routed) model can't run: it was deleted,
-            // its server was removed, or the Local Only lock refuses
-            // servers right now. The chat falls back to the built-in
+            // its server was removed, the Local Only lock refuses
+            // servers and cloud models right now, or an OpenRouter
+            // chat has no key yet. The chat falls back to the built-in
             // model — say which happened, once, rather than silently
             // switching.
-            if routingInputs.localOnly, case .endpoint(_) = targetSelection {
+            let targetLeavesMac: Bool = {
+                switch targetSelection {
+                case .endpoint, .privateCloudCompute, .openRouter:
+                    return true
+                case .auto, .onDevice, .mlx:
+                    return false
+                }
+            }()
+            if routingInputs.localOnly, targetLeavesMac {
                 errorMessages[conversationID] =
-                    "Local Only is on, so this chat can't use its "
-                    + "server right now — it switched to a model that "
-                    + "runs entirely on this Mac."
+                    "Local Only is on, so this chat can't use a "
+                    + "server or cloud model right now — it switched "
+                    + "to a model that runs entirely on this Mac."
+            } else if case .openRouter = targetSelection {
+                errorMessages[conversationID] =
+                    "This chat's cloud model needs your OpenRouter "
+                    + "API key first — add it in Settings → Cloud "
+                    + "models (gear button). Until then, this chat "
+                    + "uses the built-in on-device model."
             } else {
                 errorMessages[conversationID] =
                     "The model this chat was using isn't available anymore, "
@@ -574,20 +614,31 @@ final class ChatEngine {
             }
         }
 
-        // Phase 4 privacy firewall. A chat pointed at a server that
-        // isn't on this Mac is the one place a prompt can leave the
-        // machine in this phase, so everything bound for it — the
+        // Phase 4 privacy firewall, extended by Phase 8 to the
+        // cloud. A prompt can now leave the machine three ways: a
+        // server that isn't on this Mac, Private Cloud Compute, or
+        // OpenRouter. Everything bound for one of those — the
         // instructions now, the prompt (seeded history included)
         // further below — is scrubbed by `Redactor` first. Local
         // destinations (built-in model, MLX, a localhost server) get
         // the text exactly as written. Stored messages are never
         // touched; only the sent copy is edited.
         let isRemoteDestination: Bool = {
-            guard case .endpoint(let id) = selection,
-                  let config = routingInputs.endpoints
+            switch selection {
+            case .privateCloudCompute, .openRouter:
+                return true
+            case .endpoint(let id):
+                guard let config = routingInputs.endpoints
                     .first(where: { $0.id == id }) else { return false }
-            return !config.isLocalhost
+                return !config.isLocalhost
+            case .auto, .onDevice, .mlx:
+                return false
+            }
         }()
+        /// Phase 8: the remote destination is a cloud (Apple's or
+        /// OpenRouter's) rather than a user-added server — used for
+        /// the tool-result redaction below and the banner wording.
+        let isCloudDestination = selection.isCloud
         var effectiveInstructions = instructions
         var redactions = 0
         if isRemoteDestination {
@@ -662,9 +713,11 @@ final class ChatEngine {
         // visibility source; endpoint chats never do. The signature
         // joins the reuse check below, so a toggled source or changed
         // folder list rebuilds the session with the new tool set.
-        // `redactResults` is false: every tool-capable backend in
-        // this phase runs on this Mac. Phase 8's cloud tier is where
-        // it turns on — see `ToolRuntime`.
+        // Phase 8: Private Cloud Compute is tool-capable AND remote,
+        // so its tool set is built with `redactResults` on (below, at
+        // session creation) — lookup results pass the privacy check
+        // inside the runtime before they can enter a cloud prompt.
+        // Local tool hosts keep raw results.
         let toolAvailability = toolAvailabilityProvider()
         let toolsSignature = backend.supportsTools
             ? toolAvailability.signature
@@ -699,8 +752,13 @@ final class ChatEngine {
                         conversationID: conversationID,
                         enabledSources: toolAvailability.enabledSources,
                         folderRootPaths: toolAvailability.folderRootPaths,
-                        redactResults: false,
-                        redactionTerms: [],
+                        // Phase 8: a tool host in the cloud (today
+                        // that means PCC) gets its results scrubbed
+                        // by the runtime's choke point; a local host
+                        // keeps them raw. Tool-capable + remote is
+                        // exactly that one case.
+                        redactResults: isRemoteDestination,
+                        redactionTerms: routingInputs.customRedactionTerms,
                         fileWritingEnabled: toolAvailability.fileWritingEnabled,
                         proposalSink: Self.proposalSink),
                     sink: Self.toolEventSink,
@@ -760,11 +818,15 @@ final class ChatEngine {
             redactions += scrubbed.replacementCount
             if redactions > 0 {
                 let noun = redactions == 1 ? "item" : "items"
+                let whereabouts = isCloudDestination
+                    ? "because \(backend.displayName) runs in the "
+                        + "cloud, not on this Mac"
+                    : "because that server isn't on this Mac"
                 infoMessages[conversationID] =
                     "Privacy check: \(redactions) \(noun) that looked "
                     + "like secrets or personal details were hidden "
                     + "before this was sent to \(backend.displayName), "
-                    + "because that server isn't on this Mac. Your "
+                    + "\(whereabouts). Your "
                     + "saved chat is unchanged — only the copy that "
                     + "was sent was edited."
             }
@@ -804,14 +866,30 @@ final class ChatEngine {
                                 conversation: conversation)
             // Phase 4 telemetry: which backend actually answered, how
             // long it took, roughly how big the reply is. Rendered as
-            // the pill under the message; local backends are free, so
-            // the cost (not stored) reads $0.00.
+            // the pill under the message. Phase 8: a session that can
+            // report usage (OpenRouter's) contributes the reply's real
+            // cost; a paid route with no report reads "cost unknown"
+            // rather than $0.00. Local backends and PCC are free and
+            // stay $0.00.
+            var costUSD = 0.0
+            var costKnown = true
+            if case .openRouter = selection {
+                if let report = (session as? UsageReportingChatSession)?
+                    .lastUsageReport,
+                   let reportedCost = report.costUSD {
+                    costUSD = reportedCost
+                } else {
+                    costKnown = false
+                }
+            }
             reply.telemetry = MessageTelemetry(
                 backendLabel: TelemetryFormat.label(
                     for: selection, displayName: backend.displayName),
                 seconds: generationSeconds,
                 estimatedTokens: PromptHistory.approximateTokenCount(
-                    for: finalText))
+                    for: finalText),
+                costUSD: costUSD,
+                costKnown: costKnown)
             context.insert(reply)
             conversation.updatedAt = Date()
             try? context.save()

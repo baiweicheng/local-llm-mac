@@ -95,6 +95,14 @@ final class Message {
     var telemetryBackendLabel: String?
     var telemetrySeconds: Double?
     var telemetryTokens: Int?
+    /// Phase 8: what the reply cost, when a backend charges (the
+    /// real figure OpenRouter reported). Two more optional fields,
+    /// so the store migrates in place like Phase 4's: nil cost reads
+    /// back as $0.00 (true for every local reply ever written), and
+    /// nil "known" reads back as known — only a cloud reply whose
+    /// provider reported no cost stores known = false.
+    var telemetryCostUSD: Double?
+    var telemetryCostKnown: Bool?
     var createdAt: Date
     var conversation: Conversation?
 
@@ -106,14 +114,15 @@ final class Message {
         self.telemetryBackendLabel = nil
         self.telemetrySeconds = nil
         self.telemetryTokens = nil
+        self.telemetryCostUSD = nil
+        self.telemetryCostKnown = nil
         self.createdAt = Date()
         self.conversation = conversation
     }
 
     /// This message's execution telemetry, when it has any — assistant
-    /// replies written since Phase 4. Cost isn't stored: every backend
-    /// so far is local and free, so it's always $0.00; when the cloud
-    /// tier lands (Phase 8) it can start recording real costs here.
+    /// replies written since Phase 4, with real cloud costs since
+    /// Phase 8.
     var telemetry: MessageTelemetry? {
         get {
             guard let telemetryBackendLabel,
@@ -121,12 +130,16 @@ final class Message {
                   let telemetryTokens else { return nil }
             return MessageTelemetry(backendLabel: telemetryBackendLabel,
                                     seconds: telemetrySeconds,
-                                    estimatedTokens: telemetryTokens)
+                                    estimatedTokens: telemetryTokens,
+                                    costUSD: telemetryCostUSD ?? 0,
+                                    costKnown: telemetryCostKnown ?? true)
         }
         set {
             telemetryBackendLabel = newValue?.backendLabel
             telemetrySeconds = newValue?.seconds
             telemetryTokens = newValue?.estimatedTokens
+            telemetryCostUSD = newValue?.costUSD
+            telemetryCostKnown = newValue?.costKnown
         }
     }
 

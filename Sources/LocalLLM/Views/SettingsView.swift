@@ -21,10 +21,16 @@ import SwiftUI
 /// that lets models PROPOSE file changes inside the shared folders
 /// (approval still happens in the chat, never here), and the log
 /// becomes "Recent activity" — lookups and file changes together.
+///
+/// Phase 8 adds "Cloud models": what Private Cloud Compute is, the
+/// OpenRouter key field (the key goes straight to the Mac's
+/// Keychain — this view never displays it back), the curated model
+/// list, and the custom model id.
 struct SettingsView: View {
     @Bindable var settings: AppSettings
     let fileScopeStore: FileScopeStore
     let permissionCenter: PermissionCenter
+    let openRouterKeyStore: OpenRouterKeyStore
     @Environment(\.dismiss) private var dismiss
     @Environment(\.modelContext) private var modelContext
 
@@ -34,6 +40,10 @@ struct SettingsView: View {
     private var recentRecords: [ToolActivityRecord]
 
     @State private var newTerm = ""
+    /// The OpenRouter key as typed, held only until Save hands it
+    /// to the Keychain; the field then clears. The saved key is
+    /// never read back into this field.
+    @State private var keyDraft = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -52,6 +62,8 @@ struct SettingsView: View {
                     localOnlySection
                     Divider()
                     redactionSection
+                    Divider()
+                    cloudSection
                     Divider()
                     kvCacheSection
                     Divider()
@@ -79,7 +91,7 @@ struct SettingsView: View {
                 Label("Local Only", systemImage: "lock.fill")
                     .font(.headline)
             }
-            Text("When this is on, only models that run on this Mac may answer — the built-in model and downloaded MLX models. Server backends (even ones on this Mac) are refused, Auto never routes to a server, and a chat that was using a server switches to the built-in model with a note explaining why. Nothing is sent anywhere while the lock is on.")
+            Text("When this is on, only models that run on this Mac may answer — the built-in model and downloaded MLX models. Server backends (even ones on this Mac) and both cloud backends are refused: Local Only means nothing leaves this Mac, and Apple Private Cloud runs on Apple's servers, so it counts as leaving. Auto never routes out, and a chat that was using a server or cloud model switches to the built-in model with a note explaining why.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
@@ -91,7 +103,7 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Privacy check")
                 .font(.headline)
-            Text("If a chat ever talks to a server that isn't on this Mac (a server address you added that points somewhere else — and, in a later phase, cloud models), the app first hides things that look like secrets or personal details: API keys, passwords after a label like \u{201C}password:\u{201D}, email addresses, phone numbers, and card numbers. Your saved messages are never changed — only the copy that gets sent.")
+            Text("If a chat ever talks to a destination that isn't on this Mac (a server address you added that points somewhere else, or a cloud model — Apple Private Cloud or OpenRouter), the app first hides things that look like secrets or personal details: API keys, passwords after a label like \u{201C}password:\u{201D}, email addresses, phone numbers, and card numbers. Lookup results headed to a cloud model pass the same check. Your saved messages are never changed — only the copy that gets sent.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
             Text("Add your own words or phrases to hide — a project codename, an employer, an address. Matching ignores upper/lower case; entries shorter than \(Redactor.minimumCustomTermLength) characters are ignored, since hiding a two-letter word would mangle every message.")
@@ -135,6 +147,76 @@ struct SettingsView: View {
         newTerm = ""
     }
 
+    // MARK: - Cloud models (Phase 8)
+
+    private var cloudSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Cloud models")
+                .font(.headline)
+            Text("Two cloud routes, for prompts that outgrow this Mac. Both are off-limits while Local Only is on, and everything sent to either passes the privacy check above first.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("Apple Private Cloud is Apple's own cloud model: it runs on Apple's servers under Apple's privacy design (nothing stored, nothing used for training), needs no key or account, and appears in the model picker as \u{201C}Apple Private Cloud\u{201D}. macOS decides whether it's available on this Mac. Chats on it can still make lookups — the results pass the privacy check before they leave.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("OpenRouter is one key that opens many frontier models, billed per reply to your OpenRouter account. Your key is stored in this Mac's Keychain — nowhere else — and is only ever sent to OpenRouter itself, as the sign-in for your requests. The app ships with no key; add yours whenever you like, and everything else keeps working without one. Each cloud reply's pill shows what it actually cost, as OpenRouter reports it.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if openRouterKeyStore.hasKey {
+                HStack(spacing: 8) {
+                    Label("A key is saved in your Keychain", systemImage: "key.fill")
+                        .font(.callout)
+                    Spacer()
+                    Button("Remove Key", role: .destructive) {
+                        openRouterKeyStore.removeKey()
+                    }
+                    .font(.callout)
+                }
+            }
+            HStack(spacing: 8) {
+                SecureField(openRouterKeyStore.hasKey
+                            ? "Paste a new key to replace the saved one"
+                            : "Paste your OpenRouter API key", text: $keyDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { saveKey() }
+                Button("Save Key") { saveKey() }
+                    .disabled(keyDraft.trimmingCharacters(
+                        in: .whitespacesAndNewlines).isEmpty)
+            }
+            Text("Get a key at openrouter.ai (Keys). Saving a key turns on the OpenRouter models in the picker, and lets Auto send its hardest prompts there.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("The shortlist in the picker (checked against OpenRouter's model list when this version was built):")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            ForEach(OpenRouterCatalog.models) { info in
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(info.displayName)
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+                    Text(info.note)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 1)
+            }
+            Text("Want a different one? Type any OpenRouter model id — it's added to the picker as its own row:")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            TextField("Custom model id (e.g. x-ai/grok-4.7)",
+                      text: $settings.openRouterCustomModelID)
+                .textFieldStyle(.roundedBorder)
+        }
+    }
+
+    private func saveKey() {
+        openRouterKeyStore.setKey(keyDraft)
+        keyDraft = ""
+    }
+
     // MARK: - KV cache (MLX models)
 
     private var kvCacheSection: some View {
@@ -166,7 +248,7 @@ struct SettingsView: View {
             Text("Turn on a source and the model in a chat can look things up on this Mac to answer you — find a file, check what's on your calendar, look up a contact. Looking is all these switches allow — changing files is a separate switch, below. Every lookup is written to the log below and shown as a card in the chat, so nothing it sees is invisible to you.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
-            Text("Lookups work with the Apple On-Device model and downloaded MLX models — the models that run on this Mac. Server chats can't use them. What a lookup finds never leaves this Mac in this version; if a cloud model ever gets lookups in a later phase, its results will pass the privacy check above first, and under Local Only a network model gets no lookups at all.")
+            Text("Lookups work with the Apple On-Device model, downloaded MLX models, and Apple Private Cloud. Server chats and OpenRouter chats can't use them. When Apple Private Cloud makes a lookup, what it finds passes the privacy check above before it leaves this Mac — and under Local Only, no network model gets lookups at all.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
             ForEach(VisibilitySource.allCases, id: \.self) { source in

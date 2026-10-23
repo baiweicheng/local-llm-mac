@@ -71,6 +71,15 @@ final class AppSettings {
         didSet { defaults.set(hudEnabled, forKey: Self.hudEnabledKey) }
     }
 
+    /// Phase 8: a custom OpenRouter model id, typed by the user in
+    /// Settings → Cloud models — any model on OpenRouter, beyond
+    /// the curated shortlist. Empty means none. (The API KEY never
+    /// lives here — it's in the Keychain; see `OpenRouterKeyStore`.)
+    var openRouterCustomModelID: String {
+        didSet { defaults.set(openRouterCustomModelID,
+                              forKey: Self.openRouterCustomModelKey) }
+    }
+
     private let defaults: UserDefaults
 
     private static let localOnlyKey = "LocalLLM.localOnly.v1"
@@ -79,11 +88,14 @@ final class AppSettings {
     private static let visibilitySourcesKey = "LocalLLM.visibilitySources.v1"
     private static let fileWritingKey = "LocalLLM.fileWriting.v1"
     private static let hudEnabledKey = "LocalLLM.hudEnabled.v1"
+    private static let openRouterCustomModelKey = "LocalLLM.openRouterCustomModel.v1"
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         self.localOnly = defaults.bool(forKey: Self.localOnlyKey)
         self.fileWritingEnabled = defaults.bool(forKey: Self.fileWritingKey)
+        self.openRouterCustomModelID =
+            defaults.string(forKey: Self.openRouterCustomModelKey) ?? ""
         // Default ON: only an explicitly stored value can turn the
         // quick panel off.
         self.hudEnabled = defaults.object(forKey: Self.hudEnabledKey) as? Bool

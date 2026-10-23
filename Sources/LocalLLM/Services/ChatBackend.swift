@@ -25,6 +25,18 @@ protocol ChatSession: AnyObject {
         -> AsyncThrowingStream<String, Error>
 }
 
+/// Phase 8: a session that can say what its last reply actually
+/// cost. Only the OpenRouter session conforms — it's the one
+/// backend that charges per reply and reports the figure. The
+/// engine reads this after a stream finishes and puts the real
+/// cost on the message's telemetry pill; a conforming session
+/// whose report is missing (the service sent none) leaves the
+/// pill at "cost unknown" for that reply.
+@MainActor
+protocol UsageReportingChatSession: ChatSession {
+    var lastUsageReport: UsageReport? { get }
+}
+
 /// A model backend: a factory for sessions, plus the identity and
 /// context budget the engine plans against. Backends are cheap values;
 /// sessions are the stateful part.
@@ -54,6 +66,30 @@ enum BackendError: LocalizedError {
     case endpointHTTPError(name: String, status: Int)
     /// A chat's MLX model isn't downloaded (anymore).
     case mlxModelUnavailable(displayName: String)
+    /// Phase 8: OpenRouter couldn't be reached at all (offline,
+    /// DNS, a dropped connection).
+    case openRouterUnreachable
+    /// Phase 8: OpenRouter rejected the API key (HTTP 401/403).
+    case openRouterKeyRejected
+    /// Phase 8: OpenRouter says the account is out of credit
+    /// (HTTP 402).
+    case openRouterOutOfCredit
+    /// Phase 8: OpenRouter rate-limited the request (HTTP 429).
+    case openRouterRateLimited
+    /// Phase 8: any other OpenRouter HTTP error.
+    case openRouterHTTPError(status: Int)
+
+    /// Maps an OpenRouter HTTP status to the error whose wording
+    /// fits it — a rejected key and an empty balance need different
+    /// advice, so they aren't lumped into one generic failure.
+    static func openRouterHTTP(status: Int) -> BackendError {
+        switch status {
+        case 401, 403: return .openRouterKeyRejected
+        case 402: return .openRouterOutOfCredit
+        case 429: return .openRouterRateLimited
+        default: return .openRouterHTTPError(status: status)
+        }
+    }
 
     var errorDescription: String? {
         switch self {
@@ -69,6 +105,25 @@ enum BackendError: LocalizedError {
             return "\(displayName) isn't downloaded anymore, so this "
                 + "chat can't use it. Download it again in Models, or "
                 + "pick a different model above."
+        case .openRouterUnreachable:
+            return "Couldn't reach OpenRouter — check this Mac's "
+                + "internet connection, then try again."
+        case .openRouterKeyRejected:
+            return "OpenRouter didn't accept your API key. Open "
+                + "Settings → Cloud models (gear button) and paste "
+                + "the key again — if it was revoked on openrouter.ai, "
+                + "make a fresh one there first."
+        case .openRouterOutOfCredit:
+            return "OpenRouter says your account is out of credit, so "
+                + "the model couldn't answer. Add credit on "
+                + "openrouter.ai, then try again."
+        case .openRouterRateLimited:
+            return "OpenRouter is rate-limiting requests right now. "
+                + "Wait a moment, then try again."
+        case .openRouterHTTPError(let status):
+            return "OpenRouter answered with an error (HTTP \(status)). "
+                + "If it keeps happening, the model may be unavailable "
+                + "on OpenRouter right now — try a different one."
         }
     }
 }
@@ -178,11 +233,17 @@ enum BackendFactory {
     ///   the MLX backend so its sessions are created with that cache
     ///   configuration. Ignored by every other backend — they manage
     ///   their own caches.
+    /// - Parameter openRouterAPIKey: the user's OpenRouter key,
+    ///   read from the Keychain by the app shell (the one place the
+    ///   key value is ever read). Nil — no key saved — resolves an
+    ///   OpenRouter selection to the built-in model, and the engine
+    ///   explains why. The factory never sees where the key lives.
     static func resolve(selection: ModelSelection,
                         downloadedMLXRepoIDs: Set<String>,
                         endpoints: [EndpointConfig],
                         localOnly: Bool = false,
-                        kvCacheMode: KVCacheMode = .defaultMode)
+                        kvCacheMode: KVCacheMode = .defaultMode,
+                        openRouterAPIKey: String? = nil)
         -> ResolvedBackend {
         switch selection {
         case .auto:
@@ -216,6 +277,34 @@ enum BackendFactory {
             }
             return ResolvedBackend(backend: OnDeviceBackend(),
                                    effectiveSelection: .onDevice)
+        case .privateCloudCompute:
+            // PCC runs on Apple's servers — off this Mac — so the
+            // Local Only lock refuses it exactly like a server. The
+            // engine sees the effective selection change and says why.
+            if localOnly {
+                return ResolvedBackend(backend: OnDeviceBackend(),
+                                       effectiveSelection: .onDevice)
+            }
+            return ResolvedBackend(backend: PCCBackend(),
+                                   effectiveSelection: selection)
+        case .openRouter(let modelID):
+            if localOnly {
+                return ResolvedBackend(backend: OnDeviceBackend(),
+                                       effectiveSelection: .onDevice)
+            }
+            let key = openRouterAPIKey?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !key.isEmpty else {
+                // No key saved (or it was removed): the cloud route
+                // can't run. Fall back to the built-in model; the
+                // engine's message names the missing key as the
+                // reason, because it can see the target selection.
+                return ResolvedBackend(backend: OnDeviceBackend(),
+                                       effectiveSelection: .onDevice)
+            }
+            return ResolvedBackend(
+                backend: OpenRouterBackend(modelID: modelID, apiKey: key),
+                effectiveSelection: selection)
         }
     }
 }

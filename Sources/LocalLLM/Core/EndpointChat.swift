@@ -135,11 +135,17 @@ enum OpenAIRequestBuilder {
     }
 
     /// The request body: streaming chat completions for `model`.
+    /// `includeUsage` (Phase 8, OpenRouter) asks the service to
+    /// attach a usage report — tokens and the real cost — to the
+    /// stream's final chunk; `SSEAccumulator` picks it up. Local
+    /// servers never set it: they don't charge, and some would
+    /// reject an unknown field.
     static func bodyData(model: String,
                          instructions: String,
                          history: [ChatMessagePayload],
-                         newUserMessage: String) -> Data {
-        let payload: [String: Any] = [
+                         newUserMessage: String,
+                         includeUsage: Bool = false) -> Data {
+        var payload: [String: Any] = [
             "model": model,
             "stream": true,
             "messages": messages(instructions: instructions,
@@ -147,6 +153,9 @@ enum OpenAIRequestBuilder {
                                  newUserMessage: newUserMessage)
                 .map { ["role": $0.role, "content": $0.content] },
         ]
+        if includeUsage {
+            payload["usage"] = ["include": true]
+        }
         // The payload is built from strings and arrays only, so
         // serialization cannot fail; the empty-object fallback exists
         // only to keep this function total.
@@ -164,6 +173,11 @@ struct SSEAccumulator: Equatable, Sendable {
     private(set) var text: String = ""
     /// True once the server sent the [DONE] marker.
     private(set) var isDone: Bool = false
+    /// Phase 8: the latest usage report seen in the stream, when the
+    /// request asked for one (OpenRouter sends it in the final
+    /// chunk, which usually carries no content at all — so this is
+    /// captured independently of the content path below).
+    private(set) var usage: UsageReport?
 
     /// Consumes one raw stream line. Returns the new cumulative text
     /// when the line carried a content piece, nil otherwise (blank
@@ -177,6 +191,9 @@ struct SSEAccumulator: Equatable, Sendable {
         if payload == "[DONE]" {
             isDone = true
             return nil
+        }
+        if let report = UsageReport.parse(payload: String(payload)) {
+            usage = report
         }
         guard let delta = Self.contentDelta(fromPayload: String(payload)) else {
             return nil

@@ -23,6 +23,14 @@ enum ModelSelection: Equatable, Hashable, Sendable {
     case mlx(repoID: String)
     /// A saved local-server configuration, by its stable id.
     case endpoint(id: UUID)
+    /// Phase 8: Apple's Private Cloud Compute — Apple's own cloud
+    /// model (32K context, no key; the OS decides eligibility).
+    case privateCloudCompute
+    /// Phase 8: a model on OpenRouter, by its OpenRouter model id
+    /// (e.g. "anthropic/claude-opus-5.5") — one of the curated
+    /// `OpenRouterCatalog` entries, or any custom id the user typed
+    /// in Settings.
+    case openRouter(modelID: String)
 
     // MARK: - Storage codec
 
@@ -40,6 +48,10 @@ enum ModelSelection: Equatable, Hashable, Sendable {
             return "mlx:" + repoID
         case .endpoint(let id):
             return "endpoint:" + id.uuidString.lowercased()
+        case .privateCloudCompute:
+            return "privateCloudCompute"
+        case .openRouter(let modelID):
+            return "openRouter:" + modelID
         }
     }
 
@@ -47,9 +59,16 @@ enum ModelSelection: Equatable, Hashable, Sendable {
         let key = storageKey.trimmingCharacters(in: .whitespacesAndNewlines)
         if key == "auto" {
             self = .auto
+        } else if key == "privateCloudCompute" {
+            self = .privateCloudCompute
         } else if key.hasPrefix("mlx:") {
             let repoID = String(key.dropFirst("mlx:".count))
             self = repoID.isEmpty ? .onDevice : .mlx(repoID: repoID)
+        } else if key.hasPrefix("openRouter:") {
+            // Only the first prefix is stripped: a model id may
+            // itself contain ":" (OpenRouter's ":free" variants do).
+            let modelID = String(key.dropFirst("openRouter:".count))
+            self = modelID.isEmpty ? .onDevice : .openRouter(modelID: modelID)
         } else if key.hasPrefix("endpoint:"),
                   let id = UUID(uuidString: String(key.dropFirst("endpoint:".count))) {
             self = .endpoint(id: id)
@@ -76,6 +95,8 @@ enum ModelSelection: Equatable, Hashable, Sendable {
         case .onDevice: return .onDevice
         case .mlx: return .mlxLocal
         case .endpoint: return .mlxLocal
+        case .privateCloudCompute: return .privateCloudCompute
+        case .openRouter: return .openRouterCloud
         }
     }
 
@@ -84,6 +105,20 @@ enum ModelSelection: Equatable, Hashable, Sendable {
     var isOnDevice: Bool { self == .onDevice }
 
     var isAuto: Bool { self == .auto }
+
+    /// Phase 8: whether this selection runs off this Mac, in a cloud
+    /// (Apple's Private Cloud Compute, or OpenRouter). The UI labels
+    /// these chats "Cloud"; the engine runs the privacy check before
+    /// anything is sent to one; the Local Only lock refuses both.
+    /// (A *server* selection is a network destination too, but it may
+    /// well be this very Mac — its locality is a property of the
+    /// saved configuration, checked separately.)
+    var isCloud: Bool {
+        switch self {
+        case .privateCloudCompute, .openRouter: return true
+        case .auto, .onDevice, .mlx, .endpoint: return false
+        }
+    }
 }
 
 /// One row of the model picker: everything the UI needs to show a
@@ -107,18 +142,34 @@ struct BackendDescriptor: Equatable, Sendable, Identifiable {
     var id: String { selection.storageKey }
 }
 
+/// Phase 8: what the picker needs to know about the cloud tier —
+/// plain values, gathered by the app shell, so the row logic stays
+/// testable: whether Private Cloud Compute is offered by the OS
+/// right now, whether the user has saved an OpenRouter key in the
+/// Keychain, and the custom OpenRouter model id from Settings
+/// (empty = none).
+struct CloudPickerInputs: Equatable, Sendable {
+    var pccReady: Bool = false
+    var openRouterKeyPresent: Bool = false
+    var customOpenRouterModelID: String = ""
+}
+
 /// Builds the picker's rows from plain inputs (what's downloaded, what's
 /// configured), so the list logic is unit-testable without any live
 /// model, disk, or network state.
 enum BackendRegistry {
 
     /// Rows in picker order: Auto first (Phase 4 — it's the default
-    /// for new chats), then the built-in model, then downloaded MLX
-    /// models in catalog order, then saved local servers in the order
-    /// the user arranged them.
+    /// for new chats), then the built-in model, then Apple Private
+    /// Cloud (Phase 8), then downloaded MLX models in catalog order,
+    /// then saved local servers in the order the user arranged them,
+    /// then the OpenRouter cloud models (curated shortlist, then the
+    /// user's custom model id when one is set).
     static func descriptors(downloadedMLX: [MLXModelInfo],
                             endpoints: [EndpointConfig],
-                            onDeviceReady: Bool) -> [BackendDescriptor] {
+                            onDeviceReady: Bool,
+                            cloud: CloudPickerInputs = CloudPickerInputs())
+        -> [BackendDescriptor] {
         var rows: [BackendDescriptor] = [
             // Auto always counts as ready: it degrades to whatever
             // local route exists, and a route that's actually down
@@ -126,7 +177,9 @@ enum BackendRegistry {
             BackendDescriptor(
                 selection: .auto,
                 displayName: "Auto",
-                detail: "Picks the best model on this Mac for each message",
+                detail: "Picks the best model for each message — "
+                    + "on this Mac, or in the cloud when a prompt "
+                    + "really needs it",
                 budget: .onDevice,
                 isReady: true),
             BackendDescriptor(
@@ -134,7 +187,20 @@ enum BackendRegistry {
                 displayName: "Apple On-Device",
                 detail: "Built into macOS · nothing to download",
                 budget: .onDevice,
-                isReady: onDeviceReady)
+                isReady: onDeviceReady),
+            // Phase 8: Apple's cloud. Always listed (like a saved
+            // server); readiness is macOS's own eligibility, read by
+            // the app shell. Under Local Only the factory refuses it
+            // and the engine explains the switch, exactly as with
+            // servers.
+            BackendDescriptor(
+                selection: .privateCloudCompute,
+                displayName: "Apple Private Cloud",
+                detail: cloud.pccReady
+                    ? "Cloud · runs on Apple's servers, privately · no key needed"
+                    : "Cloud · Apple's servers — not available on this Mac right now",
+                budget: .privateCloudCompute,
+                isReady: cloud.pccReady)
         ]
         for info in downloadedMLX {
             rows.append(BackendDescriptor(
@@ -152,6 +218,33 @@ enum BackendRegistry {
                 budget: .mlxLocal,
                 isReady: true))
         }
+        // Phase 8: OpenRouter. The rows exist with or without a key
+        // — without one they say exactly what's missing instead of
+        // vanishing, and the send button stays off until a key is
+        // saved (readiness drives that, as with the built-in model).
+        for info in OpenRouterCatalog.models {
+            rows.append(BackendDescriptor(
+                selection: .openRouter(modelID: info.modelID),
+                displayName: info.displayName,
+                detail: cloud.openRouterKeyPresent
+                    ? "Cloud · OpenRouter · paid per use"
+                    : "Cloud · OpenRouter · needs your key — add it in Settings",
+                budget: .openRouterCloud,
+                isReady: cloud.openRouterKeyPresent))
+        }
+        let customID = cloud.customOpenRouterModelID
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !customID.isEmpty,
+           OpenRouterCatalog.info(forModelID: customID) == nil {
+            rows.append(BackendDescriptor(
+                selection: .openRouter(modelID: customID),
+                displayName: customID,
+                detail: cloud.openRouterKeyPresent
+                    ? "Cloud · OpenRouter · your custom model"
+                    : "Cloud · OpenRouter · needs your key — add it in Settings",
+                budget: .openRouterCloud,
+                isReady: cloud.openRouterKeyPresent))
+        }
         return rows
     }
 
@@ -162,10 +255,13 @@ enum BackendRegistry {
     static func descriptor(for selection: ModelSelection,
                            downloadedMLX: [MLXModelInfo],
                            endpoints: [EndpointConfig],
-                           onDeviceReady: Bool) -> BackendDescriptor? {
+                           onDeviceReady: Bool,
+                           cloud: CloudPickerInputs = CloudPickerInputs())
+        -> BackendDescriptor? {
         descriptors(downloadedMLX: downloadedMLX,
                     endpoints: endpoints,
-                    onDeviceReady: onDeviceReady)
+                    onDeviceReady: onDeviceReady,
+                    cloud: cloud)
             .first { $0.selection == selection }
     }
 }
