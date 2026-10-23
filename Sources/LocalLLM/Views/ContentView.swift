@@ -70,7 +70,8 @@ struct ContentView: View {
             engine.configureToolAvailabilityProvider {
                 ToolAvailability(
                     enabledSources: settings.enabledVisibilitySources,
-                    folderRootPaths: fileScopeStore.rootPaths)
+                    folderRootPaths: fileScopeStore.rootPaths,
+                    fileWritingEnabled: settings.fileWritingEnabled)
             }
         }
     }

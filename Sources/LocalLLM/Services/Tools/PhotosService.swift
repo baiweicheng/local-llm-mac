@@ -57,6 +57,35 @@ enum PhotosService {
         return recognizeText(in: data)
     }
 
+    // MARK: - Phase 6: shared fetch points for the resize tool
+
+    /// The asset at a "recent" index (0 = most recent), or nil when
+    /// the library has fewer photos than that.
+    static func asset(atRecentIndex index: Int) -> PHAsset? {
+        let options = PHFetchOptions()
+        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        options.fetchLimit = index + 1
+        let assets = PHAsset.fetchAssets(with: .image, options: options)
+        guard assets.count > index else { return nil }
+        return assets.object(at: index)
+    }
+
+    /// A recent photo's original file name, for deriving the resized
+    /// copy's name ("IMG_1234.jpg" → "IMG_1234-resized.jpg").
+    static func recentPhotoFilename(index: Int) -> String? {
+        guard let asset = asset(atRecentIndex: index) else { return nil }
+        return PHAssetResource.assetResources(for: asset)
+            .first?.originalFilename
+    }
+
+    /// A recent photo's full image data — the same local-copies-only
+    /// rule as the text reader: iCloud-only photos return nil rather
+    /// than triggering a download.
+    static func imageData(atRecentIndex index: Int) async -> Data? {
+        guard let asset = asset(atRecentIndex: index) else { return nil }
+        return await imageData(for: asset)
+    }
+
     // MARK: - Helpers
 
     private static func line(for asset: PHAsset) -> String {

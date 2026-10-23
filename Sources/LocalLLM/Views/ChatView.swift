@@ -24,6 +24,10 @@ struct ChatView: View {
     /// keeps this chat's cards to this chat.
     @Query private var toolRecords: [ToolActivityRecord]
 
+    /// Phase 6: this conversation's decided action plans (approved
+    /// or discarded), merged into the transcript the same way.
+    @Query private var planRecords: [ActionPlanRecord]
+
     init(conversation: Conversation, engine: ChatEngine,
          mlxStore: MLXModelStore, endpointStore: EndpointStore,
          settings: AppSettings, fileScopeStore: FileScopeStore,
@@ -39,6 +43,9 @@ struct ChatView: View {
         _toolRecords = Query(
             filter: #Predicate<ToolActivityRecord> { $0.conversationID == id },
             sort: \ToolActivityRecord.createdAt)
+        _planRecords = Query(
+            filter: #Predicate<ActionPlanRecord> { $0.conversationID == id },
+            sort: \ActionPlanRecord.createdAt)
     }
 
     @State private var input = ""
@@ -80,6 +87,23 @@ struct ChatView: View {
                 availabilityBanner
             } else if selectedDescriptor == nil {
                 modelMissingBanner
+            }
+            if !engine.pendingPlan(for: conversationID).isEmpty {
+                PendingPlanCard(
+                    actions: engine.pendingPlan(for: conversationID),
+                    busy: engine.planBusyIDs.contains(conversationID),
+                    onRemove: { actionID in
+                        engine.removePendingAction(actionID,
+                                                   conversationID: conversationID)
+                    },
+                    onApprove: {
+                        engine.approvePlan(conversationID: conversationID,
+                                           context: modelContext)
+                    },
+                    onDiscard: {
+                        engine.discardPlan(conversationID: conversationID,
+                                           context: modelContext)
+                    })
             }
             Divider()
             composer
@@ -288,13 +312,26 @@ struct ChatView: View {
     private enum TranscriptItem: Identifiable {
         case message(Message)
         case tool(ToolActivityRecord)
+        case plan(ActionPlanRecord)
         case divider
 
         var id: String {
             switch self {
             case .message(let message): return "message-\(message.id.uuidString)"
             case .tool(let record): return "tool-\(record.id.uuidString)"
+            case .plan(let record): return "plan-\(record.id.uuidString)"
             case .divider: return "summarized-divider"
+            }
+        }
+
+        /// When the item happened (the divider has no time of its
+        /// own and sorts first among equals).
+        var createdAt: Date {
+            switch self {
+            case .message(let message): return message.createdAt
+            case .tool(let record): return record.createdAt
+            case .plan(let record): return record.createdAt
+            case .divider: return .distantPast
             }
         }
     }
@@ -302,13 +339,19 @@ struct ChatView: View {
     private var transcriptItems: [TranscriptItem] {
         let messages = conversation.sortedMessages
         let summarized = conversation.summarizedMessageCount
+        // Tool cards and plan cards share one time-ordered stream of
+        // non-message items; the divider stays placed by message
+        // position, exactly as before.
+        var events: [TranscriptItem] = toolRecords.map(TranscriptItem.tool)
+        events += planRecords.map(TranscriptItem.plan)
+        events.sort { $0.createdAt < $1.createdAt }
         var items: [TranscriptItem] = []
-        var recordIndex = 0
+        var eventIndex = 0
         for (index, message) in messages.enumerated() {
-            while recordIndex < toolRecords.count,
-                  toolRecords[recordIndex].createdAt <= message.createdAt {
-                items.append(.tool(toolRecords[recordIndex]))
-                recordIndex += 1
+            while eventIndex < events.count,
+                  events[eventIndex].createdAt <= message.createdAt {
+                items.append(events[eventIndex])
+                eventIndex += 1
             }
             if index == summarized, summarized > 0 {
                 items.append(.divider)
@@ -318,9 +361,9 @@ struct ChatView: View {
         if summarized > 0, summarized >= messages.count {
             items.append(.divider)
         }
-        while recordIndex < toolRecords.count {
-            items.append(.tool(toolRecords[recordIndex]))
-            recordIndex += 1
+        while eventIndex < events.count {
+            items.append(events[eventIndex])
+            eventIndex += 1
         }
         return items
     }
@@ -339,6 +382,8 @@ struct ChatView: View {
                                 .id(message.id)
                         case .tool(let record):
                             ToolActivityCard(record: record)
+                        case .plan(let record):
+                            ActionPlanCard(record: record, engine: engine)
                         case .divider:
                             SummarizedDivider()
                         }
@@ -355,6 +400,12 @@ struct ChatView: View {
                 scrollToBottom(proxy)
             }
             .onChange(of: toolRecords.count) {
+                scrollToBottom(proxy)
+            }
+            .onChange(of: planRecords.count) {
+                scrollToBottom(proxy)
+            }
+            .onChange(of: engine.pendingPlan(for: conversationID).count) {
                 scrollToBottom(proxy)
             }
             .onChange(of: engine.streamingText[conversationID]) {

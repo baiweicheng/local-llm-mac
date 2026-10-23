@@ -31,12 +31,24 @@ struct ToolCallArguments {
     var limit: Int?
     @Guide(description: "Which item, counting from the most recent (0 = most recent), when the tool takes one.")
     var index: Int?
+    @Guide(description: "A new name for the item (no folders, no slashes), when the tool takes one.")
+    var newName: String?
+    @Guide(description: "A full destination path inside the user's shared folders, when the tool takes one.")
+    var destination: String?
+    @Guide(description: "For edit_text_file: true adds text at the end of the file; false or omitted replaces its contents.")
+    var append: Bool?
+    @Guide(description: "For resize_photo: the widest the output may be, in pixels (default 1200).")
+    var maxWidth: Int?
+    @Guide(description: "For resize_photo: the largest the output JPEG may be, in bytes (default 512000).")
+    var maxBytes: Int?
 }
 
 extension ToolCallArguments {
     var coreArguments: ToolArguments {
         ToolArguments(query: query, path: path, expression: expression,
-                      text: text, days: days, limit: limit, index: index)
+                      text: text, days: days, limit: limit, index: index,
+                      newName: newName, destination: destination,
+                      append: append, maxWidth: maxWidth, maxBytes: maxBytes)
     }
 }
 

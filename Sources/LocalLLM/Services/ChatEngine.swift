@@ -86,6 +86,13 @@ import SwiftData
 @Observable
 final class ChatEngine {
 
+    init() {
+        // The tool runtime's proposal sink is static (like the
+        // activity-log sink below); it forwards to the one live
+        // engine, which the app shell creates.
+        Self.proposalTarget = self
+    }
+
     // MARK: - Observable state for the UI
 
     /// Partial reply text, per conversation, while a reply is streaming.
@@ -103,6 +110,21 @@ final class ChatEngine {
     /// the privacy-check notice when a prompt was scrubbed before
     /// being sent to a server that isn't on this Mac.
     var infoMessages: [UUID: String] = [:]
+    /// Phase 6: pending approval lists, per conversation — file
+    /// changes the model has proposed and the user hasn't decided
+    /// yet. Memory only, on purpose: a relaunch starts empty.
+    /// Proposals are cheap for the model to make again; silently
+    /// keeping half-approved file changes around is not.
+    private(set) var pendingPlans: [UUID: [PlannedAction]] = [:]
+    /// Phase 6: conversations whose plan is being executed or undone
+    /// right now (the card shows a spinner state and locks its
+    /// buttons).
+    private(set) var planBusyIDs: Set<UUID> = []
+    /// Phase 6: outcome notes waiting to ride at the head of the next
+    /// prompt in a conversation, so the model learns what the user
+    /// decided (approved / discarded / undone, and per-item results)
+    /// without a fake user message entering the transcript.
+    private var pendingOutcomeNotes: [UUID: String] = [:]
 
     // MARK: - Backends
 
@@ -186,6 +208,204 @@ final class ChatEngine {
         try? context.save()
     }
 
+    // MARK: - Action plans (Phase 6)
+
+    /// Where the static proposal sink forwards: the one live engine.
+    private static weak var proposalTarget: ChatEngine?
+
+    /// The runtime's proposal sink — validated file-action proposals
+    /// arrive here and land on the conversation's pending list.
+    /// Returns false for an identical change already on the list.
+    private static let proposalSink: @Sendable (UUID, PlannedAction) async -> Bool = { conversationID, action in
+        await MainActor.run {
+            ChatEngine.proposalTarget?.recordProposedAction(
+                action, conversationID: conversationID) ?? false
+        }
+    }
+
+    /// One validated proposal from the tool runtime. Identical
+    /// changes already pending are refused, so a chatty model can't
+    /// stack duplicates the user then has to wade through.
+    @discardableResult
+    func recordProposedAction(_ action: PlannedAction,
+                              conversationID: UUID) -> Bool {
+        let existing = pendingPlans[conversationID] ?? []
+        guard !ActionPlanRules.isDuplicate(action, in: existing) else {
+            return false
+        }
+        pendingPlans[conversationID] = existing + [action]
+        return true
+    }
+
+    /// The pending approval list for a conversation (empty if none).
+    func pendingPlan(for conversationID: UUID) -> [PlannedAction] {
+        pendingPlans[conversationID] ?? []
+    }
+
+    /// Removes one item from a pending list — the card's per-item
+    /// opt-out. What's left is what Approve will run.
+    func removePendingAction(_ actionID: UUID, conversationID: UUID) {
+        guard var plan = pendingPlans[conversationID] else { return }
+        plan.removeAll { $0.id == actionID }
+        pendingPlans[conversationID] = plan.isEmpty ? nil : plan
+    }
+
+    /// The user pressed Approve: run every item in order, persist
+    /// the decided plan (the transcript card), audit-log each item,
+    /// and queue the outcome note for the model's next turn. A
+    /// per-item failure is recorded on that item; the rest still run.
+    func approvePlan(conversationID: UUID, context: ModelContext) {
+        guard let plan = pendingPlans[conversationID], !plan.isEmpty,
+              !planBusyIDs.contains(conversationID) else { return }
+        pendingPlans[conversationID] = nil
+        planBusyIDs.insert(conversationID)
+        Self.activityLogContext = context
+        let roots = toolAvailabilityProvider().folderRootPaths
+        let planKey = UUID()
+        Task { [weak self] in
+            let backupDirectory = Self.backupDirectory(for: planKey)
+            var executed: [ExecutedActionItem] = []
+            for action in plan {
+                executed.append(await FileActionService.execute(
+                    action, roots: roots, backupDirectory: backupDirectory))
+            }
+            await MainActor.run {
+                guard let self else { return }
+                let record = ActionPlanRecord(conversationID: conversationID,
+                                              status: .executed,
+                                              items: executed)
+                context.insert(record)
+                try? context.save()
+                for item in executed {
+                    Self.recordToolEvent(ToolEvent(
+                        conversationID: conversationID,
+                        toolName: item.action.kind.toolName,
+                        source: item.action.kind == .resizePhoto ? .photos : .files,
+                        querySummary: item.action.summary,
+                        resultSummary: ToolResultText.summary(
+                            of: item.resultNote),
+                        date: Date()))
+                }
+                self.planBusyIDs.remove(conversationID)
+                self.pendingOutcomeNotes[conversationID] =
+                    Self.approvalOutcomeNote(items: executed)
+            }
+        }
+    }
+
+    /// The user pressed Discard: nothing runs, the decision is still
+    /// recorded (card + audit), and the model is told plainly — so it
+    /// doesn't quietly re-propose the same changes next turn.
+    func discardPlan(conversationID: UUID, context: ModelContext) {
+        guard let plan = pendingPlans[conversationID], !plan.isEmpty,
+              !planBusyIDs.contains(conversationID) else { return }
+        pendingPlans[conversationID] = nil
+        Self.activityLogContext = context
+        let record = ActionPlanRecord(
+            conversationID: conversationID, status: .discarded,
+            items: plan.map {
+                ExecutedActionItem(
+                    action: $0, outcome: .declined,
+                    resultNote: "Not done — the list was discarded.")
+            })
+        context.insert(record)
+        try? context.save()
+        for action in plan {
+            Self.recordToolEvent(ToolEvent(
+                conversationID: conversationID,
+                toolName: action.kind.toolName,
+                source: action.kind == .resizePhoto ? .photos : .files,
+                querySummary: action.summary,
+                resultSummary: "Discarded by the user — nothing was changed.",
+                date: Date()))
+        }
+        pendingOutcomeNotes[conversationID] =
+            "The user discarded the list of \(plan.count) file "
+            + "change(s) you proposed — NOTHING was changed. Do not "
+            + "re-propose them unless the user asks again."
+    }
+
+    /// The user pressed Undo on an executed plan's card: reverse
+    /// every reversible item, newest first, record each item's undo
+    /// note on the plan, audit-log the undo, and queue the outcome
+    /// note. Items that can't be reversed say so honestly on the
+    /// card rather than pretending.
+    func undoPlan(record: ActionPlanRecord, context: ModelContext) {
+        let conversationID = record.conversationID
+        guard record.canUndo, !planBusyIDs.contains(conversationID)
+        else { return }
+        planBusyIDs.insert(conversationID)
+        Self.activityLogContext = context
+        Task { [weak self] in
+            var items = record.items
+            let steps = ActionUndo.steps(for: items, home: NSHomeDirectory())
+            // Steps are keyed by the action's id, not by position.
+            var results: [(item: ExecutedActionItem, note: String)] = []
+            for step in steps {
+                let note = FileActionService.executeUndoStep(step)
+                if let index = items.firstIndex(
+                    where: { $0.action.id == step.itemID }) {
+                    items[index].undoNote = note
+                    results.append((items[index], note))
+                }
+            }
+            await MainActor.run {
+                guard let self else { return }
+                record.items = items
+                record.undoneAt = Date()
+                try? context.save()
+                for entry in results {
+                    Self.recordToolEvent(ToolEvent(
+                        conversationID: conversationID,
+                        toolName: entry.item.action.kind.toolName,
+                        source: entry.item.action.kind == .resizePhoto
+                            ? .photos : .files,
+                        querySummary: "Undo: \(entry.item.action.summary)",
+                        resultSummary: ToolResultText.summary(of: entry.note),
+                        date: Date()))
+                }
+                self.planBusyIDs.remove(conversationID)
+                let lines = results.map {
+                    "• \($0.item.action.summary) — \($0.note)"
+                }
+                self.pendingOutcomeNotes[conversationID] =
+                    "The user undid the file changes from the approved "
+                    + "list. Results:\n" + lines.joined(separator: "\n")
+            }
+        }
+    }
+
+    /// The note the model sees after an approval: per-item results,
+    /// in the conversation's own terms.
+    private static func approvalOutcomeNote(
+        items: [ExecutedActionItem]) -> String {
+        let lines = items.map { item -> String in
+            switch item.outcome {
+            case .done:
+                return "• \(item.action.summary) — done. \(item.resultNote)"
+            case .failed(let reason):
+                return "• \(item.action.summary) — FAILED. \(reason)"
+            case .declined:
+                return "• \(item.action.summary) — not done."
+            }
+        }
+        return "The user approved the list of file changes you "
+            + "proposed. Results:\n" + lines.joined(separator: "\n")
+    }
+
+    /// Where pre-edit backups live: one folder per approved plan,
+    /// inside the app's own Application Support — never inside the
+    /// user's shared folders, so a backup can never be mistaken for
+    /// the user's file (or proposed on by a later action).
+    private static func backupDirectory(for planKey: UUID) -> URL {
+        let support = FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory())
+                .appendingPathComponent("Library/Application Support")
+        return support.appendingPathComponent(
+            "LocalLLM/ActionBackups/\(planKey.uuidString)", isDirectory: true)
+    }
+
     // MARK: - Sessions
 
     /// A conversation's live session and everything needed to know
@@ -231,6 +451,9 @@ final class ChatEngine {
         errorMessages[conversationID] = nil
         routingNotes[conversationID] = nil
         infoMessages[conversationID] = nil
+        pendingPlans[conversationID] = nil
+        pendingOutcomeNotes[conversationID] = nil
+        planBusyIDs.remove(conversationID)
     }
 
     // MARK: - Sending
@@ -462,7 +685,9 @@ final class ChatEngine {
                         enabledSources: toolAvailability.enabledSources,
                         folderRootPaths: toolAvailability.folderRootPaths,
                         redactResults: false,
-                        redactionTerms: []),
+                        redactionTerms: [],
+                        fileWritingEnabled: toolAvailability.fileWritingEnabled,
+                        proposalSink: Self.proposalSink),
                     sink: Self.toolEventSink,
                     permissionProvider: { source in
                         PermissionStatusReader.currentState(for: source)
@@ -489,6 +714,16 @@ final class ChatEngine {
                 instructions: effectiveInstructions, summaryKey: summaryKey,
                 seeded: true, kvCacheMode: routingInputs.kvCacheMode,
                 toolsSignature: toolsSignature)
+        }
+
+        // Phase 6: if the user decided a proposed file-change list
+        // since the last message (approved, discarded, or undone),
+        // the outcome rides at the head of this prompt. It is part of
+        // the sent copy only — never a stored message — and it goes
+        // through the same firewall scrub as everything else below.
+        if let outcomeNote = pendingOutcomeNotes.removeValue(
+            forKey: conversationID) {
+            promptText = outcomeNote + "\n\n" + promptText
         }
 
         // The firewall's second half: with the outgoing prompt fully

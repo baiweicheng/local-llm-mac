@@ -16,6 +16,11 @@ import SwiftUI
 /// guidance, the shared-folder picker, and the access log ("Recent
 /// lookups"). This sheet is where visibility is granted; chats only
 /// ever consume what was granted here.
+///
+/// Phase 6 adds "File changes": the separate, default-off switch
+/// that lets models PROPOSE file changes inside the shared folders
+/// (approval still happens in the chat, never here), and the log
+/// becomes "Recent activity" — lookups and file changes together.
 struct SettingsView: View {
     @Bindable var settings: AppSettings
     let fileScopeStore: FileScopeStore
@@ -51,6 +56,8 @@ struct SettingsView: View {
                     kvCacheSection
                     Divider()
                     visibilitySection
+                    Divider()
+                    fileChangesSection
                     Divider()
                     accessLogSection
                 }
@@ -154,7 +161,7 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("What this app can see")
                 .font(.headline)
-            Text("Turn on a source and the model in a chat can look things up on this Mac to answer you — find a file, check what's on your calendar, look up a contact. Everything here is read-only: the model can look, never change. Every lookup is written to the log below and shown as a card in the chat, so nothing it sees is invisible to you.")
+            Text("Turn on a source and the model in a chat can look things up on this Mac to answer you — find a file, check what's on your calendar, look up a contact. Looking is all these switches allow — changing files is a separate switch, below. Every lookup is written to the log below and shown as a card in the chat, so nothing it sees is invisible to you.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
             Text("Lookups work with the Apple On-Device model and downloaded MLX models — the models that run on this Mac. Server chats can't use them. What a lookup finds never leaves this Mac in this version; if a cloud model ever gets lookups in a later phase, its results will pass the privacy check above first, and under Local Only a network model gets no lookups at all.")
@@ -268,12 +275,36 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - File changes (Phase 6)
+
+    private var fileChangesSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("File changes")
+                .font(.headline)
+            Text("With this on, the model can also PROPOSE file changes inside your shared folders: rename, move, copy, create a folder, write a text file, move something to the Trash, or make a smaller copy of a photo. Proposing is all it can do — every change appears as a list in the chat, and nothing happens until you press Approve there. Each change can be taken off the list first, and approved changes can be undone from their card. Changes are never allowed outside the shared folders, and nothing is ever overwritten. Proposals and results are written to the log below, like lookups.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Toggle(isOn: $settings.fileWritingEnabled) {
+                Text("Let the model propose file changes")
+            }
+            if settings.fileWritingEnabled,
+               !settings.enabledVisibilitySources.contains(.files),
+               !settings.enabledVisibilitySources.contains(.photos) {
+                Text("Turn on Files or Photos above as well — file changes work inside the shared folders and the photo library, and both are off right now.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
     // MARK: - Access log (Phase 5)
 
     private var accessLogSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("Recent lookups")
+                Text("Recent activity")
                     .font(.headline)
                 Spacer()
                 if !recentRecords.isEmpty {
@@ -286,7 +317,7 @@ struct SettingsView: View {
                     .font(.callout)
                 }
             }
-            Text("Every lookup a model makes is recorded here — what it used, what it asked, and a summary of what it found. The newest \(AccessLogPolicy.maxRecords) are kept; older ones fall off.")
+            Text("Everything a model does is recorded here — every lookup, and every proposed, approved, discarded, or undone file change. The newest \(AccessLogPolicy.maxRecords) are kept; older ones fall off.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
             if recentRecords.isEmpty {

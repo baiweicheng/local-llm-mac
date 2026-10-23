@@ -83,13 +83,20 @@ enum FileAccessService {
     /// else nil. Roots are expected pre-resolved (FileScopeStore);
     /// both sides still go through `FileScope`'s standardization.
     private static func scopedPath(_ rawPath: String, roots: [String]) -> String? {
+        guard let resolved = resolvedPath(rawPath) else { return nil }
+        return FileScope.isPath(resolved, insideAnyRoot: roots) ? resolved : nil
+    }
+
+    /// Phase 6: the resolved form on its own — proposal validation
+    /// resolves every path a model names through this, then applies
+    /// `FileScope` itself, so reads and writes resolve identically.
+    static func resolvedPath(_ rawPath: String) -> String? {
         let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        let resolved = URL(fileURLWithPath: (trimmed as NSString).expandingTildeInPath)
+        return URL(fileURLWithPath: (trimmed as NSString).expandingTildeInPath)
             .resolvingSymlinksInPath()
             .standardizedFileURL
             .path
-        return FileScope.isPath(resolved, insideAnyRoot: roots) ? resolved : nil
     }
 
     private static func outsideScopeMessage(roots: [String]) -> String {

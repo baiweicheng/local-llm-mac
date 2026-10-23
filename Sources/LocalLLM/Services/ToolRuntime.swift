@@ -17,6 +17,13 @@ import Foundation
 ///    can enter a prompt.
 ///  - Every execution emits a `ToolEvent` — which the engine persists
 ///    to the access log and renders as a transcript card.
+///  - Phase 6: file-action tools never execute here at all. A call is
+///    validated (scope on both ends, never-overwrite) and handed to
+///    the engine as a proposal via `Configuration.proposalSink`; the
+///    disk changes only after the user approves the list in the chat,
+///    in `FileActionService`. The proposal itself is logged like any
+///    other call, so proposals and executions both appear in the
+///    audit log.
 ///
 /// PRIVACY: tool results are local data. In this phase every
 /// tool-capable backend is local (the on-device model and MLX models
@@ -38,6 +45,16 @@ actor ToolRuntime {
         /// tool-capable backend that exists in Phase 5.
         var redactResults: Bool
         var redactionTerms: [String]
+        /// Phase 6: the file-writing Settings toggle, snapshotted
+        /// with the rest of the tool availability. Write tools are
+        /// offered only while it's on, and a call that arrives with
+        /// it off (a stale session) is refused here.
+        var fileWritingEnabled: Bool = false
+        /// Phase 6: where validated proposals go — the engine's
+        /// pending approval list for the conversation. Returns false
+        /// when the identical change is already on the list (and for
+        /// the default sink, which accepts nothing).
+        var proposalSink: @Sendable (UUID, PlannedAction) async -> Bool = { _, _ in false }
     }
 
     private let configuration: Configuration
@@ -54,7 +71,8 @@ actor ToolRuntime {
 
     /// The tools this session may offer its model.
     var descriptors: [ToolDescriptor] {
-        ToolCatalog.descriptors(enabledSources: configuration.enabledSources)
+        ToolCatalog.descriptors(enabledSources: configuration.enabledSources,
+                                fileWritingEnabled: configuration.fileWritingEnabled)
     }
 
     /// Run one tool call and return the text the model sees. Never
@@ -76,6 +94,13 @@ actor ToolRuntime {
             result = "The app doesn't have permission for \(source.displayName) yet. "
                 + (PermissionGuidance.text(source: source, state: state)
                     ?? "The user can allow it in Settings → What this app can see.")
+        } else if descriptor.isWriteAction, !configuration.fileWritingEnabled {
+            // Defense in depth: write tools aren't offered while the
+            // toggle is off, but a session built earlier could still
+            // try one.
+            result = "File changes are turned off. The user can turn them on in Settings → File changes — every proposed change still needs their approval before anything happens."
+        } else if descriptor.isWriteAction {
+            result = await propose(descriptor: descriptor, arguments: arguments)
         } else {
             result = await run(descriptor: descriptor, arguments: arguments)
         }
@@ -138,5 +163,70 @@ actor ToolRuntime {
         default:
             return "That tool isn't wired up yet."
         }
+    }
+
+    // MARK: - Phase 6: file-action proposals
+
+    /// Validates a file-action call and, when it passes, puts it on
+    /// the conversation's approval list. The only disk access here
+    /// is read-only (resolving paths, checking what exists): a
+    /// proposal NEVER changes anything. Validation failures come
+    /// back as the plain-English refusal the model relays.
+    private func propose(descriptor: ToolDescriptor,
+                         arguments: ToolArguments) async -> String {
+        guard let kind = PlannedActionKind(toolName: descriptor.name) else {
+            return "That tool isn't wired up yet."
+        }
+        let roots = configuration.folderRootPaths
+        let inputs: ActionInputs
+        switch kind {
+        case .rename:
+            inputs = ActionInputs(sourcePath: resolved(arguments.path),
+                                  newName: arguments.newName)
+        case .move, .copy:
+            inputs = ActionInputs(sourcePath: resolved(arguments.path),
+                                  destinationPath: resolved(arguments.destination))
+        case .createFolder:
+            inputs = ActionInputs(sourcePath: resolved(arguments.path))
+        case .editText:
+            inputs = ActionInputs(sourcePath: resolved(arguments.path),
+                                  editText: arguments.text,
+                                  appendEdit: arguments.appendFlag)
+        case .trash:
+            inputs = ActionInputs(sourcePath: resolved(arguments.path))
+        case .resizePhoto:
+            let filePath = resolved(arguments.path)
+            inputs = ActionInputs(
+                sourcePath: filePath,
+                destinationPath: resolved(arguments.destination),
+                sourcePhotoIndex: filePath == nil ? arguments.indexClamped : nil,
+                libraryPhotoName: filePath == nil
+                    ? PhotosService.recentPhotoFilename(index: arguments.indexClamped)
+                    : nil,
+                maxWidthPx: arguments.maxWidthClamped,
+                byteCeiling: arguments.maxBytesClamped)
+        }
+
+        switch ActionProposal.make(kind: kind, inputs: inputs, roots: roots,
+                                   probe: FileActionService.probe,
+                                   home: NSHomeDirectory()) {
+        case .refused(let reason):
+            return reason
+        case .proposed(let action):
+            if await configuration.proposalSink(configuration.conversationID, action) {
+                return "Added to the list for the user's approval — NOTHING has been changed yet: \(action.summary) The user sees the list in the chat with Approve and Discard buttons. Do not say it is done; what the user decides comes back in a later message."
+            }
+            return "That exact change is already on the approval list — the user hasn't decided yet, so nothing new was added."
+        }
+    }
+
+    /// The resolved absolute form of a path the model named (nil for
+    /// an empty one) — the same resolution the read tools use, so a
+    /// path means the same thing on both sides.
+    private func resolved(_ rawPath: String?) -> String? {
+        guard let rawPath,
+              !rawPath.trimmingCharacters(in: .whitespaces).isEmpty
+        else { return nil }
+        return FileAccessService.resolvedPath(rawPath)
     }
 }

@@ -52,16 +52,28 @@ final class AppSettings {
     /// persisted as the set of source raw values.
     private(set) var enabledVisibilitySources: Set<VisibilitySource>
 
+    /// Phase 6: the file-writing master switch — separate from the
+    /// read toggles above, default OFF. While off, the file-action
+    /// tools (rename/move/copy/create/edit/trash/resize) don't exist
+    /// for any model; while on, they exist but only PROPOSE changes
+    /// inside the shared folders, and every proposal still needs the
+    /// user's approval in the chat before anything changes.
+    var fileWritingEnabled: Bool {
+        didSet { defaults.set(fileWritingEnabled, forKey: Self.fileWritingKey) }
+    }
+
     private let defaults: UserDefaults
 
     private static let localOnlyKey = "LocalLLM.localOnly.v1"
     private static let redactionTermsKey = "LocalLLM.redactionTerms.v1"
     private static let kvCacheModeKey = "LocalLLM.kvCacheMode.v1"
     private static let visibilitySourcesKey = "LocalLLM.visibilitySources.v1"
+    private static let fileWritingKey = "LocalLLM.fileWriting.v1"
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         self.localOnly = defaults.bool(forKey: Self.localOnlyKey)
+        self.fileWritingEnabled = defaults.bool(forKey: Self.fileWritingKey)
         self.kvCacheMode = KVCacheMode(
             storedValue: defaults.string(forKey: Self.kvCacheModeKey))
         if let stored = defaults.stringArray(forKey: Self.redactionTermsKey) {

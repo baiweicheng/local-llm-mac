@@ -184,8 +184,10 @@ could ever leave this Mac.
 The local visibility layer: the model can now *look things up on your
 Mac* to answer you — and only ever where you've said it may. This is
 the app's main idea, so it's built like a bank vault door: everything
-is off until you turn it on, everything is read-only, and everything
-it looks at is written down where you can see it.
+is off until you turn it on, everything in this phase is read-only,
+and everything it looks at is written down where you can see it.
+(Phase 6, below, adds carefully-confirmed *changes* under a separate
+switch.)
 
 **Turning it on.** Open the gear (Privacy) sheet and scroll to
 **What this app can see**. Each source has its own switch, off by
@@ -233,7 +235,7 @@ isn't landing.
 **The access log.** Every lookup is recorded — when, which tool, what
 it asked, a one-line summary of what it found — and shown two ways:
 as a small card in the chat, right where it happened, and in the
-gear sheet under **Recent lookups**. The newest 300 are kept. If a
+gear sheet under **Recent activity**. The newest 300 are kept. If a
 model ever looks at something, there is a card saying so; there is no
 silent looking.
 
@@ -254,6 +256,86 @@ purpose (a file search returns a handful of lines, trimmed with a
 note if longer), because the on-device model's memory window is
 small and a 200-line search result would crowd out your conversation.
 
+## What's new in Phase 6
+
+File actions — carefully, and only ever with your OK. Phase 5 let the
+model *look*; this phase lets it *propose changes* to files inside
+your shared folders. The model can never change anything by itself:
+proposing is all a tool call can do, and every change waits for you.
+
+**The switch.** In the gear sheet, below "What this app can see",
+there's a separate **File changes** switch — off by default, and
+separate from the read switches on purpose. While it's off, the
+file-action tools don't exist for any model. While it's on, the
+model gains seven propose-only tools: **rename**, **move**, **copy**,
+**create folder**, **edit a text file** (replace its contents, or add
+at the end), **move to Trash**, and **resize a photo**.
+
+**How proposing works.** When the model wants to change something,
+the change lands on a list pinned above the message box: *"Rename
+“IMG_2049.jpg” → “beach-sunset.jpg” in ~/Downloads"*, one line per
+change, in plain English. You can take individual changes off the
+list (the ✕ on each row), **Discard** the whole list, or **Approve**
+it. Only Approve touches the disk: the app then runs each change in
+order, and each one reports its own result on a card in the chat —
+done, or exactly why it couldn't. One failure doesn't stop the rest.
+The model is told the outcome with your next message, so the
+conversation carries on knowing what you decided — including when
+you discard, so it doesn't quietly re-propose the same list.
+
+**The safety rules** (all checked when a change is proposed, and
+checked *again* against the disk as it is when you approve):
+
+- Nothing outside your shared folders can ever be changed — both
+  ends of a move or copy must be inside them, and a shared folder
+  itself can never be moved to the Trash.
+- **Nothing is ever overwritten.** If something already sits where a
+  change would land, that change fails with a note instead. (The one
+  deliberate exception is editing a text file — the file *is* the
+  destination — and there the app keeps a backup of the old contents
+  first, which is also what makes the edit undoable.)
+- Deletes are really **Move to Trash** — nothing is permanently
+  erased.
+- A folder can't be moved or copied into itself.
+- Every proposal, approval, discard, result, and undo is written to
+  the same log as the lookups (the gear sheet's **Recent activity**)
+  and shown as cards in the chat.
+
+**Undo.** Every approved list's card keeps an **Undo these changes**
+button until you've used it. Undo runs newest-change-first: renames
+and moves go back where they came from, copies and created files go
+to the Trash, a created folder is removed *only if it's still
+empty*, an edited file gets its backed-up contents back (the edited
+version goes to the Trash, so undo loses nothing itself), and a
+trashed item is pulled back out of the Trash. The honest limits:
+undo never overwrites either — if something new sits in the original
+spot, that item stays put and the card says why; a folder that has
+gained files is left alone; and if macOS didn't tell the app where a
+trashed item landed, that one item can't be pulled back
+automatically (it can always be dragged back from the Trash in
+Finder).
+
+**Resizing a photo** (for uploads with size limits, email, sharing).
+Point it at a recent library photo or at an image file in a shared
+folder, with a maximum width (default 1200 px) and a JPEG size limit
+(default about 500 KB). The app scales the photo down, then saves it
+as a JPEG, stepping the quality down until the file fits the limit;
+if even the lowest quality is too big, it shrinks the photo a step
+and tries again — and if it still can't fit, you get the smallest
+version it could make, with the card saying so. The original is never
+touched; the resized copy is a new file (named like the original,
+with "-resized" added, unless you asked for a specific place), and
+when the change is approved the copy is **also put on your
+clipboard**, ready to paste.
+
+**Artifact chips.** Any file an approved change creates — the
+resized photo, a copy, a new text file — appears on the plan's card
+as a small pill with its name and size. The pill is the file: drag it
+straight into a browser upload, Finder, or another app. If the file
+is later moved or deleted somewhere else, the pill stays on the card,
+greyed out and marked "missing", rather than vanishing from the
+record.
+
 ## Good to know
 
 - The built-in model is small (~3 billion parameters). It's good at chat,
@@ -271,14 +353,16 @@ small and a 200-line search result would crowd out your conversation.
   server-request building, stream parsing, routing decisions, the
   privacy check, the telemetry pill, the calculator, the
   shared-folder scope check, tool arguments and result trimming, and
-  the tool runtime's on/off and permission gates) and never call the
-  real model.
+  the tool runtime's on/off and permission gates, plus the
+  file-action layer: proposal validation, the
+  never-overwrite rule, undo planning, and the photo-resize
+  arithmetic) and never call the real model.
 
 ## Where this is going
 
-This is phase 5 of a larger build (see the project plan): next come
-carefully-confirmed file actions (built on the same shared-folder
-scope the read tools use), a global hotkey HUD, and an optional
-cloud tier via OpenRouter — which will inherit Phase 4's privacy check
-(and its habit of reusing the conversation summary instead of raw
-history) before anything leaves the Mac.
+This is phase 6 of a larger build (see the project plan): next come
+a global hotkey HUD (the same chat and tools, one keystroke away
+from any app), and an optional cloud tier via OpenRouter — which
+will inherit Phase 4's privacy check (and its habit of reusing the
+conversation summary instead of raw history) before anything leaves
+the Mac.

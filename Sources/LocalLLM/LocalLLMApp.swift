@@ -16,13 +16,15 @@ struct LocalLLMApp: App {
     let container: ModelContainer = {
         do {
             return try ModelContainer(for: Conversation.self, Message.self,
-                                      ToolActivityRecord.self)
+                                      ToolActivityRecord.self,
+                                      ActionPlanRecord.self)
         } catch {
             let memoryOnly = ModelConfiguration(isStoredInMemoryOnly: true)
             // If even this fails there is no store at all; crashing loudly
             // at launch is the honest outcome.
             return try! ModelContainer(for: Conversation.self, Message.self,
                                        ToolActivityRecord.self,
+                                       ActionPlanRecord.self,
                                        configurations: memoryOnly)
         }
     }()

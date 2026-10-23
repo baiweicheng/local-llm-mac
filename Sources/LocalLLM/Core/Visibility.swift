@@ -165,11 +165,20 @@ enum ToolArgumentField: String, CaseIterable, Sendable {
     case days
     case limit
     case index
+    // Phase 6: the file-action fields. Same deal as the rest — one
+    // shared shape, the per-tool descriptions say which apply.
+    case newName
+    case destination
+    case append
+    case maxWidth
+    case maxBytes
 
     var jsonType: String {
         switch self {
-        case .query, .path, .expression, .text: return "string"
-        case .days, .limit, .index: return "integer"
+        case .query, .path, .expression, .text, .newName, .destination:
+            return "string"
+        case .days, .limit, .index, .maxWidth, .maxBytes: return "integer"
+        case .append: return "boolean"
         }
     }
 
@@ -182,6 +191,11 @@ enum ToolArgumentField: String, CaseIterable, Sendable {
         case .days: return "How many days ahead to look, when the tool takes one."
         case .limit: return "How many results to return at most, when the tool takes one."
         case .index: return "Which item, counting from the most recent (0 = most recent)."
+        case .newName: return "The new name only (no folder, no slashes), for the rename tool."
+        case .destination: return "The full destination path, for the move, copy, and photo-resize tools."
+        case .append: return "True to add the text at the end of the file instead of replacing its contents, for the edit tool."
+        case .maxWidth: return "The widest the resized photo may be, in pixels, for the photo-resize tool."
+        case .maxBytes: return "The largest JPEG file size allowed, in bytes, for the photo-resize tool."
         }
     }
 }
@@ -204,10 +218,18 @@ struct ToolArguments: Sendable, Equatable {
     var days: Int?
     var limit: Int?
     var index: Int?
+    // Phase 6: file-action fields.
+    var newName: String?
+    var destination: String?
+    var append: Bool?
+    var maxWidth: Int?
+    var maxBytes: Int?
 
     init(query: String? = nil, path: String? = nil,
          expression: String? = nil, text: String? = nil,
-         days: Int? = nil, limit: Int? = nil, index: Int? = nil) {
+         days: Int? = nil, limit: Int? = nil, index: Int? = nil,
+         newName: String? = nil, destination: String? = nil,
+         append: Bool? = nil, maxWidth: Int? = nil, maxBytes: Int? = nil) {
         self.query = query
         self.path = path
         self.expression = expression
@@ -215,6 +237,11 @@ struct ToolArguments: Sendable, Equatable {
         self.days = days
         self.limit = limit
         self.index = index
+        self.newName = newName
+        self.destination = destination
+        self.append = append
+        self.maxWidth = maxWidth
+        self.maxBytes = maxBytes
     }
 
     /// From backend values (the MLX dispatch path). Strings that look
@@ -238,9 +265,25 @@ struct ToolArguments: Sendable, Equatable {
             case .bool, nil: return nil
             }
         }
+        func bool(_ field: ToolArgumentField) -> Bool? {
+            switch values[field.rawValue] {
+            case .bool(let value): return value
+            case .string(let value):
+                switch value.trimmingCharacters(in: .whitespaces).lowercased() {
+                case "true", "yes", "1": return true
+                case "false", "no", "0": return false
+                default: return nil
+                }
+            case .int(let value): return value != 0
+            case .double, nil: return nil
+            }
+        }
         self.init(query: string(.query), path: string(.path),
                   expression: string(.expression), text: string(.text),
-                  days: int(.days), limit: int(.limit), index: int(.index))
+                  days: int(.days), limit: int(.limit), index: int(.index),
+                  newName: string(.newName), destination: string(.destination),
+                  append: bool(.append), maxWidth: int(.maxWidth),
+                  maxBytes: int(.maxBytes))
     }
 
     /// Days ahead for calendar lookups: default a week, at most 60.
@@ -249,6 +292,12 @@ struct ToolArguments: Sendable, Equatable {
     var limitClamped: Int { min(max(limit ?? 8, 1), 25) }
     /// "Which recent item": default the most recent, never negative.
     var indexClamped: Int { min(max(index ?? 0, 0), 24) }
+    /// Photo resize width cap: default 1200 px, sane bounds.
+    var maxWidthClamped: Int { min(max(maxWidth ?? 1200, 16), 8192) }
+    /// Photo resize JPEG ceiling: default ~500 KB, sane bounds.
+    var maxBytesClamped: Int { min(max(maxBytes ?? 512_000, 10_000), 20_000_000) }
+    /// Edit mode: replace unless the model asked to append.
+    var appendFlag: Bool { append ?? false }
 
     /// The short human summary of what was asked, for the access log
     /// and the transcript card.
@@ -270,6 +319,14 @@ struct ToolArguments: Sendable, Equatable {
             return expression ?? "an expression"
         case "write_clipboard":
             return String((text ?? "").prefix(40))
+        case "rename_file":
+            return "\(path ?? "a file") → \(newName ?? "a new name")"
+        case "move_file", "copy_file":
+            return "\(path ?? "a file") → \(destination ?? "elsewhere")"
+        case "create_folder", "edit_text_file", "trash_file":
+            return path ?? "a path"
+        case "resize_photo":
+            return path ?? "photo #\(indexClamped + 1) from most recent"
         default:
             return ""
         }
@@ -292,6 +349,12 @@ struct ToolDescriptor: Sendable, Equatable, Identifiable {
     let source: VisibilitySource?
     let argumentFields: [ToolArgumentField]
     let symbolName: String
+    /// Phase 6: a file-action tool. These NEVER touch the disk when
+    /// called — they propose an item onto the conversation's approval
+    /// list (see `FileActions.swift`) — and they exist only while the
+    /// separate file-writing Settings toggle is on. Declared last with
+    /// a default so every read-tool literal above stays unchanged.
+    let isWriteAction: Bool = false
 
     var id: String { name }
 }
@@ -404,6 +467,72 @@ enum ToolCatalog {
             source: nil,
             argumentFields: [],
             symbolName: "clock"),
+
+        // MARK: Phase 6 — file actions (propose-only)
+        //
+        // Every description below carries the same deal, stated to the
+        // model in so many words: calling the tool changes NOTHING.
+        // It adds one item to a list the user reviews (each item can
+        // be removed) and approves or discards as a whole. The model
+        // must never report an action as done before the user approves
+        // — the outcome arrives as a note in a later message.
+
+        ToolDescriptor(
+            name: "rename_file",
+            displayName: "Rename file",
+            modelDescription: "Propose renaming a file or folder inside a shared folder. Set path to the item's full path and newName to the new name only (no folder, no slashes). This changes NOTHING yet: it adds the rename to a list the user must approve before anything happens. Never say a rename is done until the user has approved it.",
+            source: .files,
+            argumentFields: [.path, .newName],
+            symbolName: "pencil",
+            isWriteAction: true),
+        ToolDescriptor(
+            name: "move_file",
+            displayName: "Move file",
+            modelDescription: "Propose moving a file or folder to a new path inside the shared folders. Set path to where it is now and destination to the full new path (folder + name). This changes NOTHING yet: it adds the move to a list the user must approve before anything happens. A move never overwrites — if something already sits at the destination, pick a different name.",
+            source: .files,
+            argumentFields: [.path, .destination],
+            symbolName: "arrow.right.square",
+            isWriteAction: true),
+        ToolDescriptor(
+            name: "copy_file",
+            displayName: "Copy file",
+            modelDescription: "Propose copying a file to a new path inside the shared folders (the original stays where it is). Set path to the file and destination to the full path of the copy. This changes NOTHING yet: it adds the copy to a list the user must approve before anything happens. A copy never overwrites an existing file.",
+            source: .files,
+            argumentFields: [.path, .destination],
+            symbolName: "doc.on.doc",
+            isWriteAction: true),
+        ToolDescriptor(
+            name: "create_folder",
+            displayName: "Create folder",
+            modelDescription: "Propose creating a new folder inside a shared folder. Set path to the new folder's full path. This changes NOTHING yet: it adds the new folder to a list the user must approve before anything happens.",
+            source: .files,
+            argumentFields: [.path],
+            symbolName: "folder.badge.plus",
+            isWriteAction: true),
+        ToolDescriptor(
+            name: "edit_text_file",
+            displayName: "Edit text file",
+            modelDescription: "Propose writing text into a file inside a shared folder: the file's contents are replaced with text, or added at the end when append is true. If the file doesn't exist yet, this proposes creating it with that text. Set path and text. This changes NOTHING yet: it adds the edit to a list the user must approve before anything happens. Before an existing file is replaced, the app keeps a backup so the change can be undone.",
+            source: .files,
+            argumentFields: [.path, .text, .append],
+            symbolName: "square.and.pencil",
+            isWriteAction: true),
+        ToolDescriptor(
+            name: "trash_file",
+            displayName: "Move to Trash",
+            modelDescription: "Propose moving a file or folder inside a shared folder to the Trash. Set path to the item. This changes NOTHING yet: it adds the move to a list the user must approve before anything happens. Items go to the Trash — they are never permanently deleted — and the change can be undone.",
+            source: .files,
+            argumentFields: [.path],
+            symbolName: "trash",
+            isWriteAction: true),
+        ToolDescriptor(
+            name: "resize_photo",
+            displayName: "Resize photo",
+            modelDescription: "Propose making a smaller JPEG copy of a photo, sized for uploading or sharing: it is shrunk to at most maxWidth pixels wide (default 1200) and re-saved under a byte ceiling (maxBytes, default about 500 KB), lowering quality — and, if needed, size — until it fits. The original is never touched. Set index to pick one of the most recent library photos (0 = most recent), or path to an image file inside a shared folder; optionally set destination for the new file's full path (otherwise a name is derived next to the original, or in the first shared folder for library photos). This changes NOTHING yet: it adds the resize to a list the user must approve; when approved, the new file is also copied to the clipboard.",
+            source: .photos,
+            argumentFields: [.path, .index, .destination, .maxWidth, .maxBytes],
+            symbolName: "arrow.down.right.and.arrow.up.left",
+            isWriteAction: true),
     ]
 
     static func descriptor(named name: String) -> ToolDescriptor? {
@@ -414,12 +543,24 @@ enum ToolCatalog {
     /// source the user has enabled. Nothing enabled = no tools at all,
     /// so a Phase 5 install with every toggle off behaves exactly
     /// like Phase 4.
-    static func descriptors(enabledSources: Set<VisibilitySource>) -> [ToolDescriptor] {
+    ///
+    /// Phase 6: file-action tools carry a second gate — they are in
+    /// the set only while the file-writing toggle is also on. The
+    /// default (toggle off) keeps every Phase 5 call site behaving
+    /// exactly as before.
+    static func descriptors(enabledSources: Set<VisibilitySource>,
+                            fileWritingEnabled: Bool = false) -> [ToolDescriptor] {
         guard !enabledSources.isEmpty else { return [] }
         return all.filter { descriptor in
+            if descriptor.isWriteAction, !fileWritingEnabled { return false }
             guard let source = descriptor.source else { return true }
             return enabledSources.contains(source)
         }
+    }
+
+    /// Just the file-action tools (Phase 6), in catalog order.
+    static var writeActions: [ToolDescriptor] {
+        all.filter { $0.isWriteAction }
     }
 }
 
@@ -486,6 +627,11 @@ enum AccessLogPolicy {
 struct ToolAvailability: Equatable, Sendable {
     var enabledSources: Set<VisibilitySource>
     var folderRootPaths: [String]
+    /// Phase 6: the file-writing toggle. Part of the signature, so
+    /// flipping it retires live sessions and the next send rebuilds
+    /// them with (or without) the file-action tools — the same deal
+    /// as toggling a source.
+    var fileWritingEnabled: Bool = false
 
     static let none = ToolAvailability(enabledSources: [], folderRootPaths: [])
 
@@ -494,5 +640,6 @@ struct ToolAvailability: Equatable, Sendable {
     var signature: String {
         let sources = enabledSources.map(\.rawValue).sorted().joined(separator: ",")
         return sources + "|" + folderRootPaths.sorted().joined(separator: ",")
+            + "|" + (fileWritingEnabled ? "write" : "read")
     }
 }
