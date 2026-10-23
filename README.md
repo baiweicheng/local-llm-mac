@@ -92,7 +92,8 @@ memory.
 - **Downloading an MLX model.** Click the chip/CPU button in the chat
   header → **Manage Models…**. Three models are listed, sized for a Mac
   with 18 GB of memory: **Llama 3.2 3B** (small and fast, ≈1.9 GB),
-  **Llama 3.1 8B** (the balanced default, ≈4.9 GB), and **Qwen 2.5 14B**
+  **Gemma 4 12B** (Google's model — the recommended default, ≈6.5 GB;
+  it also natively understands images and audio), and **Qwen 2.5 14B**
   (the strongest local option that fits, ≈8.4 GB), each with a
   plain-English badge saying how it fits your Mac. **Download** fetches
   it from Hugging Face with a progress bar (Cancel any time); downloaded
@@ -163,7 +164,7 @@ could ever leave this Mac.
   shows while the lock is on.
 - **Telemetry pill.** Every reply now carries a small pill underneath
   — for example `Apple On-Device · 1.2s · $0.00` or `Local MLX ·
-  Llama 3.1 8B · 3.4s · $0.00` — naming the model that actually
+  Gemma 4 12B · 3.4s · $0.00` — naming the model that actually
   answered, how long it took, and what it cost. Under Auto this is
   where you can see which model handled each message.
 

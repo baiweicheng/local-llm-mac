@@ -7,7 +7,7 @@ import Foundation
 /// cost is $0.00 in every phase so far; the field exists so the cloud
 /// tier (Phase 8) has somewhere honest to put a real number.
 struct MessageTelemetry: Equatable, Sendable {
-    /// Pill label, e.g. "Apple On-Device" or "Local MLX · Llama 3.1 8B"
+    /// Pill label, e.g. "Apple On-Device" or "Local MLX · Gemma 4 12B"
     /// (see `TelemetryFormat.label`).
     let backendLabel: String
     /// Wall-clock seconds the reply took to generate.

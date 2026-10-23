@@ -19,7 +19,7 @@ enum ModelSelection: Equatable, Hashable, Sendable {
     /// Apple's built-in on-device model (Foundation Models).
     case onDevice
     /// A downloaded MLX model, identified by its Hugging Face repo id
-    /// (e.g. "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit").
+    /// (e.g. "mlx-community/gemma-4-12B-it-4bit").
     case mlx(repoID: String)
     /// A saved local-server configuration, by its stable id.
     case endpoint(id: UUID)
@@ -90,7 +90,7 @@ enum ModelSelection: Equatable, Hashable, Sendable {
 /// backend and let the user choose it, without touching live services.
 struct BackendDescriptor: Equatable, Sendable, Identifiable {
     let selection: ModelSelection
-    /// Picker label, e.g. "Apple On-Device", "Llama 3.1 8B", "Ollama".
+    /// Picker label, e.g. "Apple On-Device", "Gemma 4 12B", "Ollama".
     let displayName: String
     /// Small print under the label, e.g. "Built into macOS",
     /// "Local MLX model · ≈ 4.9 GB", "llama3.1 · localhost:11434".

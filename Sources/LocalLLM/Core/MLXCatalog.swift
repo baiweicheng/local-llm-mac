@@ -57,10 +57,15 @@ enum MLXCatalog {
         Double(ProcessInfo.processInfo.physicalMemory) / 1_000_000_000
     }
 
-    /// Three tiers, sized for 18 GB: a small fast model, the 8B-class
-    /// default, and a 14B model at 4-bit quantization (~9 GB of weights)
-    /// — the largest tier that fits this Mac with room to work. A 30B
-    /// model would need ~17 GB at 4-bit and is deliberately not listed.
+    /// Three tiers, sized for 18 GB: a small fast model, the default
+    /// (Google's Gemma 4 12B at 4-bit, ~6.5 GB of weights — the
+    /// "comfortable" tier on this Mac), and a 14B model at 4-bit
+    /// quantization (~8.4 GB of weights) — the largest tier that fits
+    /// with room to work. A 30B model would need ~17 GB at 4-bit and
+    /// is deliberately not listed. (Phase 4 follow-up: Gemma 4 12B
+    /// replaced Llama 3.1 8B as the default — it benchmarks well
+    /// above its size and covers the same footprint, so the 8B was
+    /// dropped rather than kept as a dominated middle option.)
     static let models: [MLXModelInfo] = [
         MLXModelInfo(
             repoID: "mlx-community/Llama-3.2-3B-Instruct-4bit",
@@ -68,10 +73,10 @@ enum MLXCatalog {
             blurb: "Small and fast. Good for quick questions, rewriting, and summaries.",
             approximateBytes: 1_900_000_000),
         MLXModelInfo(
-            repoID: "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit",
-            displayName: "Llama 3.1 8B",
-            blurb: "The balanced default: noticeably smarter than the built-in model, still quick on this Mac.",
-            approximateBytes: 4_900_000_000),
+            repoID: "mlx-community/gemma-4-12B-it-4bit",
+            displayName: "Gemma 4 12B",
+            blurb: "The recommended default: Google's Gemma 4 — much smarter than its size suggests, and quick on this Mac. Bonus: it natively understands images and audio too.",
+            approximateBytes: 6_500_000_000),
         MLXModelInfo(
             repoID: "mlx-community/Qwen2.5-14B-Instruct-4bit",
             displayName: "Qwen 2.5 14B",

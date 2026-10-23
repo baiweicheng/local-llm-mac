@@ -331,9 +331,9 @@ final class LocalLLMTests: XCTestCase {
         XCTAssertEqual(ModelSelection(storageKey: "onDevice"), .onDevice)
 
         let mlx = ModelSelection.mlx(
-            repoID: "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit")
+            repoID: "mlx-community/gemma-4-12B-it-4bit")
         XCTAssertEqual(mlx.storageKey,
-                       "mlx:mlx-community/Meta-Llama-3.1-8B-Instruct-4bit")
+                       "mlx:mlx-community/gemma-4-12B-it-4bit")
         XCTAssertEqual(ModelSelection(storageKey: mlx.storageKey), mlx)
 
         let endpointID = UUID()
@@ -444,6 +444,14 @@ final class LocalLLMTests: XCTestCase {
         }
         XCTAssertEqual(
             MLXCatalog.fit(bytes: MLXCatalog.models[0].approximateBytes,
+                           totalMemoryGB: 18), .comfortable)
+        // The default (Gemma 4 12B, ≈6.5 GB ≈ 36% of 18 GB) sits in
+        // the comfortable tier; only the 14B reaches "fits".
+        XCTAssertEqual(MLXCatalog.models[1].repoID,
+                       "mlx-community/gemma-4-12B-it-4bit")
+        XCTAssertEqual(MLXCatalog.models[1].displayName, "Gemma 4 12B")
+        XCTAssertEqual(
+            MLXCatalog.fit(bytes: MLXCatalog.models[1].approximateBytes,
                            totalMemoryGB: 18), .comfortable)
         XCTAssertEqual(
             MLXCatalog.fit(bytes: MLXCatalog.models[2].approximateBytes,
@@ -854,8 +862,8 @@ final class LocalLLMTests: XCTestCase {
             "Apple On-Device")
         XCTAssertEqual(
             TelemetryFormat.label(for: .mlx(repoID: "x"),
-                                  displayName: "Llama 3.1 8B"),
-            "Local MLX · Llama 3.1 8B")
+                                  displayName: "Gemma 4 12B"),
+            "Local MLX · Gemma 4 12B")
         XCTAssertEqual(
             TelemetryFormat.label(for: .endpoint(id: UUID()),
                                   displayName: "Ollama"),
@@ -869,9 +877,9 @@ final class LocalLLMTests: XCTestCase {
         XCTAssertEqual(TelemetryFormat.costText(0), "$0.00")
 
         let pill = TelemetryFormat.line(for: MessageTelemetry(
-            backendLabel: "Local MLX · Llama 3.1 8B", seconds: 3.44,
+            backendLabel: "Local MLX · Gemma 4 12B", seconds: 3.44,
             estimatedTokens: 210))
-        XCTAssertEqual(pill, "Local MLX · Llama 3.1 8B · 3.4s · ≈210 tokens · $0.00")
+        XCTAssertEqual(pill, "Local MLX · Gemma 4 12B · 3.4s · ≈210 tokens · $0.00")
 
         // Zero-token replies (shouldn't happen, but) omit the segment.
         let bare = TelemetryFormat.line(for: MessageTelemetry(
