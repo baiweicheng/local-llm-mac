@@ -116,6 +116,57 @@ memory.
   servers are on `localhost`. The only network use in this phase is
   downloading models you asked for.
 
+## What's new in Phase 4
+
+Phase 4 makes the app **route each message to the right model by
+itself**, and puts a **privacy firewall** in front of anything that
+could ever leave this Mac.
+
+- **Auto mode (the new default for new chats).** The model picker in
+  the chat header now starts with **Auto**, and new chats use it.
+  Before an Auto message is sent, the built-in on-device model quickly
+  sorts it into one of four kinds — *something to do on this Mac*, a
+  *quick edit or question*, *hard work that should stay local*, or
+  *something that really wants a frontier cloud model* — and the app
+  picks the backend to match: quick things go to the built-in model,
+  hard local work goes to your largest downloaded MLX model (or a
+  local server, if no model is downloaded), and a cloud-worthy
+  question gets the best local stand-in available **plus a plain note
+  that cloud models arrive in a later phase** — the app never pretends
+  a cloud call happened. A quiet line under the chat header says what
+  Auto decided and why ("Auto: a quick edit or question — Apple
+  On-Device handles those instantly and privately."). If the sorting
+  step ever fails or takes too long, the message just goes to the
+  built-in model — sorting never blocks a send. Picking a model
+  yourself in the picker still overrides Auto completely, and chats
+  you already had keep the model you picked for them.
+- **The privacy check (firewall).** You can add a server in Models
+  whose address *isn't* on this Mac (say, a machine on your network).
+  Anything sent to such a server is scrubbed first — automatically,
+  every time: API keys and other secret-shaped tokens, values after
+  labels like `password:`, email addresses, phone numbers, and
+  card-number-shaped digit runs are replaced with `[redacted]`, and a
+  notice under the chat tells you how much was hidden. Servers on
+  `localhost` (Ollama, LM Studio) count as *on this Mac* and get your
+  message exactly as written, as do the built-in and MLX models. Your
+  saved messages are never edited — only the copy that gets sent. You
+  can add your own words and phrases to hide (a codename, an address)
+  in **Privacy settings** — the gear button in the chat header.
+  History stays compressed, too: a long chat that has been summarized
+  sends a remote server the summary plus the recent messages — never
+  the full raw history.
+- **Local Only lock.** In Privacy settings, the **Local Only** switch
+  guarantees nothing is sent anywhere: server backends are refused
+  outright (not just hidden), Auto never routes to a server, and a
+  chat that was using a server switches to the built-in model with a
+  note explaining why. A small **Local Only** badge in the chat header
+  shows while the lock is on.
+- **Telemetry pill.** Every reply now carries a small pill underneath
+  — for example `Apple On-Device · 1.2s · $0.00` or `Local MLX ·
+  Llama 3.1 8B · 3.4s · $0.00` — naming the model that actually
+  answered, how long it took, and what it cost. Under Auto this is
+  where you can see which model handled each message.
+
 ## Good to know
 
 - The built-in model is small (~3 billion parameters). It's good at chat,
@@ -130,13 +181,15 @@ memory.
   the behind-the-scenes logic (instructions, token estimates, markdown
   splitting, context budgets, compaction planning, summary merging,
   attachment storage, model-picker persistence, download planning,
-  server-request building, and stream parsing) and never call the real
+  server-request building, stream parsing, routing decisions, the
+  privacy check, and the telemetry pill) and never call the real
   model.
 
 ## Where this is going
 
-This is phase 3 of a larger build (see the project plan): automatic
-routing with a privacy firewall next, then read-only tools that can see
-your files/calendar/photos locally, carefully-confirmed file actions,
-a global hotkey HUD, and an optional cloud tier via OpenRouter — all
-over this same chat window.
+This is phase 4 of a larger build (see the project plan): next come
+read-only tools that can see your files/calendar/photos locally,
+carefully-confirmed file actions, a global hotkey HUD, and an optional
+cloud tier via OpenRouter — which will inherit Phase 4's privacy check
+(and its habit of reusing the conversation summary instead of raw
+history) before anything leaves the Mac.

@@ -355,6 +355,8 @@ final class LocalLLMTests: XCTestCase {
     }
 
     func testModelSelectionBudgets() {
+        // Auto plans against the tightest budget until it resolves.
+        XCTAssertEqual(ModelSelection.auto.budget.windowTokens, 4_096)
         XCTAssertEqual(ModelSelection.onDevice.budget.windowTokens, 4_096)
         XCTAssertEqual(ModelSelection.mlx(repoID: "x").budget.windowTokens,
                        ContextBudget.mlxLocal.windowTokens)
@@ -365,7 +367,8 @@ final class LocalLLMTests: XCTestCase {
 
     func testConversationPersistsModelSelection() {
         let conversation = Conversation()
-        XCTAssertEqual(conversation.modelSelection, .onDevice)
+        // Phase 4: a brand-new chat starts on Auto.
+        XCTAssertEqual(conversation.modelSelection, .auto)
 
         let mlx = ModelSelection.mlx(repoID: "mlx-community/Qwen2.5-14B-Instruct-4bit")
         conversation.modelSelection = mlx
@@ -386,24 +389,32 @@ final class LocalLLMTests: XCTestCase {
             downloadedMLX: downloaded,
             endpoints: EndpointConfig.defaultConfigs,
             onDeviceReady: true)
-        XCTAssertEqual(rows.count, 1 + 2 + 2)
-        XCTAssertEqual(rows[0].selection, .onDevice)
-        XCTAssertEqual(rows[0].displayName, "Apple On-Device")
-        XCTAssertEqual(rows[0].budget.windowTokens, 4_096)
+        // Phase 4: Auto leads the picker, then the built-in model.
+        XCTAssertEqual(rows.count, 1 + 1 + 2 + 2)
+        XCTAssertEqual(rows[0].selection, .auto)
+        XCTAssertEqual(rows[0].displayName, "Auto")
         XCTAssertTrue(rows[0].isReady)
-        XCTAssertEqual(rows[1].selection, .mlx(repoID: downloaded[0].repoID))
-        XCTAssertEqual(rows[1].budget.windowTokens,
+        XCTAssertEqual(rows[1].selection, .onDevice)
+        XCTAssertEqual(rows[1].displayName, "Apple On-Device")
+        XCTAssertEqual(rows[1].budget.windowTokens, 4_096)
+        XCTAssertTrue(rows[1].isReady)
+        XCTAssertEqual(rows[2].selection, .mlx(repoID: downloaded[0].repoID))
+        XCTAssertEqual(rows[2].budget.windowTokens,
                        ContextBudget.mlxLocal.windowTokens)
-        XCTAssertEqual(rows[3].selection,
+        XCTAssertEqual(rows[4].selection,
                        .endpoint(id: EndpointConfig.ollamaPresetID))
-        XCTAssertEqual(rows[4].displayName, "LM Studio")
+        XCTAssertEqual(rows[5].displayName, "LM Studio")
     }
 
     func testRegistryOnDeviceReadinessAndLookup() {
         let rows = BackendRegistry.descriptors(
             downloadedMLX: [], endpoints: [], onDeviceReady: false)
-        XCTAssertEqual(rows.count, 1)
-        XCTAssertFalse(rows[0].isReady)
+        // Phase 4: Auto + the built-in model; Auto stays "ready" (it
+        // falls back gracefully), the on-device row reports the truth.
+        XCTAssertEqual(rows.count, 2)
+        XCTAssertEqual(rows[0].selection, .auto)
+        XCTAssertTrue(rows[0].isReady)
+        XCTAssertFalse(rows[1].isReady)
 
         // A selection for a model that isn't downloaded has no row.
         let missing = BackendRegistry.descriptor(
@@ -599,5 +610,287 @@ final class LocalLLMTests: XCTestCase {
         accumulator.consume(line: #"data: {"choices":[{"delta":{"content":"x"}}]}"#)
         XCTAssertEqual(accumulator.consume(
             line: #"data: {"choices":[{"delta":{"content":""}}]}"#), "x")
+    }
+
+    // MARK: - Phase 4: Auto selection codec
+
+    func testAutoSelectionStorageRoundTrip() {
+        XCTAssertEqual(ModelSelection.auto.storageKey, "auto")
+        XCTAssertEqual(ModelSelection(storageKey: "auto"), .auto)
+        XCTAssertTrue(ModelSelection.auto.isAuto)
+        XCTAssertFalse(ModelSelection.auto.isOnDevice)
+        // "auto" must not swallow lookalike legacy values.
+        XCTAssertEqual(ModelSelection(storageKey: "automatic"), .onDevice)
+    }
+
+    func testIntentRawValuesMatchBrief() {
+        // The classifier is instructed to answer with exactly these.
+        XCTAssertEqual(PromptIntent(rawValue: "os_action"), .osAction)
+        XCTAssertEqual(PromptIntent(rawValue: "quick_transform"), .quickTransform)
+        XCTAssertEqual(PromptIntent(rawValue: "local_heavy"), .localHeavy)
+        XCTAssertEqual(PromptIntent(rawValue: "frontier_cloud"), .frontierCloud)
+        XCTAssertNil(PromptIntent(rawValue: "something_else"))
+    }
+
+    // MARK: - Phase 4: routing policy
+
+    /// Inputs with nothing optional set up: no downloads, no servers.
+    private func bareInputs(localOnly: Bool = false,
+                            onDeviceReady: Bool = true) -> RoutingInputs {
+        RoutingInputs(downloadedMLX: [], endpoints: [],
+                      localOnly: localOnly, cloudAvailable: false,
+                      onDeviceReady: onDeviceReady)
+    }
+
+    func testRoutingQuickAndActionGoToOnDevice() {
+        let inputs = bareInputs()
+        let quick = RoutingPolicy.decide(intent: .quickTransform, inputs: inputs)
+        XCTAssertEqual(quick.selection, .onDevice)
+        XCTAssertNil(quick.note)
+        XCTAssertTrue(quick.reason.contains("Apple On-Device"))
+
+        let action = RoutingPolicy.decide(intent: .osAction, inputs: inputs)
+        XCTAssertEqual(action.selection, .onDevice)
+        XCTAssertNil(action.note)
+    }
+
+    func testRoutingLocalHeavyPrefersLargestMLX() {
+        // Deliberately unordered: the policy must pick by size,
+        // not by position.
+        var inputs = bareInputs()
+        inputs.downloadedMLX = [MLXCatalog.models[1], MLXCatalog.models[2],
+                                MLXCatalog.models[0]]
+        let decision = RoutingPolicy.decide(intent: .localHeavy, inputs: inputs)
+        XCTAssertEqual(decision.selection,
+                       .mlx(repoID: MLXCatalog.models[2].repoID))
+        XCTAssertTrue(decision.reason.contains("Qwen 2.5 14B"))
+    }
+
+    func testRoutingLocalHeavyFallsBackToEndpointThenOnDevice() {
+        var inputs = bareInputs()
+        inputs.endpoints = EndpointConfig.defaultConfigs
+        let viaServer = RoutingPolicy.decide(intent: .localHeavy, inputs: inputs)
+        XCTAssertEqual(viaServer.selection,
+                       .endpoint(id: EndpointConfig.ollamaPresetID))
+
+        let bare = RoutingPolicy.decide(intent: .localHeavy, inputs: bareInputs())
+        XCTAssertEqual(bare.selection, .onDevice)
+        XCTAssertTrue(bare.reason.contains("no bigger local model"))
+    }
+
+    func testRoutingLocalOnlySkipsEndpoints() {
+        var inputs = bareInputs(localOnly: true)
+        inputs.endpoints = EndpointConfig.defaultConfigs
+        // Even for local_heavy, the lock keeps servers off the table.
+        let heavy = RoutingPolicy.decide(intent: .localHeavy, inputs: inputs)
+        XCTAssertEqual(heavy.selection, .onDevice)
+        XCTAssertNotNil(heavy.note)
+
+        // ...but a downloaded MLX model is still fair game.
+        inputs.downloadedMLX = [MLXCatalog.models[1]]
+        let heavyMLX = RoutingPolicy.decide(intent: .localHeavy, inputs: inputs)
+        XCTAssertEqual(heavyMLX.selection,
+                       .mlx(repoID: MLXCatalog.models[1].repoID))
+    }
+
+    func testRoutingFrontierCloudStandsInAndSaysSo() {
+        // A server stands in first…
+        var inputs = bareInputs()
+        inputs.endpoints = EndpointConfig.defaultConfigs
+        inputs.downloadedMLX = [MLXCatalog.models[2]]
+        let viaServer = RoutingPolicy.decide(intent: .frontierCloud, inputs: inputs)
+        XCTAssertEqual(viaServer.selection,
+                       .endpoint(id: EndpointConfig.ollamaPresetID))
+        XCTAssertTrue(viaServer.reason.contains("later phase"))
+        XCTAssertTrue(viaServer.reason.contains("stands in"))
+
+        // …then the biggest local model…
+        inputs.endpoints = []
+        let viaMLX = RoutingPolicy.decide(intent: .frontierCloud, inputs: inputs)
+        XCTAssertEqual(viaMLX.selection, .mlx(repoID: MLXCatalog.models[2].repoID))
+        XCTAssertTrue(viaMLX.reason.contains("stands in"))
+
+        // …then the built-in model, honestly.
+        let viaOnDevice = RoutingPolicy.decide(intent: .frontierCloud,
+                                               inputs: bareInputs())
+        XCTAssertEqual(viaOnDevice.selection, .onDevice)
+        XCTAssertTrue(viaOnDevice.reason.contains("later phase"))
+    }
+
+    func testRoutingFrontierCloudLocalOnlyNeverPicksEndpoint() {
+        var inputs = bareInputs(localOnly: true)
+        inputs.endpoints = EndpointConfig.defaultConfigs
+        let decision = RoutingPolicy.decide(intent: .frontierCloud, inputs: inputs)
+        XCTAssertEqual(decision.selection, .onDevice)
+        XCTAssertNotNil(decision.note)
+    }
+
+    func testRoutingStandsInWhenOnDeviceNotReady() {
+        var inputs = bareInputs(onDeviceReady: false)
+        inputs.downloadedMLX = [MLXCatalog.models[0]]
+        let quick = RoutingPolicy.decide(intent: .quickTransform, inputs: inputs)
+        XCTAssertEqual(quick.selection,
+                       .mlx(repoID: MLXCatalog.models[0].repoID))
+        XCTAssertNotNil(quick.note)
+
+        // With nothing else available, routing still answers
+        // on-device and lets its availability state explain itself.
+        let stuck = RoutingPolicy.decide(
+            intent: .quickTransform,
+            inputs: bareInputs(onDeviceReady: false))
+        XCTAssertEqual(stuck.selection, .onDevice)
+    }
+
+    // MARK: - Phase 4: local-only factory enforcement
+
+    func testFactoryRefusesEndpointsWhenLocalOnly() {
+        let endpoints = EndpointConfig.defaultConfigs
+        let locked = BackendFactory.resolve(
+            selection: .endpoint(id: EndpointConfig.ollamaPresetID),
+            downloadedMLXRepoIDs: [], endpoints: endpoints, localOnly: true)
+        XCTAssertEqual(locked.effectiveSelection, .onDevice)
+
+        let open = BackendFactory.resolve(
+            selection: .endpoint(id: EndpointConfig.ollamaPresetID),
+            downloadedMLXRepoIDs: [], endpoints: endpoints, localOnly: false)
+        XCTAssertEqual(open.effectiveSelection,
+                       .endpoint(id: EndpointConfig.ollamaPresetID))
+
+        // Auto arriving at the factory unresolved means "no routing
+        // context" — the built-in model, never a crash.
+        let auto = BackendFactory.resolve(
+            selection: .auto, downloadedMLXRepoIDs: [], endpoints: endpoints)
+        XCTAssertEqual(auto.effectiveSelection, .onDevice)
+    }
+
+    // MARK: - Phase 4: endpoint locality
+
+    func testEndpointLocalhostDetection() {
+        func config(_ url: String) -> EndpointConfig {
+            EndpointConfig(id: UUID(), name: "X", baseURL: url, modelName: "")
+        }
+        XCTAssertTrue(config("http://localhost:11434/v1").isLocalhost)
+        XCTAssertTrue(config("http://127.0.0.1:1234/v1").isLocalhost)
+        XCTAssertTrue(config("http://[::1]:8080/v1").isLocalhost)
+        XCTAssertFalse(config("http://192.168.1.20:11434/v1").isLocalhost)
+        XCTAssertFalse(config("https://api.example.com/v1").isLocalhost)
+        XCTAssertFalse(config("not a url").isLocalhost)
+    }
+
+    // MARK: - Phase 4: redactor
+
+    func testRedactorMasksAPIKeyShapes() {
+        let text = "Use sk-proj-abc123XYZ789def456 for the call, "
+            + "token ghp_0123456789abcdefghijABCD and AKIAIOSFODNN7EXAMPLE."
+        let result = Redactor.redact(text)
+        XCTAssertFalse(result.text.contains("sk-proj-abc123XYZ789def456"))
+        XCTAssertFalse(result.text.contains("ghp_0123456789abcdefghijABCD"))
+        XCTAssertFalse(result.text.contains("AKIAIOSFODNN7EXAMPLE"))
+        XCTAssertEqual(result.replacementCount, 3)
+        XCTAssertTrue(result.text.contains(Redactor.mask))
+    }
+
+    func testRedactorMasksLabeledSecrets() {
+        let result = Redactor.redact(
+            "My password: hunter22! and api_key = abcdef123456 ok?")
+        XCTAssertTrue(result.text.contains("password: \(Redactor.mask)"))
+        XCTAssertTrue(result.text.contains("api_key = \(Redactor.mask)"))
+        XCTAssertFalse(result.text.contains("hunter22"))
+        XCTAssertFalse(result.text.contains("abcdef123456"))
+        XCTAssertEqual(result.replacementCount, 2)
+    }
+
+    func testRedactorMasksEmailsPhonesAndCards() {
+        let text = "Reach jane.doe+news@example-mail.com or (404) 555-0123; "
+            + "card 4111 1111 1111 1111 or 4111-1111-1111-1111."
+        let result = Redactor.redact(text)
+        XCTAssertFalse(result.text.contains("jane.doe+news@example-mail.com"))
+        XCTAssertFalse(result.text.contains("555-0123"))
+        XCTAssertFalse(result.text.contains("4111"))
+        XCTAssertEqual(result.replacementCount, 4)
+    }
+
+    func testRedactorMasksLongOpaqueTokens() {
+        // A git-style SHA (hex, letters + digits, 40 chars) is
+        // secret-shaped and goes; a long plain word stays.
+        let sha = "0123456789abcdef0123456789abcdef01234567"
+        let result = Redactor.redact("commit \(sha) fixed it")
+        XCTAssertEqual(result.replacementCount, 1)
+        XCTAssertFalse(result.text.contains(sha))
+
+        let wordy = Redactor.redact(
+            "Antidisestablishmentarianism is a long word.")
+        XCTAssertEqual(wordy.replacementCount, 0)
+    }
+
+    func testRedactorCustomTerms() {
+        let result = Redactor.redact(
+            "The FALCON launch moved to the falcon site.",
+            customTerms: ["Falcon"])
+        XCTAssertEqual(result.replacementCount, 2)
+        XCTAssertFalse(result.text.lowercased().contains("falcon"))
+
+        // Too-short terms are ignored rather than mangling the text.
+        let short = Redactor.redact("a cat sat", customTerms: ["a", "at"])
+        XCTAssertEqual(short.replacementCount, 0)
+        XCTAssertEqual(short.text, "a cat sat")
+    }
+
+    func testRedactorLeavesOrdinaryTextAlone() {
+        let text = "Please summarize chapter 3 for me. My order "
+            + "12345678 shipped on 2026-10-23, and the meeting is at "
+            + "10:30 on Friday."
+        let result = Redactor.redact(text)
+        XCTAssertEqual(result.replacementCount, 0)
+        XCTAssertEqual(result.text, text)
+        XCTAssertFalse(result.didRedact)
+    }
+
+    // MARK: - Phase 4: telemetry
+
+    func testTelemetryLabels() {
+        XCTAssertEqual(
+            TelemetryFormat.label(for: .onDevice, displayName: "ignored"),
+            "Apple On-Device")
+        XCTAssertEqual(
+            TelemetryFormat.label(for: .mlx(repoID: "x"),
+                                  displayName: "Llama 3.1 8B"),
+            "Local MLX · Llama 3.1 8B")
+        XCTAssertEqual(
+            TelemetryFormat.label(for: .endpoint(id: UUID()),
+                                  displayName: "Ollama"),
+            "Ollama")
+    }
+
+    func testTelemetryFormatting() {
+        XCTAssertEqual(TelemetryFormat.durationText(0.4), "0.4s")
+        XCTAssertEqual(TelemetryFormat.durationText(1.24), "1.2s")
+        XCTAssertEqual(TelemetryFormat.durationText(65), "1m 5s")
+        XCTAssertEqual(TelemetryFormat.costText(0), "$0.00")
+
+        let pill = TelemetryFormat.line(for: MessageTelemetry(
+            backendLabel: "Local MLX · Llama 3.1 8B", seconds: 3.44,
+            estimatedTokens: 210))
+        XCTAssertEqual(pill, "Local MLX · Llama 3.1 8B · 3.4s · ≈210 tokens · $0.00")
+
+        // Zero-token replies (shouldn't happen, but) omit the segment.
+        let bare = TelemetryFormat.line(for: MessageTelemetry(
+            backendLabel: "Apple On-Device", seconds: 1.0,
+            estimatedTokens: 0))
+        XCTAssertEqual(bare, "Apple On-Device · 1.0s · $0.00")
+    }
+
+    func testMessageTelemetryRoundTrip() {
+        let message = Message(role: .assistant, text: "hi")
+        XCTAssertNil(message.telemetry)
+        message.telemetry = MessageTelemetry(
+            backendLabel: "Apple On-Device", seconds: 1.5,
+            estimatedTokens: 42)
+        XCTAssertEqual(message.telemetry?.backendLabel, "Apple On-Device")
+        XCTAssertEqual(message.telemetry?.seconds, 1.5)
+        XCTAssertEqual(message.telemetry?.estimatedTokens, 42)
+        XCTAssertEqual(message.telemetry?.costUSD, 0)
+        message.telemetry = nil
+        XCTAssertNil(message.telemetry)
     }
 }

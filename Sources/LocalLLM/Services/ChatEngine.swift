@@ -31,6 +31,35 @@ import SwiftData
 /// - Stored messages are never deleted. The summary lives on the
 ///   `Conversation` record; the transcript the user sees is whole.
 ///
+/// Phase 4 adds the routing layer on top of that shape:
+///
+/// - A chat set to Auto has its outgoing prompt classified by a
+///   throwaway on-device session (`IntentClassifier`) and routed by
+///   the pure `RoutingPolicy` to a concrete backend before any of the
+///   machinery above runs — from there on, an Auto send is an ordinary
+///   send against the routed backend, telemetry included. A manual
+///   picker choice remains a complete override: no classification.
+/// - The privacy firewall: a chat pointed at a server that isn't on
+///   this Mac is the one place a prompt can leave the machine, so the
+///   outgoing text (instructions + prompt, history included) is
+///   scrubbed by `Redactor` first, and the user is told it happened.
+///   Stored messages are never touched — only the sent copy. The
+///   brief's history-compression half of the firewall needs no new
+///   machinery: a session is seeded with [running summary + recent
+///   turns] (Phase 2), never the raw stored history, and an endpoint
+///   session's memory is exactly the seeded prompt chain it was fed —
+///   so a compacted chat's older turns reach a remote destination
+///   only as their summary. Phase 8's cloud backend consumes this
+///   same hook: it will be a `ModelBackend` like any other, seeded
+///   the same way, with `Redactor` applied on the same
+///   remote-destination check.
+/// - The Local Only lock is enforced in `BackendFactory`: a server
+///   selection resolves to the built-in model while it's on, and the
+///   engine explains the switch.
+/// - Every finished reply records telemetry (backend, seconds,
+///   estimated tokens) on its `Message` for the pill in the
+///   transcript.
+///
 /// All state here is main-actor: the UI reads `streamingText`,
 /// `respondingIDs`, and `errorMessages` directly.
 @MainActor
@@ -46,6 +75,14 @@ final class ChatEngine {
     private(set) var respondingIDs: Set<UUID> = []
     /// Last error per conversation, in plain English, shown as a banner.
     var errorMessages: [UUID: String] = [:]
+    /// Phase 4: the latest Auto routing explanation per conversation
+    /// ("Auto: a quick edit or question — Apple On-Device has it."),
+    /// shown as a small caption while the chat is on Auto.
+    private(set) var routingNotes: [UUID: String] = [:]
+    /// Phase 4: informational banners that aren't errors — currently
+    /// the privacy-check notice when a prompt was scrubbed before
+    /// being sent to a server that isn't on this Mac.
+    var infoMessages: [UUID: String] = [:]
 
     // MARK: - Backends
 
@@ -62,6 +99,22 @@ final class ChatEngine {
         _ provider: @escaping (ModelSelection) -> ResolvedBackend
     ) {
         backendProvider = provider
+    }
+
+    /// Phase 4: everything routing and the privacy firewall need to
+    /// know about the world — what's downloaded, what's configured,
+    /// whether Local Only is on, what must never leave unhidden.
+    /// Configured by the app shell alongside the backend provider;
+    /// until then, empty inputs (Auto routes to the built-in model,
+    /// nothing counts as remote).
+    private var routingContextProvider: () -> RoutingInputs = {
+        RoutingInputs()
+    }
+
+    func configureRoutingContextProvider(
+        _ provider: @escaping () -> RoutingInputs
+    ) {
+        routingContextProvider = provider
     }
 
     // MARK: - Sessions
@@ -97,6 +150,8 @@ final class ChatEngine {
         streamingText[conversationID] = nil
         respondingIDs.remove(conversationID)
         errorMessages[conversationID] = nil
+        routingNotes[conversationID] = nil
+        infoMessages[conversationID] = nil
     }
 
     // MARK: - Sending
@@ -129,6 +184,7 @@ final class ChatEngine {
 
         let conversationID = conversation.id
         errorMessages[conversationID] = nil
+        infoMessages[conversationID] = nil
         respondingIDs.insert(conversationID)
         streamingText[conversationID] = ""
         tasks[conversationID] = Task { [weak self] in
@@ -146,19 +202,6 @@ final class ChatEngine {
         let instructions = PromptHistory.mergedInstructions(
             userInstructions: conversation.systemInstructions)
 
-        let resolved = backendProvider(conversation.modelSelection)
-        let backend = resolved.backend
-        let selection = resolved.effectiveSelection
-        let budget = backend.budget
-        if selection != conversation.modelSelection {
-            // The picked model is gone (deleted MLX model, removed
-            // server). The chat falls back to the built-in model —
-            // say so once, here, rather than silently switching.
-            errorMessages[conversationID] =
-                "The model this chat was using isn't available anymore, "
-                + "so it switched back to the built-in on-device model."
-        }
-
         let stored = conversation.sortedMessages
         guard let lastMessage = stored.last,
               lastMessage.messageRole == .user else {
@@ -166,6 +209,74 @@ final class ChatEngine {
             return
         }
         let newPromptTurn = lastMessage.chatTurn
+
+        // Phase 4 routing: an Auto chat's prompt is classified and
+        // routed to a concrete backend first; a manual selection is
+        // already concrete and skips this entirely.
+        let routingInputs = routingContextProvider()
+        var targetSelection = conversation.modelSelection
+        if conversation.modelSelection.isAuto {
+            let intent = await IntentClassifier.classify(
+                prompt: lastMessage.text) ?? .quickTransform
+            if Task.isCancelled {
+                finish(conversationID: conversationID)
+                return
+            }
+            let decision = RoutingPolicy.decide(intent: intent,
+                                                inputs: routingInputs)
+            targetSelection = decision.selection
+            var noteText = decision.reason
+            if let note = decision.note {
+                noteText += " " + note
+            }
+            routingNotes[conversationID] = noteText
+        }
+
+        let resolved = backendProvider(targetSelection)
+        let backend = resolved.backend
+        let selection = resolved.effectiveSelection
+        let budget = backend.budget
+        if selection != targetSelection {
+            // The picked (or routed) model can't run: it was deleted,
+            // its server was removed, or the Local Only lock refuses
+            // servers right now. The chat falls back to the built-in
+            // model — say which happened, once, rather than silently
+            // switching.
+            if routingInputs.localOnly, case .endpoint(_) = targetSelection {
+                errorMessages[conversationID] =
+                    "Local Only is on, so this chat can't use its "
+                    + "server right now — it switched to a model that "
+                    + "runs entirely on this Mac."
+            } else {
+                errorMessages[conversationID] =
+                    "The model this chat was using isn't available anymore, "
+                    + "so it switched back to the built-in on-device model."
+            }
+        }
+
+        // Phase 4 privacy firewall. A chat pointed at a server that
+        // isn't on this Mac is the one place a prompt can leave the
+        // machine in this phase, so everything bound for it — the
+        // instructions now, the prompt (seeded history included)
+        // further below — is scrubbed by `Redactor` first. Local
+        // destinations (built-in model, MLX, a localhost server) get
+        // the text exactly as written. Stored messages are never
+        // touched; only the sent copy is edited.
+        let isRemoteDestination: Bool = {
+            guard case .endpoint(let id) = selection,
+                  let config = routingInputs.endpoints
+                    .first(where: { $0.id == id }) else { return false }
+            return !config.isLocalhost
+        }()
+        var effectiveInstructions = instructions
+        var redactions = 0
+        if isRemoteDestination {
+            let scrubbed = Redactor.redact(
+                instructions,
+                customTerms: routingInputs.customRedactionTerms)
+            effectiveInstructions = scrubbed.text
+            redactions += scrubbed.replacementCount
+        }
 
         // Live turns: stored history minus the summarized prefix and
         // minus the message about to be sent.
@@ -216,11 +327,14 @@ final class ChatEngine {
         // when backend, instructions, and summary all still match —
         // anything else (first send, picker switch, instructions edit,
         // compaction, relaunch) rebuilds and re-seeds.
+        // Note the session identity uses the *effective* instructions
+        // (the scrubbed copy for a remote destination), so a session
+        // is never reused across a change in what would be sent.
         let summaryKey = conversation.contextSummary ?? ""
         let existing = liveSessions[conversationID]
         let canReuse = existing != nil
             && existing!.selection == selection
-            && existing!.instructions == instructions
+            && existing!.instructions == effectiveInstructions
             && existing!.summaryKey == summaryKey
             && existing!.seeded
 
@@ -229,7 +343,7 @@ final class ChatEngine {
         if canReuse, let existing {
             session = existing.session
         } else {
-            session = backend.makeSession(instructions: instructions)
+            session = backend.makeSession(instructions: effectiveInstructions)
             // The fresh session knows nothing yet: prepend the stored
             // context (summary + live turns) to this prompt. For a
             // brand-new chat the seed is empty and the prompt stands
@@ -242,8 +356,29 @@ final class ChatEngine {
             }
             liveSessions[conversationID] = LiveSession(
                 session: session, selection: selection,
-                instructions: instructions, summaryKey: summaryKey,
+                instructions: effectiveInstructions, summaryKey: summaryKey,
                 seeded: true)
+        }
+
+        // The firewall's second half: with the outgoing prompt fully
+        // assembled (seeded history included), scrub it too, and say
+        // so — once per send, counting the instructions with it.
+        if isRemoteDestination {
+            let scrubbed = Redactor.redact(
+                promptText,
+                customTerms: routingInputs.customRedactionTerms)
+            promptText = scrubbed.text
+            redactions += scrubbed.replacementCount
+            if redactions > 0 {
+                let noun = redactions == 1 ? "item" : "items"
+                infoMessages[conversationID] =
+                    "Privacy check: \(redactions) \(noun) that looked "
+                    + "like secrets or personal details were hidden "
+                    + "before this was sent to \(backend.displayName), "
+                    + "because that server isn't on this Mac. Your "
+                    + "saved chat is unchanged — only the copy that "
+                    + "was sent was edited."
+            }
         }
 
         // Streaming. Images ride along as temporary files (framework
@@ -258,6 +393,7 @@ final class ChatEngine {
         }
 
         var received = ""
+        let generationStarted = Date()
         do {
             let request = ChatReplyRequest(promptText: promptText,
                                            imageURLs: imageFiles.urls)
@@ -271,11 +407,22 @@ final class ChatEngine {
             errorMessages[conversationID] =
                 "The model couldn't finish that reply: \(error.localizedDescription)"
         }
+        let generationSeconds = Date().timeIntervalSince(generationStarted)
 
         let finalText = received.trimmingCharacters(in: .whitespacesAndNewlines)
         if !finalText.isEmpty {
             let reply = Message(role: .assistant, text: finalText,
                                 conversation: conversation)
+            // Phase 4 telemetry: which backend actually answered, how
+            // long it took, roughly how big the reply is. Rendered as
+            // the pill under the message; local backends are free, so
+            // the cost (not stored) reads $0.00.
+            reply.telemetry = MessageTelemetry(
+                backendLabel: TelemetryFormat.label(
+                    for: selection, displayName: backend.displayName),
+                seconds: generationSeconds,
+                estimatedTokens: PromptHistory.approximateTokenCount(
+                    for: finalText))
             context.insert(reply)
             conversation.updatedAt = Date()
             try? context.save()

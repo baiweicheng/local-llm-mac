@@ -9,10 +9,16 @@ import SwiftData
 /// manager and the saved local servers — and wires them into the
 /// engine as its backend provider, so a chat's picker choice resolves
 /// against what's actually downloaded and configured right now.
+///
+/// Phase 4: it also owns the privacy settings and wires the engine's
+/// routing context (what's downloaded/configured, the Local Only
+/// lock, the custom redaction terms) from the same live sources, so
+/// routing and the factory never disagree about the world.
 struct ContentView: View {
     @State private var engine = ChatEngine()
     @State private var mlxStore = MLXModelStore()
     @State private var endpointStore = EndpointStore()
+    @State private var settings = AppSettings()
     @State private var selection: Conversation?
 
     var body: some View {
@@ -22,7 +28,8 @@ struct ContentView: View {
         } detail: {
             if let conversation = selection {
                 ChatView(conversation: conversation, engine: engine,
-                         mlxStore: mlxStore, endpointStore: endpointStore)
+                         mlxStore: mlxStore, endpointStore: endpointStore,
+                         settings: settings)
                     .id(conversation.id)
             } else {
                 ContentUnavailableView(
@@ -38,7 +45,17 @@ struct ContentView: View {
                 BackendFactory.resolve(
                     selection: selection,
                     downloadedMLXRepoIDs: mlxStore.downloadedRepoIDs,
-                    endpoints: endpointStore.configs)
+                    endpoints: endpointStore.configs,
+                    localOnly: settings.localOnly)
+            }
+            engine.configureRoutingContextProvider {
+                RoutingInputs(
+                    downloadedMLX: mlxStore.downloadedModels,
+                    endpoints: endpointStore.configs,
+                    localOnly: settings.localOnly,
+                    cloudAvailable: false, // Phase 8 brings cloud backends
+                    onDeviceReady: ModelAvailabilityState.current.canChat,
+                    customRedactionTerms: settings.customRedactionTerms)
             }
         }
     }

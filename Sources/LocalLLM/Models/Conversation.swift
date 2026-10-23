@@ -34,6 +34,8 @@ final class Conversation {
     /// "endpoint:<uuid>"). Stored as a plain string so the on-disk
     /// format stays obvious; the typed value is `modelSelection`. New
     /// property with a default — existing stores migrate in place.
+    /// Phase 4 adds "auto" (the routing default for new chats, see
+    /// init); chats saved before keep whatever they had.
     var modelSelectionRaw: String
     var createdAt: Date
     var updatedAt: Date
@@ -47,7 +49,10 @@ final class Conversation {
         self.systemInstructions = systemInstructions
         self.contextSummary = nil
         self.summarizedMessageCount = 0
-        self.modelSelectionRaw = ModelSelection.onDevice.storageKey
+        // Phase 4: new chats start on Auto — the app picks the best
+        // local model for each message. Chats that already exist keep
+        // the explicit selection they were saved with.
+        self.modelSelectionRaw = ModelSelection.auto.storageKey
         self.createdAt = Date()
         self.updatedAt = Date()
     }
@@ -81,6 +86,15 @@ final class Message {
     /// the main store file; nil means no images. Only user messages ever
     /// carry images.
     @Attribute(.externalStorage) var attachmentsData: Data?
+    /// Phase 4 telemetry, stored as three optional fields so the store
+    /// migrates in place (older messages simply have none): which
+    /// backend produced this reply (pill label, e.g. "Apple
+    /// On-Device"), how many seconds it took, and its estimated token
+    /// count. All three nil for user messages and anything written
+    /// before Phase 4; the typed view is `telemetry`.
+    var telemetryBackendLabel: String?
+    var telemetrySeconds: Double?
+    var telemetryTokens: Int?
     var createdAt: Date
     var conversation: Conversation?
 
@@ -89,8 +103,31 @@ final class Message {
         self.role = role.rawValue
         self.text = text
         self.attachmentsData = nil
+        self.telemetryBackendLabel = nil
+        self.telemetrySeconds = nil
+        self.telemetryTokens = nil
         self.createdAt = Date()
         self.conversation = conversation
+    }
+
+    /// This message's execution telemetry, when it has any — assistant
+    /// replies written since Phase 4. Cost isn't stored: every backend
+    /// so far is local and free, so it's always $0.00; when the cloud
+    /// tier lands (Phase 8) it can start recording real costs here.
+    var telemetry: MessageTelemetry? {
+        get {
+            guard let telemetryBackendLabel,
+                  let telemetrySeconds,
+                  let telemetryTokens else { return nil }
+            return MessageTelemetry(backendLabel: telemetryBackendLabel,
+                                    seconds: telemetrySeconds,
+                                    estimatedTokens: telemetryTokens)
+        }
+        set {
+            telemetryBackendLabel = newValue?.backendLabel
+            telemetrySeconds = newValue?.seconds
+            telemetryTokens = newValue?.estimatedTokens
+        }
     }
 
     var messageRole: MessageRole {

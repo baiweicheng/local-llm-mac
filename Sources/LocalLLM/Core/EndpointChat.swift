@@ -36,6 +36,22 @@ struct EndpointConfig: Codable, Equatable, Sendable, Identifiable {
         return host
     }
 
+    /// True when this server runs on this very Mac — its address is
+    /// `localhost` or a loopback IP. Phase 4's privacy check draws its
+    /// line here: a message to a loopback server never leaves the
+    /// machine, so it is sent exactly as written; a server at any
+    /// other address counts as "somewhere else", and the prompt is
+    /// scrubbed by `Redactor` first. Anything unparseable counts as
+    /// NOT local — when in doubt, scrub.
+    var isLocalhost: Bool {
+        guard let host = URL(string: baseURL)?.host?.lowercased()
+        else { return false }
+        let bare = host.hasPrefix("[") && host.hasSuffix("]")
+            ? String(host.dropFirst().dropLast())
+            : host
+        return bare == "localhost" || bare == "127.0.0.1" || bare == "::1"
+    }
+
     /// Picker small print: "llama3.1 · localhost:11434".
     var pickerDetail: String {
         let model = modelName.trimmingCharacters(in: .whitespacesAndNewlines)

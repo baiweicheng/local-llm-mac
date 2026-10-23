@@ -13,11 +13,13 @@ struct ChatView: View {
     let engine: ChatEngine
     let mlxStore: MLXModelStore
     let endpointStore: EndpointStore
+    let settings: AppSettings
     @Environment(\.modelContext) private var modelContext
 
     @State private var input = ""
     @State private var showingInstructions = false
     @State private var showingModels = false
+    @State private var showingSettings = false
     @State private var showingFileImporter = false
     /// Images staged in the composer, waiting to go with the next send.
     @State private var pendingAttachments: [ImageAttachment] = []
@@ -34,12 +36,19 @@ struct ChatView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+            if conversation.modelSelection.isAuto,
+               let note = engine.routingNotes[conversationID] {
+                routingNoteBar(note)
+            }
             Divider()
             messageList
             if let error = engine.errorMessages[conversationID] {
                 errorBanner(error)
             }
-            if conversation.modelSelection.isOnDevice, !availability.canChat {
+            if let info = engine.infoMessages[conversationID] {
+                infoBanner(info)
+            }
+            if showsAvailabilityBanner {
                 availabilityBanner
             } else if selectedDescriptor == nil {
                 modelMissingBanner
@@ -50,6 +59,9 @@ struct ChatView: View {
         .onAppear { availability = .current }
         .sheet(isPresented: $showingInstructions) {
             instructionsSheet
+        }
+        .sheet(isPresented: $showingSettings) {
+            SettingsView(settings: settings)
         }
         .sheet(isPresented: $showingModels) {
             ModelsView(mlxStore: mlxStore, endpointStore: endpointStore)
@@ -82,6 +94,9 @@ struct ChatView: View {
                 .foregroundStyle(.secondary)
             modelPicker
             statusPill
+            if settings.localOnly {
+                lockBadge
+            }
             Button {
                 showingInstructions = true
             } label: {
@@ -89,9 +104,42 @@ struct ChatView: View {
             }
             .buttonStyle(.borderless)
             .help("System instructions for this chat")
+            Button {
+                showingSettings = true
+            } label: {
+                Image(systemName: "gearshape")
+            }
+            .buttonStyle(.borderless)
+            .help("Privacy settings (Local Only, privacy check)")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
+    }
+
+    /// The Local Only lock, visible wherever a chat is open so the
+    /// state is never a surprise.
+    private var lockBadge: some View {
+        Label("Local Only", systemImage: "lock.fill")
+            .font(.caption)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(Color.blue.opacity(0.15), in: Capsule())
+            .help("Local Only is on: only models that run on this Mac may answer. Turn it off in Privacy settings (gear button).")
+    }
+
+    /// The latest Auto routing explanation, as a quiet caption under
+    /// the header — routing should be visible, not magic.
+    private func routingNoteBar(_ note: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "wand.and.stars")
+            Text(note)
+                .font(.caption)
+                .lineLimit(2)
+            Spacer()
+        }
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 5)
     }
 
     // MARK: - Model picker (Phase 3)
@@ -286,11 +334,47 @@ struct ChatView: View {
     }
 
     private var emptyStateText: String {
+        if conversation.modelSelection.isAuto {
+            return "This chat is on Auto: each message is sorted on your Mac and given to the best local model for the job — the built-in model for quick things, a bigger downloaded model for hard ones. Nothing you type leaves the machine."
+        }
         if conversation.modelSelection.isOnDevice {
             return "This chat runs on the model built into your Mac. Nothing you type leaves the machine."
         }
         let name = selectedDescriptor?.displayName ?? "a local model"
         return "This chat runs on \(name), on this Mac. Nothing you type leaves the machine."
+    }
+
+    /// The privacy-check notice — informational, not an error: the
+    /// send worked; the user is being told what was hidden first.
+    private func infoBanner(_ message: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "lock.shield")
+            Text(message)
+                .font(.callout)
+            Spacer()
+            Button {
+                engine.infoMessages[conversationID] = nil
+            } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.borderless)
+        }
+        .padding(10)
+        .background(Color.blue.opacity(0.12))
+    }
+
+    /// When the Apple Intelligence banner matters: the built-in model
+    /// is down AND this chat depends on it — an explicitly on-device
+    /// chat always does; an Auto chat only when it has nothing else
+    /// (no downloaded MLX model and no server configured) to route to.
+    private var showsAvailabilityBanner: Bool {
+        guard !availability.canChat else { return false }
+        if conversation.modelSelection.isOnDevice { return true }
+        if conversation.modelSelection.isAuto {
+            return mlxStore.downloadedModels.isEmpty
+                && endpointStore.configs.isEmpty
+        }
+        return false
     }
 
     private var modelMissingBanner: some View {

@@ -144,10 +144,23 @@ struct ResolvedBackend {
 /// in exactly one place.
 enum BackendFactory {
 
+    /// - Parameter localOnly: the Settings privacy lock (Phase 4).
+    ///   When on, server selections are *refused* here in the factory
+    ///   — not merely hidden in the UI — and resolve to the built-in
+    ///   model, with the effective selection saying so. The engine
+    ///   notices the mismatch and explains it to the user.
     static func resolve(selection: ModelSelection,
                         downloadedMLXRepoIDs: Set<String>,
-                        endpoints: [EndpointConfig]) -> ResolvedBackend {
+                        endpoints: [EndpointConfig],
+                        localOnly: Bool = false) -> ResolvedBackend {
         switch selection {
+        case .auto:
+            // Auto is classified and routed by the engine before the
+            // factory is consulted; arriving here means there was no
+            // routing context, and the built-in model is the safe
+            // default.
+            return ResolvedBackend(backend: OnDeviceBackend(),
+                                   effectiveSelection: .onDevice)
         case .onDevice:
             return ResolvedBackend(backend: OnDeviceBackend(),
                                    effectiveSelection: .onDevice)
@@ -160,6 +173,10 @@ enum BackendFactory {
             return ResolvedBackend(backend: OnDeviceBackend(),
                                    effectiveSelection: .onDevice)
         case .endpoint(let id):
+            if localOnly {
+                return ResolvedBackend(backend: OnDeviceBackend(),
+                                       effectiveSelection: .onDevice)
+            }
             if let config = endpoints.first(where: { $0.id == id }) {
                 return ResolvedBackend(backend: EndpointBackend(config: config),
                                        effectiveSelection: selection)

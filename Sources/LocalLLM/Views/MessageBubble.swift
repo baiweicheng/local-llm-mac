@@ -32,10 +32,34 @@ struct MessageBubble: View {
                 Image(systemName: "sparkles")
                     .foregroundStyle(.secondary)
                     .padding(.top, 3)
-                MarkdownText(content: message.text)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 5) {
+                    MarkdownText(content: message.text)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if let telemetry = message.telemetry {
+                        TelemetryPill(telemetry: telemetry)
+                    }
+                }
             }
         }
+    }
+}
+
+/// The Phase 4 execution-telemetry pill under an assistant reply:
+/// which backend actually answered, how long it took, roughly how
+/// many tokens the reply is, and what it cost — $0.00 while every
+/// backend is local. Subtle on purpose; the details are in the help
+/// text.
+struct TelemetryPill: View {
+    let telemetry: MessageTelemetry
+
+    var body: some View {
+        Text(TelemetryFormat.line(for: telemetry))
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .background(Color.secondary.opacity(0.10), in: Capsule())
+            .help("Handled by \(telemetry.backendLabel) in \(TelemetryFormat.durationText(telemetry.seconds)) · about \(telemetry.estimatedTokens) tokens (estimated) · local models are always free")
     }
 }
 

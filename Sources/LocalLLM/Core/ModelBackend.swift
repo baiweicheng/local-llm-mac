@@ -10,6 +10,12 @@ import Foundation
 /// stored as one short string and resolved to a live backend later by
 /// `BackendRegistry` / the services layer.
 enum ModelSelection: Equatable, Hashable, Sendable {
+    /// Phase 4: let the app choose per message. The prompt is
+    /// classified on-device (`IntentClassifier`) and `RoutingPolicy`
+    /// maps it to a concrete backend; the engine then resolves and
+    /// runs that backend, so a stored `.auto` never reaches a backend
+    /// unresolved. The default for new chats.
+    case auto
     /// Apple's built-in on-device model (Foundation Models).
     case onDevice
     /// A downloaded MLX model, identified by its Hugging Face repo id
@@ -26,6 +32,8 @@ enum ModelSelection: Equatable, Hashable, Sendable {
     /// that no longer exists.
     var storageKey: String {
         switch self {
+        case .auto:
+            return "auto"
         case .onDevice:
             return "onDevice"
         case .mlx(let repoID):
@@ -37,7 +45,9 @@ enum ModelSelection: Equatable, Hashable, Sendable {
 
     init(storageKey: String) {
         let key = storageKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        if key.hasPrefix("mlx:") {
+        if key == "auto" {
+            self = .auto
+        } else if key.hasPrefix("mlx:") {
             let repoID = String(key.dropFirst("mlx:".count))
             self = repoID.isEmpty ? .onDevice : .mlx(repoID: repoID)
         } else if key.hasPrefix("endpoint:"),
@@ -58,6 +68,11 @@ enum ModelSelection: Equatable, Hashable, Sendable {
     /// exactly like an MLX chat does.
     var budgetKind: ContextBudget.Backend {
         switch self {
+        // Auto resolves to a concrete backend before anything is
+        // planned; until it does, the tightest budget is the honest
+        // planning assumption (it's also what the header's token
+        // meter shows for an Auto chat).
+        case .auto: return .onDevice
         case .onDevice: return .onDevice
         case .mlx: return .mlxLocal
         case .endpoint: return .mlxLocal
@@ -67,6 +82,8 @@ enum ModelSelection: Equatable, Hashable, Sendable {
     var budget: ContextBudget { ContextBudget.budget(for: budgetKind) }
 
     var isOnDevice: Bool { self == .onDevice }
+
+    var isAuto: Bool { self == .auto }
 }
 
 /// One row of the model picker: everything the UI needs to show a
@@ -80,10 +97,11 @@ struct BackendDescriptor: Equatable, Sendable, Identifiable {
     let detail: String
     let budget: ContextBudget
     /// False only for the on-device model when Apple Intelligence isn't
-    /// ready. MLX rows appear only once downloaded (always ready), and
-    /// a local server counts as ready when configured — whether it's
-    /// actually running is only known when a message is sent, and the
-    /// error then says so in plain English.
+    /// ready. MLX rows appear only once downloaded (always ready), Auto
+    /// is always ready (it falls back to whatever local route exists),
+    /// and a local server counts as ready when configured — whether
+    /// it's actually running is only known when a message is sent, and
+    /// the error then says so in plain English.
     let isReady: Bool
 
     var id: String { selection.storageKey }
@@ -94,13 +112,23 @@ struct BackendDescriptor: Equatable, Sendable, Identifiable {
 /// model, disk, or network state.
 enum BackendRegistry {
 
-    /// Rows in picker order: the built-in model first, then downloaded
-    /// MLX models in catalog order, then saved local servers in the
-    /// order the user arranged them.
+    /// Rows in picker order: Auto first (Phase 4 — it's the default
+    /// for new chats), then the built-in model, then downloaded MLX
+    /// models in catalog order, then saved local servers in the order
+    /// the user arranged them.
     static func descriptors(downloadedMLX: [MLXModelInfo],
                             endpoints: [EndpointConfig],
                             onDeviceReady: Bool) -> [BackendDescriptor] {
         var rows: [BackendDescriptor] = [
+            // Auto always counts as ready: it degrades to whatever
+            // local route exists, and a route that's actually down
+            // reports itself in plain English at send time.
+            BackendDescriptor(
+                selection: .auto,
+                displayName: "Auto",
+                detail: "Picks the best model on this Mac for each message",
+                budget: .onDevice,
+                isReady: true),
             BackendDescriptor(
                 selection: .onDevice,
                 displayName: "Apple On-Device",
