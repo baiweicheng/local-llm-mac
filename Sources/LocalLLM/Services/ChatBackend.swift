@@ -63,10 +63,11 @@ enum BackendError: LocalizedError {
     }
 }
 
-/// A `ChatSession` over a framework `LanguageModelSession` — shared by
-/// the built-in on-device backend and (see `MLXBackend`) MLX models,
-/// because in macOS 27 both are just sessions over a `LanguageModel`.
-/// All of the streaming shape lives here exactly once.
+/// A `ChatSession` over a framework `LanguageModelSession` — the
+/// built-in on-device backend's session. (MLX models used to share
+/// this wrapper through the framework bridge; they now run on the MLX
+/// library's own session so the KV-cache setting in Settings can
+/// actually reach the cache — see `MLXBackend.swift` for why.)
 @MainActor
 final class FrameworkChatSession: ChatSession {
 
@@ -149,10 +150,16 @@ enum BackendFactory {
     ///   — not merely hidden in the UI — and resolve to the built-in
     ///   model, with the effective selection saying so. The engine
     ///   notices the mismatch and explains it to the user.
+    /// - Parameter kvCacheMode: the Settings KV-cache mode, handed to
+    ///   the MLX backend so its sessions are created with that cache
+    ///   configuration. Ignored by every other backend — they manage
+    ///   their own caches.
     static func resolve(selection: ModelSelection,
                         downloadedMLXRepoIDs: Set<String>,
                         endpoints: [EndpointConfig],
-                        localOnly: Bool = false) -> ResolvedBackend {
+                        localOnly: Bool = false,
+                        kvCacheMode: KVCacheMode = .defaultMode)
+        -> ResolvedBackend {
         switch selection {
         case .auto:
             // Auto is classified and routed by the engine before the
@@ -167,8 +174,10 @@ enum BackendFactory {
         case .mlx(let repoID):
             if downloadedMLXRepoIDs.contains(repoID),
                let info = MLXCatalog.info(forRepoID: repoID) {
-                return ResolvedBackend(backend: MLXBackend(info: info),
-                                       effectiveSelection: selection)
+                return ResolvedBackend(
+                    backend: MLXBackend(info: info,
+                                        kvCacheMode: kvCacheMode),
+                    effectiveSelection: selection)
             }
             return ResolvedBackend(backend: OnDeviceBackend(),
                                    effectiveSelection: .onDevice)

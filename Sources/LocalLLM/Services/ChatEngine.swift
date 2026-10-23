@@ -122,13 +122,17 @@ final class ChatEngine {
     /// A conversation's live session and everything needed to know
     /// whether it can be reused for the next send: which backend made
     /// it, the instructions it was created with, the summary its
-    /// context reflects, and whether it has been seeded.
+    /// context reflects, whether it has been seeded, and — for MLX
+    /// sessions — the KV-cache mode it was created under (a cache's
+    /// layout is fixed at creation, so a Settings change there must
+    /// retire the session; other backends ignore the field).
     private struct LiveSession {
         let session: ChatSession
         let selection: ModelSelection
         let instructions: String
         let summaryKey: String
         let seeded: Bool
+        let kvCacheMode: KVCacheMode
     }
 
     private var liveSessions: [UUID: LiveSession] = [:]
@@ -326,17 +330,32 @@ final class ChatEngine {
         // Session selection and seeding. A live session is reused only
         // when backend, instructions, and summary all still match —
         // anything else (first send, picker switch, instructions edit,
-        // compaction, relaunch) rebuilds and re-seeds.
+        // compaction, relaunch) rebuilds and re-seeds. An MLX session
+        // additionally has to have been created under the current
+        // KV-cache mode: the cache layout is fixed at creation, so a
+        // Settings change retires MLX sessions here and the rebuild
+        // re-seeds them from the stored conversation, exactly like a
+        // picker switch. (The pure rule lives in
+        // `KVCacheMode.sessionReusable`; other backends never retire
+        // over this setting.)
         // Note the session identity uses the *effective* instructions
         // (the scrubbed copy for a remote destination), so a session
         // is never reused across a change in what would be sent.
         let summaryKey = conversation.contextSummary ?? ""
         let existing = liveSessions[conversationID]
+        let selectionIsMLX: Bool = {
+            if case .mlx = selection { return true }
+            return false
+        }()
         let canReuse = existing != nil
             && existing!.selection == selection
             && existing!.instructions == effectiveInstructions
             && existing!.summaryKey == summaryKey
             && existing!.seeded
+            && KVCacheMode.sessionReusable(
+                sessionMode: existing!.kvCacheMode,
+                currentMode: routingInputs.kvCacheMode,
+                selectionIsMLX: selectionIsMLX)
 
         let session: ChatSession
         var promptText = lastMessage.text
@@ -357,7 +376,7 @@ final class ChatEngine {
             liveSessions[conversationID] = LiveSession(
                 session: session, selection: selection,
                 instructions: effectiveInstructions, summaryKey: summaryKey,
-                seeded: true)
+                seeded: true, kvCacheMode: routingInputs.kvCacheMode)
         }
 
         // The firewall's second half: with the outgoing prompt fully

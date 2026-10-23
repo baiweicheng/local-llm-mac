@@ -1,10 +1,13 @@
 import SwiftUI
 
 /// Privacy settings (Phase 4): the Local Only lock and the custom
-/// terms for the privacy check. Opened from the gear button in the
-/// chat header. (General app settings — default model, instructions
-/// library — arrive with the Phase 10 polish pass; this sheet is the
-/// privacy page of that future settings window.)
+/// terms for the privacy check — plus, below them, the one
+/// performance setting that exists so far: how much memory a
+/// downloaded MLX model's conversation memory may use. Opened from
+/// the gear button in the chat header. (General app settings —
+/// default model, instructions library — arrive with the Phase 10
+/// polish pass; this sheet is the privacy page of that future
+/// settings window.)
 struct SettingsView: View {
     @Bindable var settings: AppSettings
     @Environment(\.dismiss) private var dismiss
@@ -28,6 +31,8 @@ struct SettingsView: View {
                     localOnlySection
                     Divider()
                     redactionSection
+                    Divider()
+                    kvCacheSection
                 }
                 .padding(16)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -98,5 +103,27 @@ struct SettingsView: View {
     private func addTerm() {
         settings.addRedactionTerm(newTerm)
         newTerm = ""
+    }
+
+    // MARK: - KV cache (MLX models)
+
+    private var kvCacheSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Local model memory")
+                .font(.headline)
+            Picker("Model memory", selection: $settings.kvCacheMode) {
+                ForEach(KVCacheMode.allCases, id: \.self) { mode in
+                    Text(mode.label).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            Text("A downloaded MLX model keeps a working memory of the conversation so far (called a KV cache) so it doesn't have to re-read everything for every word. At full size that memory can grow to several gigabytes on a long chat. 8-bit stores it in half the memory with no noticeable change in answer quality — the recommended balance. 4-bit uses a quarter of the memory, with a little more quality risk. Off keeps the full-size memory.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Text("This applies to downloaded MLX models only — the built-in model and local servers manage their own memory. Changing it restarts the current MLX chat sessions; the conversation itself is kept and re-read, so nothing is lost.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
     }
 }

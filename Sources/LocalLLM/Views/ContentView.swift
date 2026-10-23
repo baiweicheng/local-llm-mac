@@ -46,7 +46,8 @@ struct ContentView: View {
                     selection: selection,
                     downloadedMLXRepoIDs: mlxStore.downloadedRepoIDs,
                     endpoints: endpointStore.configs,
-                    localOnly: settings.localOnly)
+                    localOnly: settings.localOnly,
+                    kvCacheMode: settings.kvCacheMode)
             }
             engine.configureRoutingContextProvider {
                 RoutingInputs(
@@ -55,7 +56,8 @@ struct ContentView: View {
                     localOnly: settings.localOnly,
                     cloudAvailable: false, // Phase 8 brings cloud backends
                     onDeviceReady: ModelAvailabilityState.current.canChat,
-                    customRedactionTerms: settings.customRedactionTerms)
+                    customRedactionTerms: settings.customRedactionTerms,
+                    kvCacheMode: settings.kvCacheMode)
             }
         }
     }

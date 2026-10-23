@@ -1,23 +1,34 @@
 import Foundation
-import FoundationModels
 import MLXFoundationModels
+import MLXLMCommon
 
 // ============================================================
 //  THE ONLY FILE THAT TALKS TO MLX.
 //
-//  Every MLX-specific symbol in the app lives in `makeSession` below,
-//  so if the MLX bridge's API needs adjusting at first compile, the
-//  fix is contained to this one function. Everything downstream —
-//  sessions, streaming, compaction — only ever sees the framework's
-//  `LanguageModelSession`, identical to the on-device backend.
+//  Every MLX-specific symbol in the app lives in this file, so if
+//  the MLX libraries' APIs need adjusting at first compile, the fix
+//  is contained here. Everything downstream — sessions, streaming,
+//  compaction — only ever sees the app's own `ChatSession` protocol.
 //
-//  What the bridge is (checked against the package's own docs,
-//  2026-10-23): `MLXFoundationModels`, a product of the open-source
-//  `mlx-swift-lm` package (github.com/ml-explore/mlx-swift-lm),
-//  provides `MLXLanguageModel`, which conforms to the framework's
-//  `LanguageModel` protocol. Build one from a Hugging Face repo id,
-//  hand it to `LanguageModelSession(model:)`, and from there the
-//  session behaves exactly like the built-in model's.
+//  WHY THE SESSION NO LONGER GOES THROUGH THE FRAMEWORK BRIDGE
+//  (checked against the pinned mlx-swift-lm 3.32.3 sources,
+//  2026-10-23): Phases 3–4 built the session as
+//  `LanguageModelSession(model: MLXLanguageModel(...))`. That bridge
+//  is convenient, but it builds its `GenerateParameters` internally
+//  from Foundation Models' `GenerationOptions` — response length,
+//  temperature, sampling, seed — and nothing else. There is no
+//  surface on `MLXLanguageModel`, on its executor configuration, or
+//  on `GenerationOptions` for KV-cache configuration, so the
+//  Settings KV-cache mode could never reach the cache that way.
+//
+//  So the session is now the MLX library's own `ChatSession`
+//  (MLXLMCommon), created with `GenerateParameters` that carry the
+//  cache configuration from the start. The model *loading* still
+//  goes through the bridge value: `MLXLanguageModel.loadContainer()`
+//  is public, shares the bridge's process-wide model cache, and
+//  resolves LLM/VLM factories exactly as the framework path did —
+//  downloads, disk checks, and load behavior are unchanged from
+//  Phase 3. Only the conversation object changed hands.
 //
 //  If `MLXLanguageModel(modelID:)` doesn't resolve in the shipped
 //  bridge version, the documented alternative construction is:
@@ -27,8 +38,9 @@ import MLXFoundationModels
 //          configuration: ModelConfiguration(id: info.repoID),
 //          capabilities: [.guidedGeneration])
 //
-//  (a macro from the same package; MLXLMCommon is already a target
-//  dependency for exactly this reason).
+//  (a macro from the same package). It produces the same
+//  `MLXLanguageModel` value, so `loadContainer()` below is
+//  unaffected by which construction is used.
 // ============================================================
 
 /// A downloaded local MLX model as a backend.
@@ -36,15 +48,156 @@ struct MLXBackend: ModelBackend {
 
     let info: MLXModelInfo
 
+    /// The Settings KV-cache mode these sessions are created with.
+    /// Fixed at creation: a mode change produces a new backend (via
+    /// `BackendFactory`) and the engine retires the old session, so
+    /// a session's cache configuration can never change under it —
+    /// the library forbids that too (see `MLXChatSession`).
+    var kvCacheMode: KVCacheMode = .defaultMode
+
     var selection: ModelSelection { .mlx(repoID: info.repoID) }
     var displayName: String { info.displayName }
     var budget: ContextBudget { .mlxLocal }
 
     @MainActor
     func makeSession(instructions: String) -> ChatSession {
-        let model = MLXLanguageModel(modelID: info.repoID)
-        let session = LanguageModelSession(model: model,
-                                           instructions: instructions)
-        return FrameworkChatSession(session: session)
+        MLXChatSession(
+            model: MLXLanguageModel(modelID: info.repoID),
+            instructions: instructions,
+            generateParameters: Self.generateParameters(for: kvCacheMode))
+    }
+
+    /// Translates the pure `KVCacheMode` mapping into the library's
+    /// generation parameters. Only the cache fields differ from the
+    /// defaults; everything else keeps the library's standard chat
+    /// behavior — including the response-length cap: the framework
+    /// bridge capped replies at 4,096 tokens when the app set no
+    /// limit of its own (its executor's default), so the same cap is
+    /// set here to keep reply behavior unchanged by the move.
+    ///
+    /// Cache configuration notes (mlx-swift-lm 3.32.3):
+    /// - The typed `kvCache` field is the library's canonical path;
+    ///   it must not be combined with the legacy `kvBits`-style
+    ///   fields, and this function never sets both.
+    /// - `.eightBit` / `.fourBit` are the library's presets for the
+    ///   exact numbers `KVCacheMode.parameters` specifies (that many
+    ///   bits, group size 64, compress from token 0).
+    /// - Compatibility is `.allowPartial`: quantize the layers that
+    ///   support it and leave the rest unchanged. That matters for
+    ///   Gemma — its sliding-window attention layers keep their
+    ///   architecture-defined window (their cache is bounded by
+    ///   design), while the full-attention layers, whose cache is
+    ///   the part that grows to several GB, take the compression.
+    ///   The strict policies would instead refuse to generate on a
+    ///   hybrid model unless every (or at least one) layer matched.
+    /// - Off means `kvCache` stays nil: the library's default,
+    ///   a full-precision cache.
+    static func generateParameters(for mode: KVCacheMode)
+        -> GenerateParameters {
+        var parameters = GenerateParameters(maxTokens: 4096)
+        let mapping = mode.parameters
+        if let bits = mapping.bits {
+            let affine: AffineKVCacheConfiguration =
+                bits == 4 ? .fourBit : .eightBit
+            parameters.kvCache = KVCacheConfiguration(
+                strategy: .affine(affine),
+                compatibility: .allowPartial)
+        }
+        return parameters
+    }
+}
+
+/// A `ChatSession` over the MLX library's own `ChatSession`.
+///
+/// The wrapper exists because the two session shapes differ in
+/// exactly three ways, all absorbed here:
+///
+/// - **Creation timing.** The engine creates sessions synchronously,
+///   but a `ModelContainer` loads asynchronously. Like the framework
+///   session (which also deferred the real load to first use), the
+///   container load and the library session's creation happen lazily
+///   on the first `streamReply`; a load failure surfaces as that
+///   reply's error, in the engine's usual plain-English banner.
+/// - **Streaming shape.** The library yields *new text chunks*; the
+///   app's protocol yields the reply *so far*. The wrapper
+///   accumulates, so downstream everything is identical.
+/// - **Images.** Framework backends take a `Prompt` with attachments;
+///   the library takes `UserInput.Image` values. The same temporary
+///   file URLs the engine already writes map straight across.
+///
+/// The cache configuration is baked into `generateParameters` at
+/// creation and never mutated afterwards: the library pins the cache
+/// plan to the session and throws `kvCacheConfigurationChanged` if a
+/// later send disagrees — one more reason the engine retires the
+/// whole session when the Settings mode changes.
+@MainActor
+final class MLXChatSession: ChatSession {
+
+    private let model: MLXLanguageModel
+    private let instructions: String
+    private let generateParameters: GenerateParameters
+
+    /// The library session, created on first use; also the in-flight
+    /// container load, shared so two first sends in a row can't load
+    /// or create twice.
+    private var librarySession: MLXLMCommon.ChatSession?
+    private var containerTask: Task<ModelContainer, Error>?
+
+    init(model: MLXLanguageModel,
+         instructions: String,
+         generateParameters: GenerateParameters) {
+        self.model = model
+        self.instructions = instructions
+        self.generateParameters = generateParameters
+    }
+
+    func streamReply(to request: ChatReplyRequest)
+        -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let session = try await self.librarySession()
+                    let images = request.imageURLs.map {
+                        UserInput.Image.url($0)
+                    }
+                    var fullText = ""
+                    for try await chunk in session.streamResponse(
+                        to: request.promptText, images: images) {
+                        fullText += chunk
+                        continuation.yield(fullText)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    /// Loads the container (through the bridge value, so the shared
+    /// model cache and download state are the same ones the rest of
+    /// the app uses) and builds the library session, once.
+    private func librarySession() async throws -> MLXLMCommon.ChatSession {
+        if let librarySession { return librarySession }
+        let container = try await loadContainer()
+        // Another send may have created the session while this one
+        // was loading; the check-and-set has no suspension between,
+        // so exactly one session is ever created.
+        if let librarySession { return librarySession }
+        let created = MLXLMCommon.ChatSession(
+            container,
+            instructions: instructions,
+            generateParameters: generateParameters)
+        librarySession = created
+        return created
+    }
+
+    private func loadContainer() async throws -> ModelContainer {
+        if let containerTask { return try await containerTask.value }
+        let model = self.model
+        let task = Task { try await model.loadContainer() }
+        containerTask = task
+        return try await task.value
     }
 }

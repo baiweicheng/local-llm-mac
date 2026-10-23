@@ -50,6 +50,12 @@ struct RoutingInputs: Equatable, Sendable {
     /// The user's own additions to the privacy check (Settings): words
     /// or phrases that must never leave this Mac unhidden.
     var customRedactionTerms: [String] = []
+    /// The Settings KV-cache mode for MLX models. Routing never looks
+    /// at it — it travels here because the engine reads this one
+    /// snapshot per send: it decides whether a live MLX session was
+    /// created under the same mode (see `KVCacheMode.sessionReusable`),
+    /// retiring the session when the setting has changed.
+    var kvCacheMode: KVCacheMode = .defaultMode
 }
 
 /// The routing policy's answer: one concrete backend selection (never

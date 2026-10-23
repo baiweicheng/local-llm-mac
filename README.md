@@ -116,6 +116,17 @@ memory.
 - **Everything is still local.** MLX models run on your Mac's GPU;
   servers are on `localhost`. The only network use in this phase is
   downloading models you asked for.
+- **Model memory (KV cache).** An MLX model keeps a working memory of
+  the conversation so far — the *KV cache* — and at full size it can
+  grow to several gigabytes on a long chat, next to the model's own
+  ≈6.5 GB. The gear menu's **Local model memory** setting shrinks it:
+  **8-bit** (the default) stores that memory in half the space with no
+  noticeable change in answer quality, **4-bit** uses a quarter of the
+  space with a little more quality risk, and **Off** keeps the
+  full-size memory. It applies to downloaded MLX models only — the
+  built-in model and local servers manage their own memory — and
+  changing it simply restarts the chat's session (the conversation
+  itself is kept).
 
 ## What's new in Phase 4
 

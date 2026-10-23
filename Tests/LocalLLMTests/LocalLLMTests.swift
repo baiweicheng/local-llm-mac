@@ -901,4 +901,111 @@ final class LocalLLMTests: XCTestCase {
         message.telemetry = nil
         XCTAssertNil(message.telemetry)
     }
+
+    // MARK: - KV cache mode (MLX refinement after Phase 4)
+
+    func testKVCacheModeDecodingFallsBackToEightBit() {
+        XCTAssertEqual(KVCacheMode.defaultMode, .eightBit)
+        // A fresh install has nothing stored — the default applies.
+        XCTAssertEqual(KVCacheMode(storedValue: nil), .eightBit)
+        // So does anything unrecognized (an older/newer version's
+        // value, a hand-edited plist): never a crash, never a
+        // stranded setting.
+        XCTAssertEqual(KVCacheMode(storedValue: "banana"), .eightBit)
+        XCTAssertEqual(KVCacheMode(storedValue: ""), .eightBit)
+        XCTAssertEqual(KVCacheMode(storedValue: "off"), .off)
+        XCTAssertEqual(KVCacheMode(storedValue: "eightBit"), .eightBit)
+        XCTAssertEqual(KVCacheMode(storedValue: "fourBit"), .fourBit)
+    }
+
+    func testKVCacheModeStoredValueRoundTrips() {
+        // The stored strings are a persistence contract — they must
+        // not change spelling once written to a user's defaults.
+        XCTAssertEqual(KVCacheMode.off.storedValue, "off")
+        XCTAssertEqual(KVCacheMode.eightBit.storedValue, "eightBit")
+        XCTAssertEqual(KVCacheMode.fourBit.storedValue, "fourBit")
+        for mode in KVCacheMode.allCases {
+            XCTAssertEqual(KVCacheMode(storedValue: mode.storedValue), mode)
+        }
+    }
+
+    func testKVCacheModeParameterMapping() {
+        // Off = no quantization at all.
+        XCTAssertNil(KVCacheMode.off.parameters.bits)
+        // The two quantized modes map to the library's preset values:
+        // that many bits, groups of 64, compress from the first token.
+        let eight = KVCacheMode.eightBit.parameters
+        XCTAssertEqual(eight.bits, 8)
+        XCTAssertEqual(eight.groupSize, 64)
+        XCTAssertEqual(eight.compressionStart, 0)
+        let four = KVCacheMode.fourBit.parameters
+        XCTAssertEqual(four.bits, 4)
+        XCTAssertEqual(four.groupSize, 64)
+        XCTAssertEqual(four.compressionStart, 0)
+    }
+
+    func testKVCacheSessionReuseRule() {
+        // MLX session + unchanged mode: reusable.
+        XCTAssertTrue(KVCacheMode.sessionReusable(
+            sessionMode: .eightBit, currentMode: .eightBit,
+            selectionIsMLX: true))
+        // MLX session + changed mode (either direction): retired, so
+        // the next send rebuilds it under the new cache layout.
+        XCTAssertFalse(KVCacheMode.sessionReusable(
+            sessionMode: .eightBit, currentMode: .fourBit,
+            selectionIsMLX: true))
+        XCTAssertFalse(KVCacheMode.sessionReusable(
+            sessionMode: .fourBit, currentMode: .off,
+            selectionIsMLX: true))
+        // Any other backend: the setting can't touch its cache, so it
+        // never blocks reuse.
+        XCTAssertTrue(KVCacheMode.sessionReusable(
+            sessionMode: .eightBit, currentMode: .fourBit,
+            selectionIsMLX: false))
+        XCTAssertTrue(KVCacheMode.sessionReusable(
+            sessionMode: .off, currentMode: .eightBit,
+            selectionIsMLX: false))
+        // The routing snapshot a send reads carries the default until
+        // the app shell wires the live setting in.
+        XCTAssertEqual(RoutingInputs().kvCacheMode, .defaultMode)
+    }
+
+    func testFactoryHandsKVCacheModeToMLXBackend() {
+        let info = MLXCatalog.models[1] // Gemma 4 12B, the default
+        let resolved = BackendFactory.resolve(
+            selection: .mlx(repoID: info.repoID),
+            downloadedMLXRepoIDs: [info.repoID], endpoints: [],
+            kvCacheMode: .fourBit)
+        let backend = resolved.backend as? MLXBackend
+        XCTAssertNotNil(backend)
+        XCTAssertEqual(backend?.kvCacheMode, .fourBit)
+
+        // Without an explicit mode, the factory default is the
+        // Settings default: 8-bit.
+        let defaulted = BackendFactory.resolve(
+            selection: .mlx(repoID: info.repoID),
+            downloadedMLXRepoIDs: [info.repoID], endpoints: [])
+        XCTAssertEqual((defaulted.backend as? MLXBackend)?.kvCacheMode,
+                       .eightBit)
+    }
+
+    @MainActor
+    func testKVCacheModePersistsInSettings() {
+        let suite = "LocalLLMTests.kvCache.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        // Fresh defaults: the 8-bit default, nothing written yet.
+        let settings = AppSettings(defaults: defaults)
+        XCTAssertEqual(settings.kvCacheMode, .eightBit)
+
+        // Changing it persists immediately — a fresh settings object
+        // over the same defaults reads the new value back.
+        settings.kvCacheMode = .fourBit
+        XCTAssertEqual(AppSettings(defaults: defaults).kvCacheMode,
+                       .fourBit)
+        settings.kvCacheMode = .off
+        XCTAssertEqual(AppSettings(defaults: defaults).kvCacheMode, .off)
+    }
 }
