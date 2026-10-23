@@ -3,8 +3,10 @@ import SwiftData
 
 /// App entry point.
 ///
-/// "LocalLLM" is a placeholder name — the real name comes later; renaming
-/// it touches this file, Package.swift, and the sidebar's empty-state text.
+/// The product's name is Blink (chosen 2026-10-23) — a display name
+/// only: it lives in Scripts/make-app.sh (the bundle name and the
+/// generated Info.plist) and the README. This module, its types,
+/// and its storage keys keep the internal name "LocalLLM".
 @main
 struct LocalLLMApp: App {
 

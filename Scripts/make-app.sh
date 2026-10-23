@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# make-app.sh — build LocalLLM.app, a double-clickable app bundle,
+# make-app.sh — build Blink.app, a double-clickable app bundle,
 # from this Swift Package.
 #
 # Run it from Terminal, in this folder (or anywhere — it finds the
@@ -25,19 +25,29 @@
 #      you open the app, Gatekeeper will ask you to right-click it
 #      and choose Open (see the README).
 #
-# The finished app lands in  .build-app/LocalLLM.app  — drag it
+# The finished app lands in  .build-app/Blink.app  — drag it
 # into your Applications folder.
 
 set -euo pipefail
 
 # ----------------------------------------------------------------
-# Rename-me variables. When the app gets its real name, change
-# APP_NAME here (and, if you like, BUNDLE_ID) and re-run the
-# script — nothing else needs to change.
-APP_NAME="LocalLLM"
+# The app's name and identity. The product is called Blink (the
+# name was chosen on 2026-10-23); APP_NAME is the display name —
+# the bundle comes out as Blink.app and shows "Blink" everywhere
+# macOS names the app. The Swift package's executable keeps its
+# internal product name (LocalLLM, see BUILT_EXECUTABLE below);
+# only this display layer carries the product name. BUNDLE_ID
+# stays as it is: changing it would make macOS treat the app as
+# a different app (fresh permissions, fresh settings).
+APP_NAME="Blink"
 BUNDLE_ID="com.baiweicheng.localllm"
 APP_VERSION="1.0"
 MIN_SYSTEM="27.0"
+# The executable `swift build` produces — the package's internal
+# product name, unchanged by the product rename. It is copied
+# into the bundle under $APP_NAME, which is what the generated
+# Info.plist names as CFBundleExecutable.
+BUILT_EXECUTABLE="LocalLLM"
 # ----------------------------------------------------------------
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -51,7 +61,7 @@ CONTENTS="$APP_DIR/Contents"
 echo "==> Building $APP_NAME in release mode…"
 swift build -c release
 BIN_DIR="$(swift build -c release --show-bin-path)"
-BIN_PATH="$BIN_DIR/$APP_NAME"
+BIN_PATH="$BIN_DIR/$BUILT_EXECUTABLE"
 if [ ! -x "$BIN_PATH" ]; then
     echo "!! Build finished but no executable at $BIN_PATH" >&2
     exit 1

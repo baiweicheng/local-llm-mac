@@ -1,4 +1,4 @@
-# LocalLLM (working name)
+# Blink
 
 A chat app for your Mac that is **local first**: it chats with the AI
 model built into macOS (Apple Intelligence), with bigger models you
@@ -13,7 +13,9 @@ ever happen when you approve them.
 Two front doors, one engine: the main chat window, and a quick panel
 you summon from any app with **⌘⇧Space**.
 
-The real app name comes later; "LocalLLM" is just the placeholder.
+The app is called **Blink**. (Under the hood, the code module keeps
+the internal name "LocalLLM" — plumbing you'll see in a few folder
+names like `Sources/LocalLLM`. It doesn't affect using the app.)
 
 ## What you need
 
@@ -51,7 +53,7 @@ login — to a real app bundle. There's a script that builds one:
    (Running it through `bash` like that means no `chmod` is needed;
    the script is not marked executable in the repo, on purpose.)
 2. The script builds the app in release mode, assembles
-   **`.build-app/LocalLLM.app`** — executable, permission notes
+   **`.build-app/Blink.app`** — executable, permission notes
    (Info.plist), and icon — and signs it: with your Apple Development
    or Developer ID identity if you have one, otherwise ad-hoc.
 3. Drag the `.app` into your **Applications** folder.
@@ -59,9 +61,9 @@ login — to a real app bundle. There's a script that builds one:
    (Gatekeeper asks once because the app wasn't signed with an Apple
    identity; after that it opens with a normal double-click).
 
-The app's name and bundle id are single variables at the top of
-`Scripts/make-app.sh` — when the app gets its real name, changing
-them there (and re-running the script) is the whole rename.
+The app's name — **Blink** — and its bundle id are single variables
+at the top of `Scripts/make-app.sh`; the bundle always comes out as
+`Blink.app`, and the script is the one place the product name is set.
 
 ## First-run walkthrough
 
@@ -694,7 +696,7 @@ Images can't live in a text file, so an attached picture becomes an
 app.
 
 **The app bundle.** `Scripts/make-app.sh` (see "The
-double-clickable app" at the top) assembles `LocalLLM.app` from
+double-clickable app" at the top) assembles `Blink.app` from
 `Scripts/Info.plist` — including every permission note macOS shows
 (Calendar, Reminders, Contacts, Photos, Music, and Finder access
 for the quick panel, each written in plain English; no microphone
@@ -758,10 +760,8 @@ Known gaps, stated plainly (they're the seed list for any future
 version): what's playing in other apps can't be seen (no public
 API); the quick panel captures Finder selections but not Photos
 selections; MCP is local-stdio only (no hosted servers) and a
-server argument containing a space can't be typed yet; server and
-OpenRouter chats can't use the Mac lookups; and the app still
-carries its placeholder name — the real one is a two-minute change
-in `Scripts/make-app.sh` when it's chosen.
+server argument containing a space can't be typed yet; and server
+and OpenRouter chats can't use the Mac lookups.
 
 ## For developers
 
