@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Info.plist template for the packaged app. Scripts/make-app.sh
+  copies this into LocalLLM.app/Contents/Info.plist, replacing the
+  four __PLACEHOLDER__ values with the variables at the top of
+  that script (app name, bundle id, version, minimum system).
+
+  The NS*UsageDescription strings below are the permission notes
+  macOS shows the FIRST time the app asks to look at something.
+  Each one says what the access is for, in plain English, and each
+  matches a source the user turns on themselves in Settings —
+  nothing here is asked for until its switch is flipped. Only the
+  permissions the shipped features actually use are listed; there
+  is deliberately no microphone or camera string, because no
+  feature uses them.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>__APP_NAME__</string>
+	<key>CFBundleDisplayName</key>
+	<string>__APP_NAME__</string>
+	<key>CFBundleIdentifier</key>
+	<string>__BUNDLE_ID__</string>
+	<key>CFBundleExecutable</key>
+	<string>__APP_NAME__</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>__APP_VERSION__</string>
+	<key>CFBundleVersion</key>
+	<string>__APP_VERSION__</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>__MIN_SYSTEM__</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+
+	<key>NSCalendarsUsageDescription</key>
+	<string>LocalLLM looks at your calendar only when you turn on the Calendar switch in Settings, so chats can answer questions like “What’s on my Thursday?” Nothing is read until you allow it, and every lookup is shown in the app’s activity log.</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>LocalLLM looks at your calendar only when you turn on the Calendar switch in Settings, so chats can answer questions like “What’s on my Thursday?” Nothing is read until you allow it, and every lookup is shown in the app’s activity log.</string>
+	<key>NSRemindersUsageDescription</key>
+	<string>LocalLLM looks at your reminders only when you turn on the Reminders switch in Settings, so chats can tell you what’s still on your list. Nothing is read until you allow it, and every lookup is shown in the app’s activity log.</string>
+	<key>NSRemindersFullAccessUsageDescription</key>
+	<string>LocalLLM looks at your reminders only when you turn on the Reminders switch in Settings, so chats can tell you what’s still on your list. Nothing is read until you allow it, and every lookup is shown in the app’s activity log.</string>
+	<key>NSContactsUsageDescription</key>
+	<string>LocalLLM looks up a contact only when you turn on the Contacts switch in Settings and a chat needs a phone number or email you asked for. Nothing is read until you allow it, and every lookup is shown in the app’s activity log.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>LocalLLM looks at your photo library only when you turn on the Photos switch in Settings — to list recent photos, read the text in one, or make a smaller copy when you approve it. Your photos are never changed; resized copies are new files. Every lookup is shown in the app’s activity log.</string>
+	<key>NSAppleMusicUsageDescription</key>
+	<string>LocalLLM searches your music library only when you turn on the Music switch in Settings, so chats can find a song by title, artist, or album. Nothing is read until you allow it, and every lookup is shown in the app’s activity log.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>LocalLLM asks Finder which files you have selected, only while the Shared folders switch is on, so the quick panel (⌘⇧Space) can act on “this file”. Nothing is sent anywhere — the selection is only shown to the model answering you.</string>
+</dict>
+</plist>

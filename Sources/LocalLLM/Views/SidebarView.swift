@@ -2,6 +2,9 @@ import SwiftUI
 import SwiftData
 
 /// The conversation list: newest first, with new / rename / delete.
+/// Phase 10 adds the search field (title + message text, with a
+/// matching snippet under the title) and Markdown export in the
+/// context menu.
 struct SidebarView: View {
     @Environment(\.modelContext) private var modelContext
     @Query(sort: \Conversation.updatedAt, order: .reverse)
@@ -9,20 +12,56 @@ struct SidebarView: View {
 
     @Binding var selection: Conversation?
     let engine: ChatEngine
+    /// Phase 10: the default model for new chats comes from here.
+    let settings: AppSettings
 
     @State private var renameTarget: Conversation?
     @State private var renameText = ""
     @State private var deleteTarget: Conversation?
+    @State private var searchText = ""
+
+    /// The trimmed search text; empty means "not searching".
+    private var query: String { ChatSearch.normalizedQuery(searchText) }
+
+    /// The chats to show: every chat when not searching, otherwise
+    /// only the ones that match (the match proof is recomputed per
+    /// row by `hit(for:)` — cheap at sidebar scale).
+    private var visibleConversations: [Conversation] {
+        guard !query.isEmpty else { return conversations }
+        return conversations.filter { hit(for: $0) != nil }
+    }
+
+    /// This chat's search hit under the current query (nil when not
+    /// searching or not matching).
+    private func hit(for conversation: Conversation) -> ChatSearchHit? {
+        guard !query.isEmpty else { return nil }
+        return ChatSearch.hit(
+            title: conversation.title,
+            messageTexts: conversation.sortedMessages.map(\.text),
+            query: query)
+    }
 
     var body: some View {
         List(selection: $selection) {
-            ForEach(conversations) { conversation in
+            if !query.isEmpty, visibleConversations.isEmpty {
+                Text("No chats match \u{201C}\(query)\u{201D}.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(visibleConversations) { conversation in
                 VStack(alignment: .leading, spacing: 2) {
                     Text(conversation.title)
                         .lineLimit(1)
-                    Text(conversation.updatedAt.formatted(date: .abbreviated, time: .shortened))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    if let snippet = hit(for: conversation)?.snippet {
+                        Text(snippet)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    } else {
+                        Text(conversation.updatedAt.formatted(date: .abbreviated, time: .shortened))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 .tag(conversation)
                 .contextMenu {
@@ -30,6 +69,13 @@ struct SidebarView: View {
                         renameText = conversation.title
                         renameTarget = conversation
                     }
+                    Button("Export as Markdown…") {
+                        ConversationExporter.exportToFile(conversation)
+                    }
+                    Button("Copy as Markdown") {
+                        ConversationExporter.copyToPasteboard(conversation)
+                    }
+                    Divider()
                     Button("Delete", role: .destructive) {
                         deleteTarget = conversation
                     }
@@ -37,6 +83,8 @@ struct SidebarView: View {
             }
         }
         .listStyle(.sidebar)
+        .searchable(text: $searchText, placement: .sidebar,
+                    prompt: "Search chats")
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button(action: newChat) {
@@ -92,6 +140,11 @@ struct SidebarView: View {
 
     private func newChat() {
         let conversation = Conversation()
+        // Phase 10: new chats start on the user's default model
+        // (Auto unless they picked a specific one in Settings).
+        // `Conversation()` itself defaults to Auto; the setting is
+        // applied here, at the one place a user starts a chat.
+        conversation.modelSelection = settings.defaultModelSelection
         modelContext.insert(conversation)
         try? modelContext.save()
         selection = conversation

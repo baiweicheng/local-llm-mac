@@ -76,6 +76,9 @@ struct ChatView: View {
     @State private var showingSettings = false
     @State private var showingCompare = false
     @State private var showingFileImporter = false
+    /// Phase 10: the "save these instructions as a set" draft name
+    /// in the instructions sheet.
+    @State private var presetNameDraft = ""
     /// Images staged in the composer, waiting to go with the next send.
     @State private var pendingAttachments: [ImageAttachment] = []
     /// Re-read on appear and after each send; the system state can change
@@ -147,7 +150,8 @@ struct ChatView: View {
                          permissionCenter: permissionCenter,
                          openRouterKeyStore: openRouterKeyStore,
                          mcpServerStore: mcpServerStore,
-                         mcpManager: mcpManager)
+                         mcpManager: mcpManager,
+                         mlxStore: mlxStore, endpointStore: endpointStore)
         }
         .sheet(isPresented: $showingCompare) {
             CompareView(descriptors: descriptors,
@@ -198,6 +202,20 @@ struct ChatView: View {
             }
             .buttonStyle(.borderless)
             .help("Compare two models on one prompt, side by side")
+            Menu {
+                Button("Export as Markdown…") {
+                    ConversationExporter.exportToFile(conversation)
+                }
+                Button("Copy as Markdown") {
+                    ConversationExporter.copyToPasteboard(conversation)
+                }
+            } label: {
+                Image(systemName: "square.and.arrow.up")
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Export this chat as a Markdown file, or copy it as Markdown")
             Button {
                 showingInstructions = true
             } label: {
@@ -211,7 +229,7 @@ struct ChatView: View {
                 Image(systemName: "gearshape")
             }
             .buttonStyle(.borderless)
-            .help("Settings (privacy, what this app can see)")
+            .help("Settings (general, privacy, what this app can see)")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
@@ -793,6 +811,28 @@ struct ChatView: View {
                             in: RoundedRectangle(cornerRadius: 8))
                 .overlay(RoundedRectangle(cornerRadius: 8)
                     .strokeBorder(Color.secondary.opacity(0.3)))
+            // Phase 10: the instructions library — apply a saved
+            // set (its text is copied in; the chat keeps its own
+            // copy), or save this chat's instructions as a set.
+            if !settings.instructionPresets.isEmpty {
+                Menu("Use a saved instruction set…") {
+                    ForEach(settings.instructionPresets) { preset in
+                        Button(preset.name) {
+                            conversation.systemInstructions = preset.text
+                        }
+                    }
+                }
+                .fixedSize()
+            }
+            HStack(spacing: 8) {
+                TextField("Name for these instructions", text: $presetNameDraft)
+                    .textFieldStyle(.roundedBorder)
+                Button("Save as Instruction Set") { savePresetDraft() }
+                    .disabled(!canSavePresetDraft)
+            }
+            Text("Saved sets live in Settings → Instructions library, where they can be edited or deleted.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             HStack {
                 Spacer()
                 Button("Done") { showingInstructions = false }
@@ -801,5 +841,18 @@ struct ChatView: View {
         }
         .padding(16)
         .frame(width: 440)
+    }
+
+    private var canSavePresetDraft: Bool {
+        InstructionPresetRules.canSave(
+            name: presetNameDraft,
+            text: conversation.systemInstructions,
+            existing: settings.instructionPresets)
+    }
+
+    private func savePresetDraft() {
+        settings.addInstructionPreset(
+            name: presetNameDraft, text: conversation.systemInstructions)
+        presetNameDraft = ""
     }
 }

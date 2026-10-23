@@ -16,7 +16,8 @@ import Photos
 ///
 /// A note on prompts: macOS shows permission dialogs based on the
 /// app's bundle usage-description strings. Those ship with the
-/// packaged app in Phase 10; when the app is run from Xcode during
+/// packaged app (Scripts/Info.plist, assembled by
+/// Scripts/make-app.sh); when the app is run from Xcode during
 /// development, macOS attributes the access to Xcode instead. Every
 /// request here is wrapped so a failure lands as a state the UI can
 /// explain, never a crash.

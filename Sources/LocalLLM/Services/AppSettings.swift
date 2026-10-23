@@ -14,12 +14,16 @@ import Foundation
 /// Same storage pattern as `EndpointStore`: plain UserDefaults keys,
 /// saved on every change.
 ///
-/// It also carries the one non-privacy setting that exists so far:
-/// the **KV-cache mode** for downloaded MLX models (see
-/// `KVCacheMode`) — how much memory a local model's conversation
-/// memory may use. It lives here, rather than in a second settings
-/// object, because this sheet is the app's settings surface until the
-/// Phase 10 settings window arrives.
+/// Alongside the privacy settings it carries the app's general
+/// settings as the phases added them: the KV-cache mode for
+/// downloaded MLX models (Phase 4, see `KVCacheMode`), the source
+/// toggles (Phase 5), the file-changes and power-tools switches
+/// (Phases 6 and 9), the quick-panel switch (Phase 7), the custom
+/// OpenRouter model id (Phase 8), and — completing the sheet in
+/// Phase 10 — the **default model for new chats** and the
+/// **instructions library** (`instructionPresets`). "Open at login"
+/// deliberately does NOT live here: its truth is the system's
+/// login-item state, read live by `LoginItemService`.
 @MainActor
 @Observable
 final class AppSettings {
@@ -91,6 +95,33 @@ final class AppSettings {
                               forKey: Self.openRouterCustomModelKey) }
     }
 
+    /// Phase 10: the model new chats start with, stored as a
+    /// `ModelSelection` storage key. Auto (the Phase 4 behavior)
+    /// unless the user picks a specific backend in Settings →
+    /// General. Only the sidebar's New Chat applies it: the quick
+    /// panel always starts on Auto (its design), and compare mode
+    /// seeds its winner explicitly. Existing chats keep theirs.
+    var defaultModelRaw: String {
+        didSet { defaults.set(defaultModelRaw,
+                              forKey: Self.defaultModelKey) }
+    }
+
+    /// The typed view of `defaultModelRaw`. Setting it persists
+    /// through the raw string's `didSet`. An unrecognized stored
+    /// value reads back as the built-in model — the same forgiving
+    /// codec every chat's selection uses.
+    var defaultModelSelection: ModelSelection {
+        get { ModelSelection(storageKey: defaultModelRaw) }
+        set { defaultModelRaw = newValue.storageKey }
+    }
+
+    /// Phase 10: the instructions library — named, reusable sets of
+    /// system instructions, managed in Settings and applied to a
+    /// chat from its instructions editor (applying copies the text
+    /// into the chat). Change via the add/update/remove methods so
+    /// the naming rules (`InstructionPresetRules`) hold everywhere.
+    private(set) var instructionPresets: [InstructionPreset]
+
     private let defaults: UserDefaults
 
     private static let localOnlyKey = "LocalLLM.localOnly.v1"
@@ -101,6 +132,8 @@ final class AppSettings {
     private static let powerToolsKey = "LocalLLM.powerTools.v1"
     private static let hudEnabledKey = "LocalLLM.hudEnabled.v1"
     private static let openRouterCustomModelKey = "LocalLLM.openRouterCustomModel.v1"
+    private static let defaultModelKey = "LocalLLM.defaultModel.v1"
+    private static let instructionPresetsKey = "LocalLLM.instructionPresets.v1"
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -123,6 +156,57 @@ final class AppSettings {
         let storedSources = defaults.stringArray(forKey: Self.visibilitySourcesKey) ?? []
         self.enabledVisibilitySources = Set(
             storedSources.compactMap(VisibilitySource.init(rawValue:)))
+        self.defaultModelRaw = defaults.string(forKey: Self.defaultModelKey)
+            ?? ModelSelection.auto.storageKey
+        if let rawPresets = defaults.data(forKey: Self.instructionPresetsKey) {
+            self.instructionPresets = InstructionPresetCodec.decode(rawPresets)
+        } else {
+            self.instructionPresets = []
+        }
+    }
+
+    // MARK: - Instructions library (Phase 10)
+
+    /// Adds a preset. Returns the saved preset, or nil when the
+    /// naming rules refuse it (blank name or text, or another preset
+    /// already carries the name — ignoring case).
+    @discardableResult
+    func addInstructionPreset(name: String, text: String) -> InstructionPreset? {
+        guard InstructionPresetRules.canSave(
+                name: name, text: text, existing: instructionPresets)
+        else { return nil }
+        let preset = InstructionPreset(
+            name: InstructionPresetRules.cleanedName(name),
+            text: InstructionPresetRules.cleanedText(text))
+        instructionPresets.append(preset)
+        persistPresets()
+        return preset
+    }
+
+    /// Replaces a preset's name and text. False when the id is
+    /// unknown or the naming rules refuse the edit.
+    @discardableResult
+    func updateInstructionPreset(id: UUID, name: String, text: String) -> Bool {
+        guard let index = instructionPresets.firstIndex(where: { $0.id == id }),
+              InstructionPresetRules.canSave(
+                name: name, text: text, existing: instructionPresets,
+                excludingID: id)
+        else { return false }
+        instructionPresets[index].name = InstructionPresetRules.cleanedName(name)
+        instructionPresets[index].text = InstructionPresetRules.cleanedText(text)
+        persistPresets()
+        return true
+    }
+
+    func removeInstructionPreset(id: UUID) {
+        instructionPresets.removeAll { $0.id == id }
+        persistPresets()
+    }
+
+    private func persistPresets() {
+        if let data = InstructionPresetCodec.encode(instructionPresets) {
+            defaults.set(data, forKey: Self.instructionPresetsKey)
+        }
     }
 
     // MARK: - Visibility sources (Phase 5)

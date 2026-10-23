@@ -3,8 +3,8 @@ import Foundation
 /// How much context a model backend can hold, and how this app divides
 /// that room up.
 ///
-/// Every backend (the built-in on-device model today; Private Cloud
-/// Compute, local MLX models, and OpenRouter in later phases) gets one of
+/// Every backend (the built-in on-device model, Private Cloud
+/// Compute, local MLX models, local servers, and OpenRouter) gets one of
 /// these budgets. All of Phase 2's context math — when to compact, how
 /// much room to leave for a reply, how long a summary may be — reads from
 /// here, so a new backend only needs a new row in ``table`` and nothing

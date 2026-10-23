@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+#
+# make-app.sh — build LocalLLM.app, a double-clickable app bundle,
+# from this Swift Package.
+#
+# Run it from Terminal, in this folder (or anywhere — it finds the
+# package root itself):
+#
+#     bash Scripts/make-app.sh
+#
+# (No chmod needed when you run it through `bash` like that.)
+#
+# What it does:
+#   1. Builds the package in release mode (swift build -c release).
+#   2. Assembles the .app: the executable, an Info.plist generated
+#      from Scripts/Info.plist (including all the permission notes
+#      macOS shows), and the app icon — decoded from
+#      Resources/AppIcon-1024.png.b64 and turned into a proper
+#      .icns with the standard macOS sizes.
+#   3. Copies along any resource bundles the build produced (the
+#      MLX runtime looks for its Metal library in one), best effort.
+#   4. Code-signs the bundle: with your Apple Development /
+#      Developer ID identity if you have one, otherwise ad-hoc.
+#      Ad-hoc is fine for running on your own Mac — the first time
+#      you open the app, Gatekeeper will ask you to right-click it
+#      and choose Open (see the README).
+#
+# The finished app lands in  .build-app/LocalLLM.app  — drag it
+# into your Applications folder.
+
+set -euo pipefail
+
+# ----------------------------------------------------------------
+# Rename-me variables. When the app gets its real name, change
+# APP_NAME here (and, if you like, BUNDLE_ID) and re-run the
+# script — nothing else needs to change.
+APP_NAME="LocalLLM"
+BUNDLE_ID="com.baiweicheng.localllm"
+APP_VERSION="1.0"
+MIN_SYSTEM="27.0"
+# ----------------------------------------------------------------
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$ROOT"
+
+OUT_DIR="$ROOT/.build-app"
+APP_DIR="$OUT_DIR/$APP_NAME.app"
+CONTENTS="$APP_DIR/Contents"
+
+echo "==> Building $APP_NAME in release mode…"
+swift build -c release
+BIN_DIR="$(swift build -c release --show-bin-path)"
+BIN_PATH="$BIN_DIR/$APP_NAME"
+if [ ! -x "$BIN_PATH" ]; then
+    echo "!! Build finished but no executable at $BIN_PATH" >&2
+    exit 1
+fi
+
+echo "==> Assembling $APP_DIR"
+rm -rf "$APP_DIR"
+mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
+cp "$BIN_PATH" "$CONTENTS/MacOS/$APP_NAME"
+echo -n "APPL????" > "$CONTENTS/PkgInfo"
+
+echo "==> Writing Info.plist (name: $APP_NAME, id: $BUNDLE_ID)"
+sed -e "s/__APP_NAME__/$APP_NAME/g" \
+    -e "s/__BUNDLE_ID__/$BUNDLE_ID/g" \
+    -e "s/__APP_VERSION__/$APP_VERSION/g" \
+    -e "s/__MIN_SYSTEM__/$MIN_SYSTEM/g" \
+    "$SCRIPT_DIR/Info.plist" > "$CONTENTS/Info.plist"
+plutil -lint "$CONTENTS/Info.plist"
+
+echo "==> Building the app icon"
+ICON_WORK="$OUT_DIR/icon-work"
+rm -rf "$ICON_WORK"
+mkdir -p "$ICON_WORK/AppIcon.iconset"
+MASTER="$ICON_WORK/AppIcon-1024.png"
+# BSD base64 (macOS) spells decode -D; GNU base64 spells it -d.
+# Try the macOS spelling first, fall back to the GNU one.
+if ! base64 -D -i "$ROOT/Resources/AppIcon-1024.png.b64" -o "$MASTER" 2>/dev/null; then
+    base64 --decode "$ROOT/Resources/AppIcon-1024.png.b64" > "$MASTER"
+fi
+for size in 16 32 128 256 512; do
+    sips -z "$size" "$size" "$MASTER" \
+        --out "$ICON_WORK/AppIcon.iconset/icon_${size}x${size}.png" >/dev/null
+    double=$((size * 2))
+    sips -z "$double" "$double" "$MASTER" \
+        --out "$ICON_WORK/AppIcon.iconset/icon_${size}x${size}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICON_WORK/AppIcon.iconset" \
+    -o "$CONTENTS/Resources/AppIcon.icns"
+
+# Some dependencies (the MLX runtime among them) ship resource
+# bundles next to the executable and look for them beside the app.
+# Copy whatever the build produced into the bundle's Resources —
+# best effort: absence is normal for most packages.
+found_bundle=0
+for bundle in "$BIN_DIR"/*.bundle; do
+    [ -e "$bundle" ] || continue
+    cp -R "$bundle" "$CONTENTS/Resources/"
+    found_bundle=1
+done
+if [ "$found_bundle" = "1" ]; then
+    echo "==> Copied dependency resource bundles into the app"
+fi
+
+echo "==> Signing"
+IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+    | grep -E 'Apple Development|Developer ID Application' \
+    | head -n 1 \
+    | sed -E 's/.*\"([^\"]+)\".*/\1/' || true)"
+if [ -n "${IDENTITY:-}" ]; then
+    echo "    Using identity: $IDENTITY"
+    codesign --force --options runtime --sign "$IDENTITY" "$APP_DIR"
+else
+    echo "    No Apple signing identity found — signing ad-hoc."
+    echo "    (First launch: right-click the app and choose Open.)"
+    codesign --force --sign - "$APP_DIR"
+fi
+codesign --verify --verbose=2 "$APP_DIR" || \
+    echo "!! codesign verify reported problems (see above); the app may still run."
+
+echo ""
+echo "Done: $APP_DIR"
+echo "Drag it into your Applications folder, then double-click it."
+echo "First launch of an ad-hoc signed app: right-click → Open → Open."

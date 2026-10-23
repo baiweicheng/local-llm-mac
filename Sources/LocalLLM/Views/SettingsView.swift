@@ -2,14 +2,13 @@ import AppKit
 import SwiftData
 import SwiftUI
 
-/// Privacy settings (Phase 4): the Local Only lock and the custom
-/// terms for the privacy check — plus, below them, the one
-/// performance setting that exists so far: how much memory a
-/// downloaded MLX model's conversation memory may use. Opened from
-/// the gear button in the chat header. (General app settings —
-/// default model, instructions library — arrive with the Phase 10
-/// polish pass; this sheet is the privacy page of that future
-/// settings window.)
+/// The app's Settings sheet, opened from the gear button in the
+/// chat header. It began in Phase 4 as the privacy page (the Local
+/// Only lock and the custom terms for the privacy check) and grew a
+/// section per phase; Phase 10 completes it with the two general
+/// sections on top — **General** (the default model for new chats,
+/// open at login) and the **Instructions library** — so everything
+/// the app can be told lives in this one sheet.
 ///
 /// Phase 5 adds the visibility panel — "What this app can see": one
 /// toggle per source, its permission state with plain-English
@@ -32,6 +31,13 @@ import SwiftUI
 /// it, and the MCP server list (add/remove/enable, per-server
 /// status, retry) — servers are configured here; starting them
 /// happens lazily, from chats.
+///
+/// Phase 10 adds "General" (default model for new chats — the same
+/// backend registry the chat header's picker uses, supplied by the
+/// two model stores passed in here — and open at login, whose state
+/// is read live from the system via `LoginItemService`) and the
+/// "Instructions library" (named instruction sets, applied to chats
+/// from their instructions editor).
 struct SettingsView: View {
     @Bindable var settings: AppSettings
     let fileScopeStore: FileScopeStore
@@ -39,6 +45,10 @@ struct SettingsView: View {
     let openRouterKeyStore: OpenRouterKeyStore
     let mcpServerStore: MCPServerStore
     let mcpManager: MCPServerManager
+    /// Phase 10: the model stores the default-model picker reads,
+    /// so its rows are exactly the chat picker's rows.
+    let mlxStore: MLXModelStore
+    let endpointStore: EndpointStore
     @Environment(\.dismiss) private var dismiss
     @Environment(\.modelContext) private var modelContext
 
@@ -56,11 +66,21 @@ struct SettingsView: View {
     @State private var mcpName = ""
     @State private var mcpCommand = ""
     @State private var mcpArguments = ""
+    /// Phase 10: the instructions-library form's drafts, and which
+    /// preset (if any) is loaded into it for editing.
+    @State private var presetName = ""
+    @State private var presetText = ""
+    @State private var editingPresetID: UUID?
+    /// Phase 10: the login item's state, read live from the system
+    /// (never stored — see `LoginItemService`), plus the last
+    /// change's error, if any.
+    @State private var loginItemState: LoginItemState = .disabled
+    @State private var loginItemError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text("Privacy")
+                Text("Settings")
                     .font(.title3)
                     .fontWeight(.semibold)
                 Spacer()
@@ -71,6 +91,10 @@ struct SettingsView: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 22) {
+                    generalSection
+                    Divider()
+                    instructionsLibrarySection
+                    Divider()
                     localOnlySection
                     Divider()
                     redactionSection
@@ -94,7 +118,181 @@ struct SettingsView: View {
             }
         }
         .frame(width: 520, height: 620)
-        .task { permissionCenter.refresh() }
+        .task {
+            permissionCenter.refresh()
+            loginItemState = LoginItemService.state
+        }
+    }
+
+    // MARK: - General (Phase 10)
+
+    /// The backend rows for the default-model picker — the same
+    /// registry the chat header's picker uses, so the two can never
+    /// disagree about what exists.
+    private var descriptors: [BackendDescriptor] {
+        BackendRegistry.descriptors(
+            downloadedMLX: mlxStore.downloadedModels,
+            endpoints: endpointStore.configs,
+            onDeviceReady: ModelAvailabilityState.current.canChat,
+            cloud: CloudPickerInputs(
+                pccReady: PCCAvailabilityReader.isReady,
+                openRouterKeyPresent: openRouterKeyStore.hasKey,
+                customOpenRouterModelID: settings.openRouterCustomModelID))
+    }
+
+    private var generalSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("General")
+                .font(.headline)
+            Text("Default model for new chats")
+                .font(.subheadline)
+                .fontWeight(.medium)
+            Picker("Default model for new chats", selection: Binding(
+                get: { settings.defaultModelSelection },
+                set: { settings.defaultModelSelection = $0 }
+            )) {
+                ForEach(descriptors) { descriptor in
+                    Text(descriptor.displayName).tag(descriptor.selection)
+                }
+            }
+            .labelsHidden()
+            .fixedSize()
+            Text("New chats started from the sidebar begin with this model; chats you already have keep the model they were using, and each chat's picker can still override it. The quick panel always starts on Auto. Auto means the app picks per message — quick things on the built-in model, hard work on a bigger local or cloud model.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if !descriptors.contains(where: {
+                $0.selection == settings.defaultModelSelection }) {
+                Text("The saved default isn't in the list right now — the model it points at was removed. New chats will say so in the header and let you pick another.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Divider()
+                .padding(.vertical, 2)
+            Toggle(isOn: Binding(
+                get: { loginItemState.isOn },
+                set: { newValue in
+                    loginItemError = LoginItemService.setEnabled(newValue)
+                    loginItemState = LoginItemService.state
+                }
+            )) {
+                Text("Open at login")
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+            }
+            .disabled(loginItemState == .unavailable)
+            Text(loginItemState.explanation)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let loginItemError {
+                Text(loginItemError)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    // MARK: - Instructions library (Phase 10)
+
+    private var instructionsLibrarySection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Instructions library")
+                .font(.headline)
+            Text("Named sets of system instructions you can reuse across chats. Apply one from a chat's instructions editor (the quote button in its header) — the chat gets its own copy, so editing or deleting a set here never changes a chat that's already using it.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if settings.instructionPresets.isEmpty {
+                Text("No instruction sets saved yet.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(settings.instructionPresets) { preset in
+                    HStack(alignment: .top, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(preset.name)
+                                .font(.subheadline)
+                                .fontWeight(.medium)
+                            Text(preset.text)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+                        Spacer()
+                        Button("Edit") { loadPresetIntoForm(preset) }
+                            .font(.callout)
+                        Button(role: .destructive) {
+                            if editingPresetID == preset.id {
+                                clearPresetForm()
+                            }
+                            settings.removeInstructionPreset(id: preset.id)
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Delete \u{201C}\(preset.name)\u{201D}")
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+            Divider()
+                .padding(.vertical, 2)
+            Text(editingPresetID == nil ? "Add an instruction set"
+                                        : "Edit instruction set")
+                .font(.subheadline)
+                .fontWeight(.medium)
+            TextField("Name (e.g. Beginner mode)", text: $presetName)
+                .textFieldStyle(.roundedBorder)
+            TextEditor(text: $presetText)
+                .font(.body)
+                .frame(minHeight: 64, maxHeight: 110)
+                .padding(4)
+                .background(Color(nsColor: .textBackgroundColor),
+                            in: RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(Color.secondary.opacity(0.3)))
+            HStack(spacing: 8) {
+                Button(editingPresetID == nil ? "Add Instruction Set"
+                                              : "Save Changes") {
+                    savePresetForm()
+                }
+                .disabled(!InstructionPresetRules.canSave(
+                    name: presetName, text: presetText,
+                    existing: settings.instructionPresets,
+                    excludingID: editingPresetID))
+                if editingPresetID != nil {
+                    Button("Cancel Editing") { clearPresetForm() }
+                }
+                Spacer()
+            }
+        }
+    }
+
+    private func loadPresetIntoForm(_ preset: InstructionPreset) {
+        editingPresetID = preset.id
+        presetName = preset.name
+        presetText = preset.text
+    }
+
+    private func savePresetForm() {
+        if let id = editingPresetID {
+            if settings.updateInstructionPreset(
+                id: id, name: presetName, text: presetText) {
+                clearPresetForm()
+            }
+        } else if settings.addInstructionPreset(
+            name: presetName, text: presetText) != nil {
+            clearPresetForm()
+        }
+    }
+
+    private func clearPresetForm() {
+        editingPresetID = nil
+        presetName = ""
+        presetText = ""
     }
 
     // MARK: - Local Only

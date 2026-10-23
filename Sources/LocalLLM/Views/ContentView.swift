@@ -40,6 +40,11 @@ import SwiftData
 /// signature), the tools provider a session build fetches (the one
 /// moment servers launch), and the executor an approved MCP plan
 /// item runs through.
+///
+/// Phase 10: the same `settings` object now also carries the
+/// default model for new chats and the instructions library; the
+/// sidebar reads the default when it creates a chat, and the
+/// Settings sheet it opens manages both.
 struct ContentView: View {
     @State private var engine = ChatEngine()
     @State private var mlxStore = MLXModelStore()
@@ -70,7 +75,8 @@ struct ContentView: View {
 
     var body: some View {
         NavigationSplitView {
-            SidebarView(selection: $selection, engine: engine)
+            SidebarView(selection: $selection, engine: engine,
+                        settings: settings)
                 .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 340)
         } detail: {
             if let conversation = selection {

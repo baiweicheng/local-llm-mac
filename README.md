@@ -1,22 +1,32 @@
 # LocalLLM (working name)
 
-A chat app for your Mac that runs **entirely on the Mac itself** — no
-account, no API key, no internet needed for chatting. It uses the on-device
-AI model built into macOS (Apple Intelligence) through Apple's Foundation
-Models framework, wrapped in a familiar chat interface: conversation list
-on the left, chat on the right.
+A chat app for your Mac that is **local first**: it chats with the AI
+model built into macOS (Apple Intelligence), with bigger models you
+download to the Mac, and — only when you choose — with Apple's Private
+Cloud or frontier cloud models through OpenRouter. Its real difference
+from the cloud chat apps is that it **lives on your Mac**: with your
+permission it can look things up across your files, calendar, photos,
+contacts, and music to answer you, and it can *propose* changes —
+renaming files, resizing a photo, even running a command — that only
+ever happen when you approve them.
+
+Two front doors, one engine: the main chat window, and a quick panel
+you summon from any app with **⌘⇧Space**.
 
 The real app name comes later; "LocalLLM" is just the placeholder.
 
 ## What you need
 
 - A Mac with Apple Silicon running **macOS 27**
-- **Xcode 27**
+- **Xcode 27** (to build it — there's no prebuilt download)
 - **Apple Intelligence turned on** (System Settings → Apple Intelligence &
   Siri). The app checks for this and explains, in plain English, if
   something isn't ready — e.g. the model is still downloading.
+- Optional, only if you want them: an **OpenRouter API key** for the
+  frontier cloud models (Phase 8), and disk space for downloaded models
+  (the recommended one is ≈6.5 GB).
 
-## How to run it
+## Start here — run it from Xcode
 
 1. Get this folder onto your Mac (clone the repo, or pull the latest
    version if you already have it).
@@ -29,7 +39,89 @@ The real app name comes later; "LocalLLM" is just the placeholder.
    chat and type away.
 
 First compile happens entirely on your Mac — expect the first build to
-take a minute or two.
+take a few minutes.
+
+## The double-clickable app
+
+Running from Xcode is fine day to day, but macOS only gives the full
+treatment — permission prompts in the app's own name, opening at
+login — to a real app bundle. There's a script that builds one:
+
+1. In Terminal, in this folder, run:  `bash Scripts/make-app.sh`
+   (Running it through `bash` like that means no `chmod` is needed;
+   the script is not marked executable in the repo, on purpose.)
+2. The script builds the app in release mode, assembles
+   **`.build-app/LocalLLM.app`** — executable, permission notes
+   (Info.plist), and icon — and signs it: with your Apple Development
+   or Developer ID identity if you have one, otherwise ad-hoc.
+3. Drag the `.app` into your **Applications** folder.
+4. First launch of an ad-hoc signed app: **right-click → Open → Open**
+   (Gatekeeper asks once because the app wasn't signed with an Apple
+   identity; after that it opens with a normal double-click).
+
+The app's name and bundle id are single variables at the top of
+`Scripts/make-app.sh` — when the app gets its real name, changing
+them there (and re-running the script) is the whole rename.
+
+## First-run walkthrough
+
+1. **Just chat.** ⌘N starts a chat on **Auto**: quick questions go to
+   the built-in model, harder ones to a bigger model when there is
+   one. The note under the header always says which model answered,
+   and the pill under each reply shows the model, the time, and the
+   cost ($0.00 for anything local).
+2. **Try the quick panel.** Press **⌘⇧Space** in any app: a floating
+   panel starts a chat right there (its chats land in the sidebar,
+   titled "Quick — …"). Esc dismisses it; ⌘Return moves the chat
+   into the main window.
+3. **Download a bigger local brain.** Header → chip/CPU button →
+   **Manage Models…** → **Download** next to **Gemma 4 12B** (the
+   recommended default, ≈6.5 GB). It then appears in every chat's
+   model picker. See Phase 3 below.
+4. **Let it see something.** Gear button → **What this app can see**:
+   each source (files, calendar, photos…) has its own switch, all off
+   by default. Flip one and macOS asks for that permission — the
+   panel shows the state and where to fix a "no". Add a **shared
+   folder** under the Files switch: file reading (and, later,
+   changing) only ever happens inside folders you pick there. Every
+   lookup is logged — gear → **Recent activity** — and shown as a
+   card in the chat.
+5. **(Optional) Add the cloud.** Gear → **Cloud models** → paste your
+   **OpenRouter key** (it's stored in your Mac's Keychain, nowhere
+   else) and the frontier models light up in the picker and in Auto.
+   Apple Private Cloud needs no key at all. Everything sent to a
+   cloud model passes the privacy check first (gear → **Privacy
+   check**), and cloud chats wear a **Cloud** badge.
+6. **(Optional) Let it act.** Gear → **File changes** lets the model
+   *propose* renames, moves, edits, and photo resizes — nothing
+   happens until you press **Approve** on the list in the chat, and
+   approved changes can be undone from their card. Gear → **Power
+   tools** (off by default, the riskiest switch) extends the same
+   propose-and-approve list to shell commands in your shared folders
+   and to your own local MCP servers.
+7. **Make it yours.** Gear → **General**: pick the default model new
+   chats start with, and **Open at login** (works from the packaged
+   app in Applications, so the quick panel is always ready). Gear →
+   **Instructions library**: save named instruction sets ("Beginner
+   mode", "Be brief") and apply one to any chat from its quote-button
+   editor. In the sidebar, the **search field** finds chats by title
+   or by anything said in them; right-click a chat to **export it as
+   Markdown**.
+
+## Privacy in one paragraph
+
+Local is the default and the design: the built-in and downloaded
+models never send anything anywhere; lookups happen on the Mac and
+are logged where you can see them; sources are off until you turn
+them on, one by one. The only ways words leave the Mac are a cloud
+chat (badged, costed, and scrubbed by the privacy check first —
+secrets, emails, card numbers, and your own custom terms are hidden
+before sending) and a server you added yourself whose address isn't
+this Mac (scrubbed the same way; `localhost` servers count as local).
+**Local Only** (gear → top switch) refuses every off-Mac destination
+outright. Your OpenRouter key lives only in the macOS Keychain.
+Conversations are stored on this Mac with SwiftData and exported
+only when you ask.
 
 ## What's in Phase 1
 
@@ -145,7 +237,9 @@ could ever leave this Mac.
   local server, if no model is downloaded), and a cloud-worthy
   question gets the best local stand-in available **plus a plain note
   that cloud models arrive in a later phase** — the app never pretends
-  a cloud call happened. A quiet line under the chat header says what
+  a cloud call happened. (Phase 8, below, made the cloud route real;
+  the stand-in now only appears when no cloud route is available, and
+  its note says what would unlock one.) A quiet line under the chat header says what
   Auto decided and why ("Auto: a quick edit or question — Apple
   On-Device handles those instantly and privately."). If the sorting
   step ever fails or takes too long, the message just goes to the
@@ -226,11 +320,11 @@ arithmetic) and the current date & time.
 also need macOS's permission. The app asks when you first flip the
 switch; if you said no (or want to change your mind), the switch row
 shows the state and the exact place to fix it (System Settings →
-Privacy & Security). One wrinkle: macOS shows those prompts based on
-the packaged app's permission notes, which arrive with the Phase 10
-app bundle — when you run from Xcode in the meantime, macOS
-attributes access to Xcode, and the panel will tell you if a grant
-isn't landing.
+Privacy & Security). One wrinkle: macOS phrases those prompts from
+the packaged app's permission notes, which ship in the app bundle
+built by `Scripts/make-app.sh` (see "The double-clickable app" at
+the top) — when you run from Xcode instead, macOS attributes access
+to Xcode, and the panel will tell you if a grant isn't landing.
 
 **The access log.** Every lookup is recorded — when, which tool, what
 it asked, a one-line summary of what it found — and shown two ways:
@@ -536,13 +630,88 @@ gets a placeholder line instead).
 To try it: turn on **Power tools** in Settings, share a folder if
 you haven't, and ask the model to run `git status` in it.
 
+## What's new in Phase 10
+
+The polish-and-ship pass: the settings are finished, chats are
+searchable and exportable, and there's a script that turns the
+project into a double-clickable app.
+
+**Settings, completed.** The gear sheet is now titled **Settings**
+and opens with the two sections that were missing:
+
+- **General** — the **default model for new chats**: pick Auto
+  (still the recommended default) or any specific backend, from the
+  same list the chat picker shows. New chats started from the
+  sidebar begin with it; existing chats keep their model, and the
+  quick panel always starts on Auto. Below it, **Open at login**:
+  the app registers itself as a login item so it's running — and
+  ⌘⇧Space is live — from the moment you log in. The switch reads
+  the system's real state every time (including "macOS wants you to
+  approve this in System Settings → General → Login Items"), and
+  it's only usable from the packaged app sitting in Applications —
+  the section says so when it can't apply.
+- **Instructions library** — named sets of system instructions,
+  saved once and reused: create and edit them here (or save a
+  chat's current instructions as a set from that chat's
+  quote-button editor), then apply one to any chat from the same
+  editor. Applying copies the text into the chat, so editing a set
+  later never rewrites a chat already using it.
+
+**Chat search.** The sidebar has a search field: type and the list
+narrows to chats whose **title or messages** contain the text
+(matching ignores case and accents — "cafe" finds "café"). A chat
+that matched inside its messages shows a one-line snippet of the
+first matching message under its title, match in context; clearing
+the field brings the full list back.
+
+**Conversation export.** Right-click a chat in the sidebar (or use
+the share button in an open chat's header) for **Export as
+Markdown…** — the standard save panel, pre-named after the chat —
+or **Copy as Markdown**. The file is a clean Markdown document:
+
+```markdown
+# Weekend Plans
+
+_Started Oct 23, 2026 at 2:15 PM · Last updated Oct 23, 2026 at 3:02 PM · Exported Oct 23, 2026 at 4:48 PM_
+
+## You — Oct 23, 2026 at 2:15 PM
+
+Hello there.
+
+_[2 images attached]_
+
+## Assistant — Oct 23, 2026 at 2:16 PM
+
+Hi! How can I help?
+
+_Apple On-Device · 1.2s · ≈96 tokens · $0.00_
+```
+
+One section per message, in order, with its date; the italic line
+under an assistant reply is the same telemetry pill the app shows.
+Images can't live in a text file, so an attached picture becomes an
+"_[N images attached]_" note — the pictures themselves stay in the
+app.
+
+**The app bundle.** `Scripts/make-app.sh` (see "The
+double-clickable app" at the top) assembles `LocalLLM.app` from
+`Scripts/Info.plist` — including every permission note macOS shows
+(Calendar, Reminders, Contacts, Photos, Music, and Finder access
+for the quick panel, each written in plain English; no microphone
+or camera note, because no feature uses them) — plus the app icon
+(a blue-to-violet rounded square with a white spark, stored in the
+repo as `Resources/AppIcon-1024.png.b64` and expanded into a proper
+`.icns` by the script), and signs the result with your Apple
+identity when there is one, ad-hoc otherwise.
+
 ## Good to know
 
 - The built-in model is small (~3 billion parameters). It's good at chat,
   summarizing, rewriting, and quick questions; Apple itself warns it's
   not the right tool for heavy math, coding, or factual deep-dives.
-  For harder work, switch the chat to a downloaded MLX model (Phase 3);
-  an optional cloud tier arrives in a later phase.
+  For harder work, switch the chat to a downloaded MLX model (Phase 3)
+  or a cloud model (Phase 8) — or leave the chat on Auto and let the
+  app route each message.
 - If you reopen an old chat after restarting the app, the model is
   re-seeded with the summary (if the chat was compacted) plus the recent
   messages, so the thread isn't lost.
@@ -561,15 +730,58 @@ you haven't, and ask the model to run `git status` in it.
   and when a summon continues the last panel chat instead of
   starting fresh), plus the power tools: which commands get
   flagged as dangerous, how command output is trimmed, MCP server
-  naming and settings, and the MCP wire format itself) and never
+  naming and settings, and the MCP wire format itself, plus the
+  polish pass: the instructions library's naming rules, the
+  default-model setting's persistence, chat search's matching and
+  snippets, and the exact Markdown the exporter produces) and never
   call the real model.
 
-## Where this is going
+## The finished app
 
-This is phase 9 of a larger build (see the project plan): the main
-window and the quick panel are both in place — two front doors over
-one engine — the cloud tier (Apple Private Cloud + OpenRouter) sits
-behind Phase 4's privacy check, so local stays the default and the
-cloud is a labeled, costed choice, and the power tools (shell + MCP)
-now sit behind the same propose-and-approve gate as everything
-that acts. What remains is the final polish pass.
+The ten-phase build is **complete**. What's here: a native chat app
+with two front doors (main window + ⌘⇧Space quick panel) over one
+engine; four kinds of models behind one picker — the built-in
+on-device model, downloaded MLX models (with a compressed memory
+option for long chats), your own local servers, and a cloud tier
+(Apple Private Cloud + OpenRouter) that is always labeled, always
+behind the privacy check, and always honest about cost; Auto
+routing that sorts each message to the right model; a local
+visibility layer (files, calendar, reminders, contacts, photos,
+music, clipboard, system info) behind per-source switches with a
+full activity log; file changes, shell commands, and MCP server
+calls behind one propose-and-approve list with undo where undo is
+possible; and the polish — a finished Settings sheet, chat search,
+Markdown export, and a script that packages it all into a
+double-clickable app.
+
+Known gaps, stated plainly (they're the seed list for any future
+version): what's playing in other apps can't be seen (no public
+API); the quick panel captures Finder selections but not Photos
+selections; MCP is local-stdio only (no hosted servers) and a
+server argument containing a space can't be typed yet; server and
+OpenRouter chats can't use the Mac lookups; and the app still
+carries its placeholder name — the real one is a two-minute change
+in `Scripts/make-app.sh` when it's chosen.
+
+## For developers
+
+This is a Swift Package (Swift 6 language mode, macOS 27) with no
+`.xcodeproj`: the app target is `Sources/LocalLLM` (pure logic in
+`Core/`, platform wrappers in `Services/`, SwiftUI in `Views/`),
+tests in `Tests/LocalLLMTests`. Nothing in the repo has been
+compiled off a Mac, so expect a first-compile fix list when Xcode
+27 first builds it — the risky surfaces were kept small and
+contained on purpose: the multimodal `Prompt`/`Attachment` path
+(`ChatEngine`), the @Generable symbols (`IntentClassifier`, the
+shared tool-arguments struct), the MLX bridge (`MLXBackend.swift` —
+the only file importing the MLX packages), the PCC backend
+(`PCCBackend.swift`), the Carbon hotkey trampoline and
+`NSAppleScript` walk (`HUDCoordinator`, `HUDContextCapture`), the
+Keychain calls (`KeychainStore`), the shell/MCP process plumbing
+(`ShellCommandService`, `MCPClient`), and `SMAppService`
+(`LoginItemService`). Package pins and fallbacks are noted where
+they live (start with `Package.swift`). One packaging caveat:
+`swift build` places dependency resource bundles next to the
+executable; `make-app.sh` copies any it finds into the app bundle —
+if a packaged MLX chat ever reports a missing Metal library, that's
+the step to check.

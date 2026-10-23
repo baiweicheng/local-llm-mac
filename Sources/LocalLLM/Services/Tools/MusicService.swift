@@ -36,7 +36,7 @@ enum MusicService {
             }
             return lines.joined(separator: "\n")
         } catch {
-            return "Music search couldn't run. macOS may require the packaged app (Phase 10) with its MusicKit entitlement before the library can be searched; the library itself wasn't changed."
+            return "Music search couldn't run. macOS may require the packaged app (built with Scripts/make-app.sh — see the README) with its MusicKit entitlement before the library can be searched; the library itself wasn't changed."
         }
     }
 

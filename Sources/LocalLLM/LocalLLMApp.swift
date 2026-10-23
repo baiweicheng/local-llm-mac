@@ -19,8 +19,10 @@ struct LocalLLMApp: App {
     /// The SwiftData store for conversations and messages. If the on-disk
     /// store ever fails to open (corrupt file, future schema change), fall
     /// back to an in-memory store so the app still launches and chats work
-    /// for the session — better than crashing on open. Phase 10 revisits
-    /// storage migrations properly.
+    /// for the session — better than crashing on open. Every schema change
+    /// across the ten phases was additive (new models, new optional
+    /// fields), which SwiftData migrates in place; this fallback is the
+    /// safety net if that ever stops being true.
     let container: ModelContainer = {
         do {
             return try ModelContainer(for: Conversation.self, Message.self,

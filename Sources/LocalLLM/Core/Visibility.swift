@@ -146,7 +146,7 @@ enum PermissionGuidance {
         case .restricted:
             return "This is restricted on this Mac (for example by a management profile), so the app can't look here."
         case .unavailable:
-            return "This isn't available to the app as it's currently built. (Permission prompts arrive with the packaged app in Phase 10; when run from Xcode, macOS attributes access to Xcode.)"
+            return "This isn't available to the app as it's currently built. (Permission prompts use the packaged app's permission notes — see \u{201C}The double-clickable app\u{201D} in the README; when run from Xcode, macOS attributes access to Xcode.)"
         }
     }
 }
