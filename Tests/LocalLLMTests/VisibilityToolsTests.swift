@@ -372,4 +372,135 @@ final class VisibilityToolsTests: XCTestCase {
         XCTAssertFalse(result.contains("Falcon"))
         XCTAssertTrue(result.contains("[redacted]"))
     }
+
+    // MARK: - Access-log summaries keep content out (audit S-11)
+
+    func testClipboardAndFileSummariesAreTypeOnly() {
+        // The query summary for write_clipboard was the first 40
+        // characters of the text being copied — verbatim content in
+        // the persisted log. Now it's a type-and-size line.
+        let secret = "hunter2-is-a-very-secret-password"
+        let writeSummary = ToolArguments(text: secret)
+            .summary(for: "write_clipboard")
+        XCTAssertEqual(writeSummary,
+                       "Clipboard text (\(secret.count) characters)")
+        XCTAssertFalse(writeSummary.contains("hunter2"))
+
+        // Result summaries for the content-bearing tools.
+        let clipResult = ToolResultText.summary(
+            of: secret, toolName: "read_clipboard")
+        XCTAssertEqual(clipResult,
+                       "Clipboard text (\(secret.count) characters)")
+        XCTAssertFalse(clipResult.contains("hunter2"))
+
+        let fileResult = ToolResultText.summary(
+            of: "Dear diary, today I…", toolName: "read_file")
+        XCTAssertTrue(fileResult.hasPrefix("File text ("))
+        XCTAssertFalse(fileResult.contains("diary"))
+
+        XCTAssertEqual(ToolResultText.summary(
+            of: "Copied to the clipboard (7 characters) — ready to paste anywhere.",
+            toolName: "write_clipboard"), "Text copied to the clipboard")
+
+        // Other tools keep the first-line summary they always had.
+        XCTAssertEqual(ToolResultText.summary(
+            of: "first\nsecond", toolName: "search_files"), "first")
+    }
+
+    func testRuntimeLogsClipboardResultAsTypeOnly() async {
+        // End to end through the runtime's event sink: the event
+        // that reaches the access log must not carry the clipboard's
+        // first line.
+        let box = EventBox()
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString("a copied secret line", forType: .string)
+        let runtime = makeRuntime(enabled: [.clipboard], box: box)
+        _ = await runtime.execute(toolName: "read_clipboard",
+                                  arguments: ToolArguments())
+        let events = await box.events
+        XCTAssertEqual(events.count, 1)
+        XCTAssertFalse(events.first?.resultSummary.contains("secret") ?? true)
+        XCTAssertTrue(events.first?.resultSummary
+            .hasPrefix("Clipboard text (") ?? false)
+    }
+
+    // MARK: - Plan-record retention (audit S-04)
+
+    func testActionPlanLogRotationMath() {
+        XCTAssertEqual(ActionPlanLogPolicy.maxRecords,
+                       AccessLogPolicy.maxRecords)
+        XCTAssertEqual(ActionPlanLogPolicy.excessCount(totalRecords: 0), 0)
+        XCTAssertEqual(ActionPlanLogPolicy.excessCount(
+            totalRecords: ActionPlanLogPolicy.maxRecords), 0)
+        XCTAssertEqual(ActionPlanLogPolicy.excessCount(
+            totalRecords: ActionPlanLogPolicy.maxRecords + 1), 1)
+        XCTAssertEqual(ActionPlanLogPolicy.excessCount(totalRecords: 1000),
+                       1000 - ActionPlanLogPolicy.maxRecords)
+    }
+
+    // MARK: - Local Only folds into availability (audit S-06)
+
+    func testLocalOnlyRemovesPowerToolsFromAvailability() {
+        let unlocked = ToolAvailability(
+            enabledSources: [], folderRootPaths: [], powerToolsEnabled: true)
+        let locked = ToolAvailability(
+            enabledSources: [], folderRootPaths: [], powerToolsEnabled: true,
+            localOnly: true)
+        XCTAssertTrue(unlocked.hasTools)
+        XCTAssertTrue(unlocked.effectivePowerToolsEnabled)
+        // Under the lock the power tools simply don't exist…
+        XCTAssertFalse(locked.effectivePowerToolsEnabled)
+        XCTAssertFalse(locked.hasTools)
+        // …and the signature changes, so live sessions retire.
+        XCTAssertNotEqual(unlocked.signature, locked.signature)
+
+        // Read tools are untouched by the lock.
+        let lockedReader = ToolAvailability(
+            enabledSources: [.files], folderRootPaths: ["/x"],
+            powerToolsEnabled: true, localOnly: true)
+        XCTAssertTrue(lockedReader.hasTools)
+    }
+
+    func testCatalogDropsPowerToolsUnderLocalOnly() {
+        let descriptors = ToolCatalog.descriptors(
+            enabledSources: [.files], powerToolsEnabled: true,
+            localOnly: true)
+        XCTAssertFalse(descriptors.contains { $0.name == "run_command" })
+        XCTAssertTrue(descriptors.allSatisfy { !$0.isPowerAction })
+        // The lock doesn't touch read tools.
+        XCTAssertTrue(descriptors.contains { $0.name == "read_file" })
+        // Power-only + lock = no tool set at all.
+        XCTAssertTrue(ToolCatalog.descriptors(
+            enabledSources: [], powerToolsEnabled: true,
+            localOnly: true).isEmpty)
+    }
+
+    // MARK: - Redaction terms in the session signature (audit S-13)
+
+    func testRedactionTermsHashIsDeterministicAndOrderFree() {
+        XCTAssertEqual(RedactionTermsHash.value(for: ["Falcon", "Acme"]),
+                       RedactionTermsHash.value(for: ["Acme", "Falcon"]))
+        XCTAssertEqual(RedactionTermsHash.value(for: ["  Falcon "]),
+                       RedactionTermsHash.value(for: ["Falcon"]))
+        XCTAssertEqual(RedactionTermsHash.value(for: []),
+                       RedactionTermsHash.value(for: ["", "   "]))
+        XCTAssertNotEqual(RedactionTermsHash.value(for: ["Falcon"]),
+                          RedactionTermsHash.value(for: ["Falcon", "Acme"]))
+        XCTAssertNotEqual(RedactionTermsHash.value(for: ["Falcon"]),
+                          RedactionTermsHash.value(for: ["falcon2"]))
+    }
+
+    func testAvailabilitySignatureChangesWhenTermsChange() {
+        let before = ToolAvailability(
+            enabledSources: [.calendar], folderRootPaths: [],
+            customRedactionTerms: ["Falcon"])
+        let after = ToolAvailability(
+            enabledSources: [.calendar], folderRootPaths: [],
+            customRedactionTerms: ["Falcon", "Acme"])
+        XCTAssertNotEqual(before.signature, after.signature)
+        XCTAssertEqual(before.signature, ToolAvailability(
+            enabledSources: [.calendar], folderRootPaths: [],
+            customRedactionTerms: ["Falcon"]).signature)
+    }
 }

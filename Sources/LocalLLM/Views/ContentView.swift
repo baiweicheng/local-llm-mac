@@ -124,11 +124,22 @@ struct ContentView: View {
                     folderRootPaths: fileScopeStore.rootPaths,
                     fileWritingEnabled: settings.fileWritingEnabled,
                     powerToolsEnabled: settings.powerToolsEnabled,
-                    mcpToolsSignature: mcpManager.toolSignature)
+                    mcpToolsSignature: mcpManager.toolSignature,
+                    // Audit S-06: the lock rides along, so power
+                    // tools vanish (and plan execution refuses them)
+                    // while it's on. Audit S-13: the redaction terms
+                    // ride along by hash (in the signature), so a
+                    // term added mid-conversation retires live
+                    // sessions and rebuilds their tool runtimes.
+                    localOnly: settings.localOnly,
+                    customRedactionTerms: settings.customRedactionTerms)
             }
             mcpManager.configure { mcpServerStore.configs }
             engine.configureMCPToolsProvider {
-                await mcpManager.availableTools()
+                // Audit S-06: under Local Only, discovery doesn't
+                // run at all — servers don't even launch.
+                guard !settings.localOnly else { return [] }
+                return await mcpManager.availableTools()
             }
             engine.configureMCPExecutorProvider { action in
                 await mcpManager.executeApprovedCall(action)

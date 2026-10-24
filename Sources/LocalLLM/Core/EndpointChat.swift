@@ -52,6 +52,25 @@ struct EndpointConfig: Codable, Equatable, Sendable, Identifiable {
         return bare == "localhost" || bare == "127.0.0.1" || bare == "::1"
     }
 
+    /// True when the address uses plaintext HTTP (no TLS).
+    var usesPlainHTTP: Bool {
+        URL(string: baseURL)?.scheme?.lowercased() == "http"
+    }
+
+    /// Audit S-09: the warning the server editor shows for the one
+    /// genuinely exposed combination — a server that isn't on this
+    /// Mac, reached over plaintext HTTP. Nil for local servers and
+    /// for HTTPS addresses (a remote HTTPS server is the user's
+    /// explicit choice, and the privacy check still runs first).
+    var remoteHTTPWarning: String? {
+        guard !isLocalhost, usesPlainHTTP else { return nil }
+        return "This server isn't on this Mac and its address uses "
+            + "http://, so anything sent to it travels without "
+            + "encryption — anyone along the network path could "
+            + "read it. Use an https:// address if the server "
+            + "supports one."
+    }
+
     /// Picker small print: "llama3.1 · localhost:11434".
     var pickerDetail: String {
         let model = modelName.trimmingCharacters(in: .whitespacesAndNewlines)

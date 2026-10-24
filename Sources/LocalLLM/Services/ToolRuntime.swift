@@ -66,6 +66,12 @@ actor ToolRuntime {
         /// stopped, a session built before a server was added — is
         /// answered plainly, never guessed at.
         var powerToolsEnabled: Bool = false
+        /// Audit S-06: the Local Only lock, snapshotted with the
+        /// rest. While it's on, power tools are neither offered nor
+        /// run here — defense in depth behind the catalog gate, so
+        /// even a session built before the lock flipped refuses a
+        /// power call instead of proposing one.
+        var localOnly: Bool = false
         var mcpTools: [MCPToolInfo] = []
         /// Phase 6: where validated proposals go — the engine's
         /// pending approval list for the conversation. Returns false
@@ -93,8 +99,9 @@ actor ToolRuntime {
         var result = ToolCatalog.descriptors(
             enabledSources: configuration.enabledSources,
             fileWritingEnabled: configuration.fileWritingEnabled,
-            powerToolsEnabled: configuration.powerToolsEnabled)
-        if configuration.powerToolsEnabled {
+            powerToolsEnabled: configuration.powerToolsEnabled,
+            localOnly: configuration.localOnly)
+        if configuration.powerToolsEnabled, !configuration.localOnly {
             result += configuration.mcpTools.map(\.descriptor)
         }
         return result
@@ -135,6 +142,11 @@ actor ToolRuntime {
             // toggle is off, but a session built earlier could still
             // try one.
             result = "File changes are turned off. The user can turn them on in Settings → File changes — every proposed change still needs their approval before anything happens."
+        } else if descriptor.isPowerAction, configuration.localOnly {
+            // Audit S-06: the lock pauses power tools outright —
+            // an approved command or server call can itself send
+            // data off this Mac, which is what the lock forbids.
+            result = "Power tools are paused while Local Only is on — a command or server call could itself reach the network. The user can turn Local Only off in Settings if they want this to run."
         } else if descriptor.isPowerAction, !configuration.powerToolsEnabled {
             // Same defense in depth for the power switch.
             result = "Power tools are turned off. The user can turn them on in Settings → Power tools — every command and server call still needs their approval before anything runs."
@@ -156,7 +168,10 @@ actor ToolRuntime {
             toolName: descriptor.name,
             source: descriptor.source,
             querySummary: arguments.summary(for: descriptor.name),
-            resultSummary: ToolResultText.summary(of: clamped),
+            // Audit S-11: content-bearing tools (clipboard, file
+            // reads) log a type-and-size summary, never content.
+            resultSummary: ToolResultText.summary(
+                of: clamped, toolName: descriptor.name),
             date: Date()))
 
         return clamped

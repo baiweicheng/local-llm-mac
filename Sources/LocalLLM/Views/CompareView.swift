@@ -23,6 +23,13 @@ struct CompareView: View {
     /// Hands the seeded conversation to the main window, which
     /// selects it in the sidebar.
     let onContinue: (Conversation) -> Void
+    /// Audit S-01: the privacy context compare mode scrubs with —
+    /// the saved servers (for the remote test) and the user's custom
+    /// redaction terms, supplied by the chat pane from the same live
+    /// stores the engine reads. Without these, compare sent its
+    /// prompt to cloud/remote columns with NO privacy check at all.
+    let endpoints: [EndpointConfig]
+    let customRedactionTerms: [String]
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.modelContext) private var modelContext
@@ -33,10 +40,14 @@ struct CompareView: View {
 
     init(descriptors: [BackendDescriptor],
          resolver: @escaping (ModelSelection) -> ResolvedBackend,
-         onContinue: @escaping (Conversation) -> Void) {
+         onContinue: @escaping (Conversation) -> Void,
+         endpoints: [EndpointConfig] = [],
+         customRedactionTerms: [String] = []) {
         self.descriptors = descriptors
         self.resolver = resolver
         self.onContinue = onContinue
+        self.endpoints = endpoints
+        self.customRedactionTerms = customRedactionTerms
         _leftColumn = State(initialValue: CompareColumn(
             selection: .onDevice))
         // The interesting comparison is usually local vs cloud:
@@ -97,8 +108,12 @@ struct CompareView: View {
     private func runBoth() {
         guard canRun else { return }
         let text = prompt
-        leftColumn.run(prompt: text, resolver: resolver)
-        rightColumn.run(prompt: text, resolver: resolver)
+        leftColumn.run(prompt: text, resolver: resolver,
+                       endpoints: endpoints,
+                       customRedactionTerms: customRedactionTerms)
+        rightColumn.run(prompt: text, resolver: resolver,
+                        endpoints: endpoints,
+                        customRedactionTerms: customRedactionTerms)
     }
 
     // MARK: - One column
@@ -133,6 +148,12 @@ struct CompareView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 8) {
+                    if let notice = column.privacyNotice {
+                        Label(notice, systemImage: "lock.shield")
+                            .font(.caption)
+                            .foregroundStyle(.blue)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                     if let error = column.errorText {
                         Label(error, systemImage: "exclamationmark.triangle")
                             .font(.callout)
@@ -223,6 +244,10 @@ final class CompareColumn {
     private(set) var effectiveSelection: ModelSelection
     private(set) var text = ""
     private(set) var errorText: String?
+    /// Audit S-01: the privacy-check notice for the last run, when
+    /// the prompt had to be scrubbed for this column's destination
+    /// (same wording pattern as the chat engine's banner).
+    private(set) var privacyNotice: String?
     private(set) var telemetry: MessageTelemetry?
     private(set) var isRunning = false
     private var task: Task<Void, Never>?
@@ -237,15 +262,32 @@ final class CompareColumn {
     }
 
     func run(prompt: String,
-             resolver: (ModelSelection) -> ResolvedBackend) {
+             resolver: (ModelSelection) -> ResolvedBackend,
+             endpoints: [EndpointConfig] = [],
+             customRedactionTerms: [String] = []) {
         task?.cancel()
         text = ""
         errorText = nil
         telemetry = nil
+        privacyNotice = nil
         isRunning = true
         let resolved = resolver(selection)
         effectiveSelection = resolved.effectiveSelection
         let backend = resolved.backend
+        // Audit S-01: the same privacy firewall the chat engine
+        // applies — a column whose EFFECTIVE destination is remote
+        // (cloud, or a server that isn't on this Mac) receives the
+        // scrubbed prompt, never the raw one; a local column gets
+        // the text exactly as written.
+        let scrubbed = RemoteDestination.scrubbed(
+            prompt, selection: effectiveSelection,
+            endpoints: endpoints, customTerms: customRedactionTerms)
+        if scrubbed.didRedact {
+            privacyNotice = RemoteDestination.noticeText(
+                redactions: scrubbed.replacementCount,
+                backendDisplayName: backend.displayName,
+                selection: effectiveSelection)
+        }
         let session = backend.makeSession(
             instructions: PromptHistory.mergedInstructions(
                 userInstructions: ""),
@@ -256,7 +298,7 @@ final class CompareColumn {
             var failure: String?
             do {
                 for try await partial in session.streamReply(
-                    to: ChatReplyRequest(promptText: prompt)) {
+                    to: ChatReplyRequest(promptText: scrubbed.text)) {
                     received = partial
                     self?.text = received
                 }

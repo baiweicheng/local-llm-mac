@@ -14,7 +14,12 @@ import Security
 /// handed straight to the OpenRouter backend.
 protocol APIKeyStoring: Sendable {
     func readKey() -> String?
-    func saveKey(_ key: String)
+    /// Saves the key, reporting whether it actually landed — a
+    /// failed Keychain write must never read as success (audit
+    /// S-10: the old save discarded every status, so a failure
+    /// silently lost the key the user had just pasted).
+    @discardableResult
+    func saveKey(_ key: String) -> Bool
     func deleteKey()
 }
 
@@ -48,16 +53,31 @@ struct KeychainAPIKeyStore: APIKeyStoring {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    func saveKey(_ key: String) {
-        // Replace any existing item: delete-then-add is the simple,
-        // reliable update path for a single small secret.
-        SecItemDelete(baseQuery as CFDictionary)
-        var attributes = baseQuery
-        attributes[kSecValueData as String] =
-            Data(key.utf8)
-        attributes[kSecAttrAccessible as String] =
-            kSecAttrAccessibleAfterFirstUnlock
-        SecItemAdd(attributes as CFDictionary, nil)
+    @discardableResult
+    func saveKey(_ key: String) -> Bool {
+        // Audit S-10: update in place, falling back to add — the
+        // old delete-then-add could destroy a working key when the
+        // add then failed, and its result was never looked at.
+        // Accessibility is WhenUnlockedThisDeviceOnly: the key is
+        // usable only while this Mac is unlocked, and it never
+        // migrates to another device via a backup restore.
+        let updateAttributes: [String: Any] = [
+            kSecValueData as String: Data(key.utf8),
+            kSecAttrAccessible as String:
+                kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+        ]
+        let updateStatus = SecItemUpdate(baseQuery as CFDictionary,
+                                         updateAttributes as CFDictionary)
+        if updateStatus == errSecSuccess {
+            return true
+        }
+        guard updateStatus == errSecItemNotFound else { return false }
+        var addAttributes = baseQuery
+        for (name, value) in updateAttributes {
+            addAttributes[name] = value
+        }
+        return SecItemAdd(addAttributes as CFDictionary, nil)
+            == errSecSuccess
     }
 
     func deleteKey() {
@@ -77,10 +97,12 @@ final class InMemoryAPIKeyStore: APIKeyStoring, @unchecked Sendable {
         return key
     }
 
-    func saveKey(_ key: String) {
+    @discardableResult
+    func saveKey(_ key: String) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         self.key = key
+        return true
     }
 
     func deleteKey() {
@@ -115,16 +137,22 @@ final class OpenRouterKeyStore {
     }
 
     /// Saves a pasted key (whitespace trimmed; an empty paste is a
-    /// removal, so the field can be cleared honestly).
-    func setKey(_ rawKey: String) {
+    /// removal, so the field can be cleared honestly). Returns
+    /// whether the save actually landed, so Settings can say so
+    /// when the Keychain refuses (audit S-10).
+    @discardableResult
+    func setKey(_ rawKey: String) -> Bool {
         let trimmed = rawKey.trimmingCharacters(
             in: .whitespacesAndNewlines)
+        let saved: Bool
         if trimmed.isEmpty {
             store.deleteKey()
+            saved = store.readKey() == nil
         } else {
-            store.saveKey(trimmed)
+            saved = store.saveKey(trimmed)
         }
         hasKey = store.readKey() != nil
+        return saved
     }
 
     func removeKey() {

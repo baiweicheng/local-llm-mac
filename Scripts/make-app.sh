@@ -116,18 +116,40 @@ if [ "$found_bundle" = "1" ]; then
 fi
 
 echo "==> Signing"
+# Prefer a Developer ID Application identity when one exists (it's
+# the distribution identity), and fall back to Apple Development —
+# taking the first match of either kind, as this used to, could
+# pick the development identity on a Mac that has both.
 IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
-    | grep -E 'Apple Development|Developer ID Application' \
+    | grep 'Developer ID Application' \
     | head -n 1 \
     | sed -E 's/.*\"([^\"]+)\".*/\1/' || true)"
+if [ -z "${IDENTITY:-}" ]; then
+    IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+        | grep 'Apple Development' \
+        | head -n 1 \
+        | sed -E 's/.*\"([^\"]+)\".*/\1/' || true)"
+fi
 if [ -n "${IDENTITY:-}" ]; then
     echo "    Using identity: $IDENTITY"
-    codesign --force --options runtime --sign "$IDENTITY" "$APP_DIR"
+    SIGN_WITH="$IDENTITY"
 else
     echo "    No Apple signing identity found — signing ad-hoc."
     echo "    (First launch: right-click the app and choose Open.)"
-    codesign --force --sign - "$APP_DIR"
+    SIGN_WITH="-"
 fi
+# Sign nested code FIRST, inside-out (deepest paths first): the
+# dependency bundles copied into Resources (the MLX runtime ships
+# native code in them) must carry the same signature and hardened
+# runtime as the app itself, or library validation can refuse them
+# at launch. Both flavors sign identically — hardened runtime
+# either way — so the two builds can't behave differently.
+find "$APP_DIR" -depth \( -name "*.bundle" -o -name "*.framework" \) -print0 \
+    | while IFS= read -r -d '' nested; do
+        echo "    Signing nested: $nested"
+        codesign --force --options runtime --sign "$SIGN_WITH" "$nested"
+    done
+codesign --force --options runtime --sign "$SIGN_WITH" "$APP_DIR"
 codesign --verify --verbose=2 "$APP_DIR" || \
     echo "!! codesign verify reported problems (see above); the app may still run."
 

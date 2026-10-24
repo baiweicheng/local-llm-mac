@@ -510,16 +510,21 @@ final class MCPServerManager {
         switch await callTool(serverID: serverID, toolName: toolName,
                               argumentsJSON: argumentsJSON) {
         case .success(let text, let isError):
+            // Audit S-04: cap the server's text exactly like shell
+            // output (`ShellOutput.forModel`) before it is persisted
+            // in the plan record and quoted to the model — this was
+            // the one output path with no size limit at all.
+            let capped = ShellOutput.forModel(text)
             if isError {
                 return ExecutedActionItem(
-                    action: action, outcome: .failed(text),
+                    action: action, outcome: .failed(capped),
                     resultNote: "The server reported an error.",
-                    modelDetail: text)
+                    modelDetail: capped)
             }
             return ExecutedActionItem(
                 action: action, outcome: .done,
                 resultNote: "\(action.mcpServerName ?? "The server") answered.",
-                modelDetail: text.isEmpty ? nil : text)
+                modelDetail: capped.isEmpty ? nil : capped)
         case .failure(let message):
             return ExecutedActionItem(action: action,
                                       outcome: .failed(message),

@@ -224,6 +224,12 @@ struct EndpointEditorView: View {
                 TextField("Model name", text: $modelName)
             }
             .formStyle(.grouped)
+            if let warning = draftWarning {
+                Label(warning, systemImage: "exclamationmark.triangle")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             HStack {
                 if config == nil {
                     Button("Use Ollama Defaults") {
@@ -254,6 +260,16 @@ struct EndpointEditorView: View {
                 modelName = config.modelName
             }
         }
+    }
+
+    /// Audit S-09: the plaintext-HTTP warning for the address as
+    /// currently typed — shown live, before the server is saved.
+    private var draftWarning: String? {
+        EndpointConfig(
+            id: config?.id ?? UUID(), name: name,
+            baseURL: baseURL.trimmingCharacters(
+                in: .whitespacesAndNewlines),
+            modelName: modelName).remoteHTTPWarning
     }
 
     private func save() {

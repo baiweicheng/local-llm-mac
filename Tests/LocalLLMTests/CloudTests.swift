@@ -519,4 +519,136 @@ final class CloudTests: XCTestCase {
         XCTAssertFalse(result.contains("sam@example.com"))
         XCTAssertTrue(result.contains("[redacted]"))
     }
+
+    // MARK: - Remote destination test (audit S-01 / S-08 / S-09)
+
+    private func endpoint(_ url: String, id: UUID = UUID()) -> EndpointConfig {
+        EndpointConfig(id: id, name: "Server", baseURL: url,
+                       modelName: "llama3.1")
+    }
+
+    func testRemoteDestinationClassification() {
+        let local = endpoint("http://localhost:11434/v1")
+        let remote = endpoint("http://192.168.1.20:11434/v1")
+        let endpoints = [local, remote]
+        XCTAssertTrue(RemoteDestination.isRemote(
+            selection: .privateCloudCompute, endpoints: endpoints))
+        XCTAssertTrue(RemoteDestination.isRemote(
+            selection: .openRouter(modelID: "x/y"), endpoints: endpoints))
+        XCTAssertFalse(RemoteDestination.isRemote(
+            selection: .endpoint(id: local.id), endpoints: endpoints))
+        XCTAssertTrue(RemoteDestination.isRemote(
+            selection: .endpoint(id: remote.id), endpoints: endpoints))
+        XCTAssertFalse(RemoteDestination.isRemote(
+            selection: .onDevice, endpoints: endpoints))
+        XCTAssertFalse(RemoteDestination.isRemote(
+            selection: .mlx(repoID: "x"), endpoints: endpoints))
+        XCTAssertFalse(RemoteDestination.isRemote(
+            selection: .auto, endpoints: endpoints))
+    }
+
+    func testRemoteDestinationMissingConfigFailsClosed() {
+        // Audit S-08: an endpoint selection with no matching config
+        // used to count as LOCAL (no scrub). It must count remote.
+        XCTAssertTrue(RemoteDestination.isRemote(
+            selection: .endpoint(id: UUID()), endpoints: []))
+    }
+
+    func testCompareScrubAppliesOnlyToRemoteDestinations() {
+        // The exact helper CompareColumn.run sends through (S-01).
+        let secret = "mail me at sam@example.com please"
+        let cloud = RemoteDestination.scrubbed(
+            secret, selection: .privateCloudCompute, endpoints: [],
+            customTerms: [])
+        XCTAssertFalse(cloud.text.contains("sam@example.com"))
+        XCTAssertTrue(cloud.didRedact)
+
+        let local = RemoteDestination.scrubbed(
+            secret, selection: .onDevice, endpoints: [], customTerms: [])
+        XCTAssertEqual(local.text, secret)
+        XCTAssertEqual(local.replacementCount, 0)
+
+        // Custom terms apply in compare too.
+        let termed = RemoteDestination.scrubbed(
+            "the Falcon plan", selection: .openRouter(modelID: "x/y"),
+            endpoints: [], customTerms: ["Falcon"])
+        XCTAssertFalse(termed.text.contains("Falcon"))
+    }
+
+    func testRemoteNoticeAlwaysShownForRemoteSends() {
+        // Audit S-09: zero redactions still earns a notice.
+        let quiet = RemoteDestination.noticeText(
+            redactions: 0, backendDisplayName: "Apple Private Cloud",
+            selection: .privateCloudCompute)
+        XCTAssertTrue(quiet.contains("Sent to"))
+        XCTAssertTrue(quiet.contains("privacy check ran"))
+
+        let hidden = RemoteDestination.noticeText(
+            redactions: 2, backendDisplayName: "Apple Private Cloud",
+            selection: .privateCloudCompute)
+        XCTAssertTrue(hidden.contains("Privacy check: 2 items"))
+        XCTAssertTrue(hidden.contains("were hidden"))
+
+        let one = RemoteDestination.noticeText(
+            redactions: 1, backendDisplayName: "My Server",
+            selection: .endpoint(id: UUID()))
+        XCTAssertTrue(one.contains("1 item"))
+        XCTAssertTrue(one.contains("isn't on this Mac"))
+    }
+
+    func testImagesAreStrippedOnlyForRemoteDestinations() {
+        // Audit S-03.
+        XCTAssertTrue(RemoteDestination.shouldStripImages(
+            isRemote: true, imageCount: 1))
+        XCTAssertFalse(RemoteDestination.shouldStripImages(
+            isRemote: false, imageCount: 2))
+        XCTAssertFalse(RemoteDestination.shouldStripImages(
+            isRemote: true, imageCount: 0))
+        let notice = RemoteDestination.imageStripNoticeText(
+            backendDisplayName: "Apple Private Cloud",
+            selection: .privateCloudCompute)
+        XCTAssertTrue(notice.contains("Images weren't sent"))
+        XCTAssertTrue(notice.contains("cloud"))
+    }
+
+    func testEndpointRemoteHTTPWarning() {
+        // Audit S-09 (a): only the non-local + http:// combination.
+        XCTAssertNotNil(endpoint("http://192.168.1.20:11434/v1")
+            .remoteHTTPWarning)
+        XCTAssertNil(endpoint("https://192.168.1.20:11434/v1")
+            .remoteHTTPWarning)
+        XCTAssertNil(endpoint("http://localhost:11434/v1")
+            .remoteHTTPWarning)
+        XCTAssertTrue(endpoint("http://example.com/v1").usesPlainHTTP)
+        XCTAssertFalse(endpoint("https://example.com/v1").usesPlainHTTP)
+    }
+
+    // MARK: - Key save reporting (audit S-10)
+
+    private struct FailingKeyStore: APIKeyStoring {
+        func readKey() -> String? { nil }
+        func saveKey(_ key: String) -> Bool { false }
+        func deleteKey() {}
+    }
+
+    func testKeySaveReportsSuccess() {
+        let store = InMemoryAPIKeyStore()
+        XCTAssertTrue(store.saveKey("sk-or-abc"))
+        XCTAssertEqual(store.readKey(), "sk-or-abc")
+    }
+
+    @MainActor
+    func testKeyStoreSurfacesASaveFailure() {
+        let keyStore = OpenRouterKeyStore(store: FailingKeyStore())
+        XCTAssertFalse(keyStore.setKey("sk-or-nope"))
+        XCTAssertFalse(keyStore.hasKey)
+        XCTAssertNil(keyStore.currentKey())
+    }
+
+    @MainActor
+    func testKeyStoreSetKeyReturnsTrueOnSuccess() {
+        let keyStore = OpenRouterKeyStore(store: InMemoryAPIKeyStore())
+        XCTAssertTrue(keyStore.setKey("sk-or-fine"))
+        XCTAssertTrue(keyStore.hasKey)
+    }
 }

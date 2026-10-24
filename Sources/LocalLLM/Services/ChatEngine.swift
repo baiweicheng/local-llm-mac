@@ -371,7 +371,9 @@ final class ChatEngine {
         excludedPlanItems[conversationID] = nil
         planBusyIDs.insert(conversationID)
         Self.activityLogContext = context
-        let roots = toolAvailabilityProvider().folderRootPaths
+        let availability = toolAvailabilityProvider()
+        let roots = availability.folderRootPaths
+        let localOnly = availability.localOnly
         let mcpExecutor = mcpExecutorProvider
         let planKey = UUID()
         Task { [weak self] in
@@ -386,6 +388,7 @@ final class ChatEngine {
                     executed.append(await Self.executePlanItem(
                         action, roots: roots,
                         backupDirectory: backupDirectory,
+                        localOnly: localOnly,
                         mcpExecutor: mcpExecutor))
                 }
             }
@@ -394,7 +397,7 @@ final class ChatEngine {
                 let record = ActionPlanRecord(conversationID: conversationID,
                                               status: .executed,
                                               items: executed)
-                context.insert(record)
+                Self.insertPlanRecord(record, context: context)
                 try? context.save()
                 for item in executed {
                     Self.recordToolEvent(ToolEvent(
@@ -413,6 +416,26 @@ final class ChatEngine {
         }
     }
 
+    /// Persists one decided plan record, rotating the oldest plan
+    /// records away past `ActionPlanLogPolicy`'s cap (audit S-04 —
+    /// plan records store full payloads and previously grew without
+    /// bound, unlike the access log beside them).
+    private static func insertPlanRecord(_ record: ActionPlanRecord,
+                                         context: ModelContext) {
+        context.insert(record)
+        let total = (try? context.fetchCount(
+            FetchDescriptor<ActionPlanRecord>())) ?? 0
+        let excess = ActionPlanLogPolicy.excessCount(totalRecords: total)
+        if excess > 0 {
+            var oldest = FetchDescriptor<ActionPlanRecord>(
+                sortBy: [SortDescriptor(\.createdAt)])
+            oldest.fetchLimit = excess
+            for stale in (try? context.fetch(oldest)) ?? [] {
+                context.delete(stale)
+            }
+        }
+    }
+
     /// Runs one approved item through the executor for its kind:
     /// file changes in `FileActionService`, commands in
     /// `ShellCommandService`, MCP calls through the shell-provided
@@ -420,10 +443,29 @@ final class ChatEngine {
     /// the world may have changed since the proposal.
     private static func executePlanItem(
         _ action: PlannedAction, roots: [String], backupDirectory: URL,
+        localOnly: Bool = false,
         mcpExecutor: (PlannedAction) async -> ExecutedActionItem?
     ) async -> ExecutedActionItem {
+        // Audit S-06: under the Local Only lock, power items never
+        // run — a command or server call can itself reach the
+        // network, whatever model proposed it and whenever the lock
+        // was turned on.
+        if localOnly,
+           action.kind == .runCommand || action.kind == .mcpCall {
+            let refusal = "Not run — Local Only is on, so commands "
+                + "and server calls are paused while the lock is on."
+            return ExecutedActionItem(action: action,
+                                      outcome: .failed(refusal),
+                                      resultNote: refusal)
+        }
+        // Audit S-02: the pre-check re-resolves paths at execution
+        // time, exactly as the proposal resolved them.
         if let refusal = ActionExecution.preCheck(
-            action, roots: roots, probe: FileActionService.probe) {
+            action, roots: roots, probe: FileActionService.probe,
+            resolve: { FileAccessService.resolvedPath($0) ?? $0 },
+            resolveDestination: {
+                FileAccessService.resolvedDestinationPath($0) ?? $0
+            }) {
             return ExecutedActionItem(action: action,
                                       outcome: .failed(refusal),
                                       resultNote: refusal)
@@ -482,7 +524,7 @@ final class ChatEngine {
                     action: $0, outcome: .declined,
                     resultNote: "Not done — the list was discarded.")
             })
-        context.insert(record)
+        Self.insertPlanRecord(record, context: context)
         try? context.save()
         for action in plan {
             Self.recordToolEvent(ToolEvent(
@@ -510,13 +552,15 @@ final class ChatEngine {
         else { return }
         planBusyIDs.insert(conversationID)
         Self.activityLogContext = context
+        let undoRoots = toolAvailabilityProvider().folderRootPaths
         Task { [weak self] in
             var items = record.items
             let steps = ActionUndo.steps(for: items, home: NSHomeDirectory())
             // Steps are keyed by the action's id, not by position.
             var results: [(item: ExecutedActionItem, note: String)] = []
             for step in steps {
-                let note = FileActionService.executeUndoStep(step)
+                let note = FileActionService.executeUndoStep(
+                    step, roots: undoRoots)
                 if let index = items.firstIndex(
                     where: { $0.action.id == step.itemID }) {
                     items[index].undoNote = note
@@ -775,22 +819,12 @@ final class ChatEngine {
         // destinations (built-in model, MLX, a localhost server) get
         // the text exactly as written. Stored messages are never
         // touched; only the sent copy is edited.
-        let isRemoteDestination: Bool = {
-            switch selection {
-            case .privateCloudCompute, .openRouter:
-                return true
-            case .endpoint(let id):
-                guard let config = routingInputs.endpoints
-                    .first(where: { $0.id == id }) else { return false }
-                return !config.isLocalhost
-            case .auto, .onDevice, .mlx:
-                return false
-            }
-        }()
-        /// Phase 8: the remote destination is a cloud (Apple's or
-        /// OpenRouter's) rather than a user-added server — used for
-        /// the tool-result redaction below and the banner wording.
-        let isCloudDestination = selection.isCloud
+        // Audit S-08: the destination test lives in
+        // `RemoteDestination` (shared with compare mode) and fails
+        // CLOSED — a server selection whose config is missing
+        // counts as remote, never as local.
+        let isRemoteDestination = RemoteDestination.isRemote(
+            selection: selection, endpoints: routingInputs.endpoints)
         var effectiveInstructions = instructions
         var redactions = 0
         if isRemoteDestination {
@@ -904,7 +938,9 @@ final class ChatEngine {
                 // session build, which is the one moment that may
                 // launch a server process (lazily; a failed server
                 // simply contributes nothing).
-                let mcpTools = toolAvailability.powerToolsEnabled
+                // Audit S-06: under Local Only there are no power
+                // tools and no discovery — servers don't even launch.
+                let mcpTools = toolAvailability.effectivePowerToolsEnabled
                     ? await mcpToolsProvider()
                     : []
                 let runtime = ToolRuntime(
@@ -920,7 +956,8 @@ final class ChatEngine {
                         redactResults: isRemoteDestination,
                         redactionTerms: routingInputs.customRedactionTerms,
                         fileWritingEnabled: toolAvailability.fileWritingEnabled,
-                        powerToolsEnabled: toolAvailability.powerToolsEnabled,
+                        powerToolsEnabled: toolAvailability.effectivePowerToolsEnabled,
+                        localOnly: toolAvailability.localOnly,
                         mcpTools: mcpTools,
                         proposalSink: Self.proposalSink),
                     sink: Self.toolEventSink,
@@ -972,26 +1009,19 @@ final class ChatEngine {
         // The firewall's second half: with the outgoing prompt fully
         // assembled (seeded history included), scrub it too, and say
         // so — once per send, counting the instructions with it.
+        // Audit S-09: the notice is set for EVERY remote send, not
+        // only when something was hidden — a send that matched no
+        // pattern still left this Mac, and the user is told it did.
         if isRemoteDestination {
             let scrubbed = Redactor.redact(
                 promptText,
                 customTerms: routingInputs.customRedactionTerms)
             promptText = scrubbed.text
             redactions += scrubbed.replacementCount
-            if redactions > 0 {
-                let noun = redactions == 1 ? "item" : "items"
-                let whereabouts = isCloudDestination
-                    ? "because \(backend.displayName) runs in the "
-                        + "cloud, not on this Mac"
-                    : "because that server isn't on this Mac"
-                infoMessages[conversationID] =
-                    "Privacy check: \(redactions) \(noun) that looked "
-                    + "like secrets or personal details were hidden "
-                    + "before this was sent to \(backend.displayName), "
-                    + "\(whereabouts). Your "
-                    + "saved chat is unchanged — only the copy that "
-                    + "was sent was edited."
-            }
+            infoMessages[conversationID] = RemoteDestination.noticeText(
+                redactions: redactions,
+                backendDisplayName: backend.displayName,
+                selection: selection)
         }
 
         // Streaming. Images ride along as temporary files (framework
@@ -1005,11 +1035,30 @@ final class ChatEngine {
             }
         }
 
+        // Audit S-03: images never go to a remote destination. The
+        // firewall scrubs text; it cannot scrub a screenshot, which
+        // is exactly where secrets hide. The images are stripped
+        // from this send (the saved message keeps them) and the
+        // user is told, appended to the privacy notice above.
+        let stripImages = RemoteDestination.shouldStripImages(
+            isRemote: isRemoteDestination,
+            imageCount: imageFiles.urls.count)
+        if stripImages {
+            let imageNotice = RemoteDestination.imageStripNoticeText(
+                backendDisplayName: backend.displayName,
+                selection: selection)
+            infoMessages[conversationID] =
+                [infoMessages[conversationID], imageNotice]
+                    .compactMap { $0 }
+                    .joined(separator: " ")
+        }
+
         var received = ""
         let generationStarted = Date()
         do {
-            let request = ChatReplyRequest(promptText: promptText,
-                                           imageURLs: imageFiles.urls)
+            let request = ChatReplyRequest(
+                promptText: promptText,
+                imageURLs: stripImages ? [] : imageFiles.urls)
             for try await text in session.streamReply(to: request) {
                 received = text
                 streamingText[conversationID] = received

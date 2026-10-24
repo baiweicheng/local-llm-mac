@@ -617,6 +617,41 @@ enum ActionProposal {
     }
 }
 
+// MARK: - Execution-time path resolution (audit S-02)
+
+extension PlannedAction {
+
+    /// A copy of this action with its paths replaced by their
+    /// CURRENT resolved forms, using the two resolvers the service
+    /// layer supplies (source paths resolve whole; destination
+    /// paths resolve their parent folder and keep the final name,
+    /// since the destination usually doesn't exist yet).
+    ///
+    /// Proposal resolved every path before the scope check; the
+    /// point of re-resolving at execution is that the filesystem
+    /// may have changed since — a folder swapped for a symlink in
+    /// the propose → approve window must be seen for what it now
+    /// points at, not what it pointed at then.
+    func resolvingPaths(
+        sourceResolver: (String) -> String?,
+        destinationResolver: (String) -> String?
+    ) -> PlannedAction {
+        var copy = self
+        if let sourcePath, let resolved = sourceResolver(sourcePath) {
+            copy.sourcePath = resolved
+        }
+        if let destinationPath,
+           let resolved = destinationResolver(destinationPath) {
+            copy.destinationPath = resolved
+        }
+        if let workingDirectory,
+           let resolved = sourceResolver(workingDirectory) {
+            copy.workingDirectory = resolved
+        }
+        return copy
+    }
+}
+
 // MARK: - Execution pre-check
 
 /// The proposal rules, re-run at approval time against the disk as
@@ -625,13 +660,37 @@ enum ActionProposal {
 /// Edits are the one deliberate exception to never-overwrite: the
 /// file being edited IS the destination, and the executor backs it
 /// up first — that's what makes the edit undoable.
+///
+/// Audit S-02: the SCOPE tests run on RESOLVED paths. The caller
+/// passes the resolvers the read side uses (`FileAccessService`),
+/// so a path component swapped for an outward symlink since the
+/// proposal resolves outside the shared folders here and is
+/// refused — the stored string alone would still have looked
+/// in-scope. Existence and never-overwrite tests keep using the
+/// stored paths (the filesystem follows links for those anyway,
+/// and the executor operates on the stored paths once the resolved
+/// forms have passed). The default resolvers are the identity, for
+/// callers (and tests) with no filesystem to resolve against.
 enum ActionExecution {
 
     static func preCheck(_ action: PlannedAction,
                          roots: [String],
-                         probe: FileSystemProbe) -> String? {
+                         probe: FileSystemProbe,
+                         resolve: (String) -> String? = { $0 },
+                         resolveDestination: ((String) -> String?)? = nil
+    ) -> String? {
+        func resolved(_ path: String) -> String {
+            resolve(path) ?? path
+        }
+        func resolvedDestination(_ path: String) -> String {
+            (resolveDestination ?? resolve)(path) ?? path
+        }
         func scoped(_ path: String) -> Bool {
-            FileScope.isPath(path, insideAnyRoot: roots)
+            FileScope.isPath(resolved(path), insideAnyRoot: roots)
+        }
+        func scopedDestination(_ path: String) -> Bool {
+            FileScope.isPath(resolvedDestination(path),
+                             insideAnyRoot: roots)
         }
         switch action.kind {
         case .rename, .move, .copy:
@@ -641,11 +700,14 @@ enum ActionExecution {
             guard probe.exists(atPath: source) else {
                 return "The item isn't there anymore."
             }
-            guard let destination = action.destinationPath, scoped(destination) else {
+            guard let destination = action.destinationPath,
+                  scopedDestination(destination) else {
                 return "The destination is no longer inside a shared folder."
             }
             if probe.isDirectory(atPath: source),
-               destination.hasPrefix(source + "/") {
+               resolvedDestination(destination)
+                .lowercased()
+                .hasPrefix(resolved(source).lowercased() + "/") {
                 return "A folder can't be moved into itself."
             }
             guard !probe.exists(atPath: destination) else {
@@ -653,7 +715,8 @@ enum ActionExecution {
             }
             return nil
         case .createFolder:
-            guard let path = action.destinationPath, scoped(path) else {
+            guard let path = action.destinationPath,
+                  scopedDestination(path) else {
                 return "The folder is no longer inside a shared folder."
             }
             guard !probe.exists(atPath: path) else {
@@ -661,7 +724,8 @@ enum ActionExecution {
             }
             return nil
         case .editText:
-            guard let path = action.destinationPath, scoped(path) else {
+            guard let path = action.destinationPath,
+                  scopedDestination(path) else {
                 return "The file is no longer inside a shared folder."
             }
             if probe.exists(atPath: path), probe.isDirectory(atPath: path) {
@@ -683,7 +747,8 @@ enum ActionExecution {
                     return "The photo file isn't there anymore."
                 }
             }
-            guard let destination = action.destinationPath, scoped(destination) else {
+            guard let destination = action.destinationPath,
+                  scopedDestination(destination) else {
                 return "The destination is no longer inside a shared folder."
             }
             guard !probe.exists(atPath: destination) else {
@@ -714,6 +779,52 @@ enum ActionExecution {
                 return "The call is missing its server, tool, or arguments."
             }
             return nil
+        }
+    }
+}
+
+// MARK: - Undo scope (audit S-02)
+
+/// The scope rule for undo steps, checked at undo time on RESOLVED
+/// paths — undo originally performed no scope check at all.
+///
+/// The rule is per kind, because undo's endpoints aren't all
+/// user-scope paths by design:
+///  - `moveBack`: the place the item returns TO must be inside a
+///    shared folder; where it comes FROM must be inside one too —
+///    or in the Trash (a trashed item's undo legitimately starts
+///    there).
+///  - `trashFile` / `removeFolderIfEmpty`: the path acted on must
+///    be inside a shared folder.
+///  - `restoreBackup`: the file being restored must be inside a
+///    shared folder; the backup itself lives in the app's own
+///    backup area (its path carries the `ActionBackups` marker),
+///    never in user scope, and is admitted on that basis alone.
+///  - `notUndoable`: nothing runs, so nothing is checked.
+enum UndoStepScope {
+
+    static func isAllowed(_ step: UndoStep,
+                          roots: [String],
+                          home: String,
+                          resolve: (String) -> String?) -> Bool {
+        func resolved(_ path: String) -> String { resolve(path) ?? path }
+        func scoped(_ path: String) -> Bool {
+            FileScope.isPath(resolved(path), insideAnyRoot: roots)
+        }
+        switch step.kind {
+        case .notUndoable:
+            return true
+        case .moveBack(let from, let to):
+            let trashRoot = PathDisplay.joining(home, ".Trash")
+            return scoped(to)
+                && (scoped(from)
+                    || FileScope.isPath(resolved(from),
+                                        insideAnyRoot: [trashRoot]))
+        case .trashFile(let path), .removeFolderIfEmpty(let path):
+            return scoped(path)
+        case .restoreBackup(let backupPath, let targetPath):
+            return scoped(targetPath)
+                && resolved(backupPath).contains("/ActionBackups/")
         }
     }
 }

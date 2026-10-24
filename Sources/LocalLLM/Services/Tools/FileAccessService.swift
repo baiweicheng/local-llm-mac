@@ -99,6 +99,23 @@ enum FileAccessService {
             .path
     }
 
+    /// Audit S-02: the resolved form of a path that may not exist
+    /// yet — an action's destination. The parent folder (which does
+    /// exist; the pre-checks require it) is resolved, and the final
+    /// name is re-attached untouched, so a parent swapped for an
+    /// outward symlink since the proposal is seen for what it now
+    /// points at.
+    static func resolvedDestinationPath(_ rawPath: String) -> String? {
+        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let parent = (trimmed as NSString).deletingLastPathComponent
+        let name = (trimmed as NSString).lastPathComponent
+        guard !name.isEmpty,
+              let resolvedParent = resolvedPath(parent.isEmpty ? "/" : parent)
+        else { return nil }
+        return (resolvedParent as NSString).appendingPathComponent(name)
+    }
+
     private static func outsideScopeMessage(roots: [String]) -> String {
         guard !roots.isEmpty else {
             return "File access is off — no folders are shared with the app. The user can share folders in Settings → What this app can see → Shared folders."

@@ -155,6 +155,22 @@ struct SidebarView: View {
         if selection?.id == conversation.id {
             selection = nil
         }
+        // Audit S-05: the conversation's tool-activity and plan
+        // records are standalone models keyed by conversation id —
+        // they do NOT cascade with the conversation, so delete them
+        // in the same save, or a "deleted" chat's lookups, commands,
+        // and server answers stay behind in the access log.
+        let id = conversation.id
+        let toolRecords = FetchDescriptor<ToolActivityRecord>(
+            predicate: #Predicate { $0.conversationID == id })
+        for record in (try? modelContext.fetch(toolRecords)) ?? [] {
+            modelContext.delete(record)
+        }
+        let planRecords = FetchDescriptor<ActionPlanRecord>(
+            predicate: #Predicate { $0.conversationID == id })
+        for record in (try? modelContext.fetch(planRecords)) ?? [] {
+            modelContext.delete(record)
+        }
         modelContext.delete(conversation)
         try? modelContext.save()
     }

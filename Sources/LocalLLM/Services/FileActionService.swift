@@ -38,8 +38,15 @@ enum FileActionService {
     static func execute(_ action: PlannedAction,
                         roots: [String],
                         backupDirectory: URL) async -> ExecutedActionItem {
+        // Audit S-02: the pre-check re-resolves every path NOW —
+        // a component swapped for an outward symlink since the
+        // proposal must fail here, not be followed.
         if let refusal = ActionExecution.preCheck(
-            action, roots: roots, probe: FileManagerProbe()) {
+            action, roots: roots, probe: FileManagerProbe(),
+            resolve: { FileAccessService.resolvedPath($0) ?? $0 },
+            resolveDestination: {
+                FileAccessService.resolvedDestinationPath($0) ?? $0
+            }) {
             return ExecutedActionItem(action: action,
                                       outcome: .failed(refusal),
                                       resultNote: refusal)
@@ -265,7 +272,19 @@ enum FileActionService {
     /// Undo holds itself to the same never-overwrite rule as
     /// execution: if the original spot is occupied again, the step
     /// fails with the reason rather than replacing anything.
-    static func executeUndoStep(_ step: UndoStep) -> String {
+    ///
+    /// Audit S-02: undo also re-checks scope, on RESOLVED paths,
+    /// before touching anything (`UndoStepScope`) — it originally
+    /// checked existence only, so a path swapped for an outward
+    /// symlink after execution would have been followed blindly.
+    static func executeUndoStep(_ step: UndoStep,
+                                roots: [String]) -> String {
+        guard UndoStepScope.isAllowed(
+            step, roots: roots, home: NSHomeDirectory(),
+            resolve: { FileAccessService.resolvedPath($0) ?? $0 })
+        else {
+            return "Couldn't undo — that path is no longer inside a shared folder."
+        }
         let fileManager = FileManager.default
         switch step.kind {
         case .notUndoable(let reason):

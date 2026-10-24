@@ -156,7 +156,9 @@ struct ChatView: View {
         .sheet(isPresented: $showingCompare) {
             CompareView(descriptors: descriptors,
                         resolver: backendResolver,
-                        onContinue: onCompareContinue)
+                        onContinue: onCompareContinue,
+                        endpoints: endpointStore.configs,
+                        customRedactionTerms: settings.customRedactionTerms)
         }
         .sheet(isPresented: $showingModels) {
             ModelsView(mlxStore: mlxStore, endpointStore: endpointStore)

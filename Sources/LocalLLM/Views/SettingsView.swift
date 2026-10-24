@@ -57,11 +57,20 @@ struct SettingsView: View {
     @Query(sort: \ToolActivityRecord.createdAt, order: .reverse)
     private var recentRecords: [ToolActivityRecord]
 
+    /// Audit S-04: decided plan records live beside the access log
+    /// and are cleared with it — Clear Log previously left every
+    /// plan's full payloads behind.
+    @Query(sort: \ActionPlanRecord.createdAt, order: .reverse)
+    private var recentPlanRecords: [ActionPlanRecord]
+
     @State private var newTerm = ""
     /// The OpenRouter key as typed, held only until Save hands it
     /// to the Keychain; the field then clears. The saved key is
     /// never read back into this field.
     @State private var keyDraft = ""
+    /// Audit S-10: set when a key save fails in the Keychain, so
+    /// the failure is said out loud instead of silently losing it.
+    @State private var keySaveError: String?
     /// Phase 9: the MCP add-server form's drafts.
     @State private var mcpName = ""
     @State private var mcpCommand = ""
@@ -306,6 +315,9 @@ struct SettingsView: View {
             Text("When this is on, only models that run on this Mac may answer — the built-in model and downloaded MLX models. Server backends (even ones on this Mac) and both cloud backends are refused: Local Only means nothing leaves this Mac, and Apple Private Cloud runs on Apple's servers, so it counts as leaving. Auto never routes out, and a chat that was using a server or cloud model switches to the built-in model with a note explaining why.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
+            Text("Power tools are paused while this is on, too: an approved shell command or MCP server call can reach the network itself, so commands and server calls don't exist for any model until the lock is turned off.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -398,6 +410,12 @@ struct SettingsView: View {
                     .disabled(keyDraft.trimmingCharacters(
                         in: .whitespacesAndNewlines).isEmpty)
             }
+            if let keySaveError {
+                Text(keySaveError)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             Text("Get a key at openrouter.ai (Keys). Saving a key turns on the OpenRouter models in the picker, and lets Auto send its hardest prompts there.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -425,8 +443,14 @@ struct SettingsView: View {
     }
 
     private func saveKey() {
-        openRouterKeyStore.setKey(keyDraft)
-        keyDraft = ""
+        if openRouterKeyStore.setKey(keyDraft) {
+            keySaveError = nil
+            keyDraft = ""
+        } else {
+            // Keep the draft in the field so the user can retry —
+            // clearing it would pretend the save worked.
+            keySaveError = "That key couldn't be saved to your Keychain — it isn't stored. Try saving again; if it keeps failing, check that your login Keychain is unlocked."
+        }
     }
 
     // MARK: - KV cache (MLX models)
@@ -757,9 +781,16 @@ struct SettingsView: View {
                 Text("Recent activity")
                     .font(.headline)
                 Spacer()
-                if !recentRecords.isEmpty {
+                if !recentRecords.isEmpty || !recentPlanRecords.isEmpty {
                     Button("Clear Log", role: .destructive) {
                         for record in recentRecords {
+                            modelContext.delete(record)
+                        }
+                        // Audit S-04: plan records clear too —
+                        // they hold the full payloads (file text,
+                        // commands, server answers) the log only
+                        // excerpts.
+                        for record in recentPlanRecords {
                             modelContext.delete(record)
                         }
                         try? modelContext.save()
@@ -767,7 +798,7 @@ struct SettingsView: View {
                     .font(.callout)
                 }
             }
-            Text("Everything a model does is recorded here — every lookup, and every proposed, approved, discarded, or undone file change, command, and server call. The newest \(AccessLogPolicy.maxRecords) are kept; older ones fall off.")
+            Text("Everything a model does is recorded here — every lookup, and every proposed, approved, discarded, or undone file change, command, and server call. The newest \(AccessLogPolicy.maxRecords) are kept; older ones fall off. Decided change lists are kept to the same number (\(ActionPlanLogPolicy.maxRecords)), and Clear Log removes both kinds of record.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
             if recentRecords.isEmpty {

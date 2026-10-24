@@ -338,7 +338,10 @@ struct ToolArguments: Sendable, Equatable {
         case "calculate":
             return expression ?? "an expression"
         case "write_clipboard":
-            return String((text ?? "").prefix(40))
+            // Audit S-11: the log stores a type-and-size summary,
+            // never the clipboard text itself — copying a password
+            // and asking about it must not persist the password.
+            return "Clipboard text (\((text ?? "").count) characters)"
         case "rename_file":
             return "\(path ?? "a file") → \(newName ?? "a new name")"
         case "move_file", "copy_file":
@@ -604,11 +607,17 @@ enum ToolCatalog {
     /// less utilities ride along, as they do with any source).
     static func descriptors(enabledSources: Set<VisibilitySource>,
                             fileWritingEnabled: Bool = false,
-                            powerToolsEnabled: Bool = false) -> [ToolDescriptor] {
-        guard !enabledSources.isEmpty || powerToolsEnabled else { return [] }
+                            powerToolsEnabled: Bool = false,
+                            localOnly: Bool = false) -> [ToolDescriptor] {
+        // Audit S-06: under the Local Only lock the power tools
+        // don't exist at all — an approved command or server call
+        // can itself reach the network, so "nothing leaves this
+        // Mac" must cover them too.
+        let effectivePowerToolsEnabled = powerToolsEnabled && !localOnly
+        guard !enabledSources.isEmpty || effectivePowerToolsEnabled else { return [] }
         return all.filter { descriptor in
             if descriptor.isWriteAction, !fileWritingEnabled { return false }
-            if descriptor.isPowerAction, !powerToolsEnabled { return false }
+            if descriptor.isPowerAction, !effectivePowerToolsEnabled { return false }
             guard let source = descriptor.source else { return true }
             return enabledSources.contains(source)
         }
@@ -649,6 +658,29 @@ enum ToolResultText {
         guard trimmed.count > 100 else { return trimmed }
         return String(trimmed.prefix(100)) + "…"
     }
+
+    /// The access-log summary for one tool's result (audit S-11).
+    ///
+    /// Most tools keep the first-line summary above — their results
+    /// lead with a header or a count, not raw user content. The
+    /// exceptions are the tools whose result IS raw user content:
+    /// the clipboard's current text and a file's contents. Persisting
+    /// even a first line of those writes the content itself into the
+    /// log (a copied password, a private file's opening line), so
+    /// these store a type-and-size summary instead — mirroring how
+    /// `write_clipboard`'s own result already reports only a count.
+    static func summary(of result: String, toolName: String) -> String {
+        switch toolName {
+        case "read_clipboard":
+            return "Clipboard text (\(result.count) characters)"
+        case "write_clipboard":
+            return "Text copied to the clipboard"
+        case "read_file":
+            return "File text (\(result.count) characters)"
+        default:
+            return summary(of: result)
+        }
+    }
 }
 
 // MARK: - Access log
@@ -678,6 +710,21 @@ enum AccessLogPolicy {
     }
 }
 
+/// How many decided plan records the app keeps (audit S-04): the
+/// same discipline as the access log, for the same reason. A plan
+/// record stores full payloads — a file's replacement text, an exact
+/// command, a server's whole answer — so it must not accumulate
+/// forever either. The engine rotates to this cap on every insert;
+/// the newest `maxRecords` decided plans are kept.
+enum ActionPlanLogPolicy {
+    static let maxRecords = 300
+
+    /// How many oldest records to delete when the total reaches this.
+    static func excessCount(totalRecords: Int) -> Int {
+        max(0, totalRecords - maxRecords)
+    }
+}
+
 // MARK: - Tool availability snapshot
 
 /// What the UI shell hands the engine per conversation: which sources
@@ -685,6 +732,30 @@ enum AccessLogPolicy {
 /// fold it into its live-session signature — changing a toggle or a
 /// folder retires live sessions and the next send rebuilds them with
 /// the new tool set.
+/// A deterministic hash of the user's custom redaction terms, for
+/// the tool-availability signature (audit S-13). FNV-1a over the
+/// normalized (trimmed, order-insensitive) term list — deliberately
+/// NOT Swift's `Hasher`, which is seeded per process: a signature
+/// only ever needs to be compared within one run, but a stable
+/// value keeps the tests able to pin exact outputs.
+enum RedactionTermsHash {
+
+    static func value(for terms: [String]) -> String {
+        let normalized = terms
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .sorted()
+        let joined = normalized.joined(separator: "\u{1F}")
+        // FNV-1a, 64-bit.
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in joined.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 0x100000001b3
+        }
+        return String(hash, radix: 16)
+    }
+}
+
 struct ToolAvailability: Equatable, Sendable {
     var enabledSources: Set<VisibilitySource>
     var folderRootPaths: [String]
@@ -701,16 +772,36 @@ struct ToolAvailability: Equatable, Sendable {
     /// other part of the tool set changes.
     var powerToolsEnabled: Bool = false
     var mcpToolsSignature: String = ""
+    /// Audit S-06: the Local Only lock. While it's on, the power
+    /// tools (shell + MCP) are unavailable — they can reach the
+    /// network themselves, so the lock pauses them — and plan
+    /// execution refuses power items outright. Part of the
+    /// signature, so flipping the lock retires live sessions.
+    var localOnly: Bool = false
+    /// Audit S-13: the user's custom redaction terms. Only their
+    /// HASH joins the signature (the terms themselves travel in
+    /// `RoutingInputs`), so adding a term mid-conversation retires
+    /// a live session and its tool runtime is rebuilt with the new
+    /// list — tool results get the same fresh terms prompts get.
+    var customRedactionTerms: [String] = []
 
     static let none = ToolAvailability(enabledSources: [], folderRootPaths: [])
 
-    var hasTools: Bool { !enabledSources.isEmpty || powerToolsEnabled }
+    /// Whether the power tools may exist under the current
+    /// settings: the master switch on AND the lock off.
+    var effectivePowerToolsEnabled: Bool {
+        powerToolsEnabled && !localOnly
+    }
+
+    var hasTools: Bool { !enabledSources.isEmpty || effectivePowerToolsEnabled }
 
     var signature: String {
         let sources = enabledSources.map(\.rawValue).sorted().joined(separator: ",")
         return sources + "|" + folderRootPaths.sorted().joined(separator: ",")
             + "|" + (fileWritingEnabled ? "write" : "read")
-            + "|" + (powerToolsEnabled ? "power" : "nopower")
+            + "|" + (effectivePowerToolsEnabled ? "power" : "nopower")
+            + "|" + (localOnly ? "localonly" : "nolock")
+            + "|terms:" + RedactionTermsHash.value(for: customRedactionTerms)
             + "|" + mcpToolsSignature
     }
 }

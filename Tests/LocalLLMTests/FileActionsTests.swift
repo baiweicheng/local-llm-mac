@@ -396,6 +396,159 @@ final class FileActionsTests: XCTestCase {
         XCTAssertTrue(refusal?.contains("already at the destination") ?? false)
     }
 
+    // MARK: - Execution-time resolution (audit S-02)
+
+    /// A resolver simulating a symlink swap: after the proposal,
+    /// `Shared/Sub` was replaced by a link to `/Outside`.
+    private func swappedResolver(_ path: String) -> String? {
+        path.replacingOccurrences(of: "\(root)/Sub", with: "/Outside")
+    }
+
+    private func swappedDestinationResolver(_ path: String) -> String? {
+        let parent = (path as NSString).deletingLastPathComponent
+        let name = (path as NSString).lastPathComponent
+        let resolvedParent = swappedResolver(parent) ?? parent
+        return (resolvedParent as NSString).appendingPathComponent(name)
+    }
+
+    func testPreCheckRefusesASourceSwappedOutsideScope() {
+        guard case .proposed(let action) = propose(.trash, ActionInputs(
+            sourcePath: "\(root)/Sub"), probe: standardProbe())
+        else { return XCTFail("setup") }
+        // Sanity: without the swap, the pre-check passes.
+        XCTAssertNil(ActionExecution.preCheck(
+            action, roots: [root], probe: standardProbe()))
+        // With `Sub` now a symlink to /Outside, the stored string
+        // still reads as in-scope — only re-resolution catches it.
+        let refusal = ActionExecution.preCheck(
+            action, roots: [root], probe: standardProbe(),
+            resolve: swappedResolver)
+        XCTAssertNotNil(refusal)
+        XCTAssertTrue(refusal?.contains("no longer inside") ?? false)
+    }
+
+    func testPreCheckRefusesADestinationParentSwappedOutsideScope() {
+        guard case .proposed(let action) = propose(.move, ActionInputs(
+            sourcePath: "\(root)/photo.jpg",
+            destinationPath: "\(root)/Sub/photo.jpg"),
+            probe: standardProbe()) else { return XCTFail("setup") }
+        let refusal = ActionExecution.preCheck(
+            action, roots: [root], probe: standardProbe(),
+            resolve: swappedResolver,
+            resolveDestination: swappedDestinationResolver)
+        XCTAssertNotNil(refusal)
+        XCTAssertTrue(refusal?.contains("destination") ?? false)
+    }
+
+    func testPreCheckRefusesACommandFolderSwappedOutsideScope() {
+        guard case .proposed(let action) = propose(.editText, ActionInputs(
+            sourcePath: "\(root)/Sub/notes.txt", editText: "x"),
+            probe: standardProbe()) else { return XCTFail("setup") }
+        // editText's target is a destination: its parent is what
+        // gets resolved.
+        let refusal = ActionExecution.preCheck(
+            action, roots: [root], probe: standardProbe(),
+            resolve: swappedResolver,
+            resolveDestination: swappedDestinationResolver)
+        XCTAssertNotNil(refusal)
+    }
+
+    func testResolvingPathsRewritesAnActionCopy() {
+        guard case .proposed(let action) = propose(.move, ActionInputs(
+            sourcePath: "\(root)/photo.jpg",
+            destinationPath: "\(root)/Sub/photo.jpg"),
+            probe: standardProbe()) else { return XCTFail("setup") }
+        let resolved = action.resolvingPaths(
+            sourceResolver: swappedResolver,
+            destinationResolver: swappedDestinationResolver)
+        XCTAssertEqual(resolved.sourcePath, "\(root)/photo.jpg")
+        XCTAssertEqual(resolved.destinationPath, "/Outside/photo.jpg")
+        // The original is untouched (it's a copy).
+        XCTAssertEqual(action.destinationPath, "\(root)/Sub/photo.jpg")
+    }
+
+    func testUndoScopeRules() {
+        let identity: (String) -> String? = { $0 }
+        let rename = UndoStep(
+            itemID: UUID(),
+            kind: .moveBack(from: "\(root)/beach.jpg", to: "\(root)/photo.jpg"),
+            description: "Rename back")
+        XCTAssertTrue(UndoStepScope.isAllowed(
+            rename, roots: [root], home: home, resolve: identity))
+
+        // The place it returns to is no longer shared.
+        XCTAssertFalse(UndoStepScope.isAllowed(
+            rename, roots: [], home: home, resolve: identity))
+
+        // A trashed item's undo legitimately starts in the Trash…
+        let fromTrash = UndoStep(
+            itemID: UUID(),
+            kind: .moveBack(from: "\(home)/.Trash/taken.txt",
+                            to: "\(root)/taken.txt"),
+            description: "Back from Trash")
+        XCTAssertTrue(UndoStepScope.isAllowed(
+            fromTrash, roots: [root], home: home, resolve: identity))
+        // …but may only land back inside a shared folder.
+        let trashToOutside = UndoStep(
+            itemID: UUID(),
+            kind: .moveBack(from: "\(home)/.Trash/taken.txt",
+                            to: "/Outside/taken.txt"),
+            description: "Bad landing")
+        XCTAssertFalse(UndoStepScope.isAllowed(
+            trashToOutside, roots: [root], home: home, resolve: identity))
+
+        // A move-back whose source was swapped out of scope (and
+        // isn't the Trash) is refused.
+        let swapped = UndoStep(
+            itemID: UUID(),
+            kind: .moveBack(from: "\(root)/Sub/beach.jpg",
+                            to: "\(root)/photo.jpg"),
+            description: "Swapped source")
+        XCTAssertFalse(UndoStepScope.isAllowed(
+            swapped, roots: [root], home: home, resolve: swappedResolver))
+
+        // trashFile / removeFolderIfEmpty act inside scope only.
+        XCTAssertTrue(UndoStepScope.isAllowed(
+            UndoStep(itemID: UUID(),
+                     kind: .trashFile(path: "\(root)/copy.txt"),
+                     description: "Trash the copy"),
+            roots: [root], home: home, resolve: identity))
+        XCTAssertFalse(UndoStepScope.isAllowed(
+            UndoStep(itemID: UUID(),
+                     kind: .removeFolderIfEmpty(path: "/Outside/Folder"),
+                     description: "Remove folder"),
+            roots: [root], home: home, resolve: identity))
+
+        // restoreBackup: the target must be in scope and the backup
+        // must be the app's own backup copy.
+        let backup = "/Users/tester/Library/Application Support/LocalLLM/ActionBackups/plan/item"
+        XCTAssertTrue(UndoStepScope.isAllowed(
+            UndoStep(itemID: UUID(),
+                     kind: .restoreBackup(backupPath: backup,
+                                          targetPath: "\(root)/notes.txt"),
+                     description: "Restore"),
+            roots: [root], home: home, resolve: identity))
+        XCTAssertFalse(UndoStepScope.isAllowed(
+            UndoStep(itemID: UUID(),
+                     kind: .restoreBackup(backupPath: "/Outside/evil",
+                                          targetPath: "\(root)/notes.txt"),
+                     description: "Restore"),
+            roots: [root], home: home, resolve: identity))
+        XCTAssertFalse(UndoStepScope.isAllowed(
+            UndoStep(itemID: UUID(),
+                     kind: .restoreBackup(backupPath: backup,
+                                          targetPath: "/Outside/notes.txt"),
+                     description: "Restore"),
+            roots: [root], home: home, resolve: identity))
+
+        // notUndoable runs nothing, so nothing is checked.
+        XCTAssertTrue(UndoStepScope.isAllowed(
+            UndoStep(itemID: UUID(),
+                     kind: .notUndoable(reason: "nope"),
+                     description: "Can't"),
+            roots: [], home: home, resolve: identity))
+    }
+
     // MARK: - Dedupe
 
     func testDuplicateDetection() {
