@@ -59,8 +59,20 @@ final class MLXModelStore {
     }
 
     private(set) var states: [String: DownloadState] = [:]
-    /// Exact on-disk bytes per downloaded model.
+    /// Exact on-disk bytes per downloaded model (the app's copy).
     private(set) var diskSizes: [String: Int64] = [:]
+    /// Audit E-11: the MLX bridge keeps its OWN copy of each model
+    /// in its Hugging Face cache (see the header note), so a model
+    /// costs roughly twice what `diskSizes` alone says. The total
+    /// size of that cache folder, measured by `refresh()` — the
+    /// Models panel shows both figures rather than half the truth.
+    private(set) var huggingFaceCacheBytes: Int64 = 0
+
+    /// The standard Hugging Face cache the MLX bridge loads from.
+    nonisolated static var huggingFaceCacheDirectory: URL {
+        URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(".cache/huggingface", isDirectory: true)
+    }
 
     private var downloadTasks: [String: Task<Void, Never>] = [:]
     /// Audit B-41: the generation stamps behind `downloadTasks` —
@@ -69,7 +81,7 @@ final class MLXModelStore {
 
     /// The folder model files live under. Internal (not private) so
     /// tests and future phases can find it.
-    static var modelsDirectory: URL {
+    nonisolated static var modelsDirectory: URL {
         let base = FileManager.default.urls(
             for: .applicationSupportDirectory, in: .userDomainMask)[0]
         return base.appendingPathComponent("LocalLLM/Models",
@@ -102,28 +114,66 @@ final class MLXModelStore {
 
     /// Re-reads the models folder (called at launch and after every
     /// download/delete, so the panel never lies about the disk).
+    ///
+    /// Audit E-90: the directory walks (per-model sizes + the HF
+    /// cache total) run OFF the main actor — `refresh()` used to
+    /// walk every downloaded model synchronously on the main actor,
+    /// stalling the UI at launch and after each download. The scan
+    /// is detached; only the state assignment hops back. Folder
+    /// EXISTENCE (cheap) is still checked synchronously, so states
+    /// never flicker while sizes are being measured.
     func refresh() {
-        var newStates: [String: DownloadState] = [:]
-        var newSizes: [String: Int64] = [:]
-        for info in MLXCatalog.models {
-            if downloadTasks[info.repoID] != nil { continue }
-            let directory = Self.directory(for: info)
-            if FileManager.default.fileExists(atPath: directory.path) {
-                newStates[info.repoID] = .downloaded
-                newSizes[info.repoID] = Self.sizeOfDirectory(directory)
-            } else {
-                newStates[info.repoID] = .notDownloaded
-            }
-        }
-        // Preserve in-flight and failed states the scan can't know.
+        var newStates = Self.scanModelFolders()
+        // Preserve in-flight and failed states the scan can't know
+        // (unchanged from the old synchronous refresh).
         for (repoID, state) in states {
+            if downloadTasks[repoID] != nil {
+                newStates[repoID] = state
+                continue
+            }
             if case .downloading = state { newStates[repoID] = state }
             if case .failed = state, newStates[repoID] == .notDownloaded {
                 newStates[repoID] = state
             }
         }
         states = newStates
-        diskSizes = newSizes
+        Task.detached { [weak self] in
+            let sizes = Self.measureSizes()
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                // Don't resurrect a model deleted while measuring.
+                self.diskSizes = sizes.sizes.filter {
+                    self.states[$0.key] == .downloaded
+                }
+                self.huggingFaceCacheBytes = sizes.cacheBytes
+            }
+        }
+    }
+
+    /// The synchronous half of a refresh: which models' folders
+    /// exist. (Sizes are the detached half — see `refresh()`.)
+    private static func scanModelFolders() -> [String: DownloadState] {
+        var newStates: [String: DownloadState] = [:]
+        for info in MLXCatalog.models {
+            let directory = directory(for: info)
+            newStates[info.repoID] = FileManager.default
+                .fileExists(atPath: directory.path)
+                ? .downloaded : .notDownloaded
+        }
+        return newStates
+    }
+
+    /// The detached half of a refresh: the byte totals.
+    nonisolated private static func measureSizes()
+        -> (sizes: [String: Int64], cacheBytes: Int64) {
+        var sizes: [String: Int64] = [:]
+        for info in MLXCatalog.models {
+            let directory = directory(for: info)
+            if FileManager.default.fileExists(atPath: directory.path) {
+                sizes[info.repoID] = sizeOfDirectory(directory)
+            }
+        }
+        return (sizes, sizeOfDirectory(huggingFaceCacheDirectory))
     }
 
     // MARK: - Downloading
@@ -149,15 +199,18 @@ final class MLXModelStore {
         downloadGenerations.advance(for: info.repoID)
         downloadTasks[info.repoID]?.cancel()
         downloadTasks[info.repoID] = nil
-        // The staging folder is cleaned up by the download task as it
-        // unwinds; reset the visible state right away.
+        // Audit E-11: the staging folder is KEPT on cancel — the
+        // files already fetched stay for the next attempt, which
+        // reuses every one whose size still matches the manifest
+        // (see `performDownload`). Reset the visible state right
+        // away; `deleteModel` is the path that removes staging.
         states[info.repoID] = .notDownloaded
-        try? FileManager.default.removeItem(at: Self.stagingDirectory(for: info))
     }
 
     func deleteModel(_ info: MLXModelInfo) {
         cancelDownload(info)
         try? FileManager.default.removeItem(at: Self.directory(for: info))
+        try? FileManager.default.removeItem(at: Self.stagingDirectory(for: info))
         refresh()
     }
 
@@ -193,14 +246,33 @@ final class MLXModelStore {
             let total = MLXDownloadPlanner.totalBytes(of: files)
 
             // 2. Download each file into the staging folder.
+            // Audit E-11: staging is NOT wiped first — a retry
+            // (after cancel, failure, or relaunch) reuses every
+            // file a previous attempt completed whose size still
+            // matches the manifest, instead of discarding a 95%
+            // download of a multi-GB model. Only the generation
+            // guard (B-41) decides whose staging this is: a stale
+            // attempt never reaches this loop (`isCurrent` checks
+            // per file), so reuse can't resurrect a cancelled
+            // attempt's claim on the folder.
             let staging = Self.stagingDirectory(for: info)
-            try? FileManager.default.removeItem(at: staging)
             try FileManager.default.createDirectory(
                 at: staging, withIntermediateDirectories: true)
             var received: Int64 = 0
             for file in files {
                 try Task.checkCancellation()
                 guard isCurrent() else { return }
+                let destination = staging.appendingPathComponent(file.path)
+                // Already here, complete, from an earlier attempt?
+                if file.size > 0,
+                   Self.sizeOfFile(destination) == file.size {
+                    received += file.size
+                    if total > 0, isCurrent() {
+                        states[repoID] = .downloading(
+                            fraction: min(1, Double(received) / Double(total)))
+                    }
+                    continue
+                }
                 guard let url = MLXDownloadPlanner.downloadURL(
                         repoID: repoID, path: file.path)
                 else { throw StoreFailure.unreachable }
@@ -209,7 +281,6 @@ final class MLXModelStore {
                    !(200...299).contains(http.statusCode) {
                     throw StoreFailure.notFound
                 }
-                let destination = staging.appendingPathComponent(file.path)
                 try FileManager.default.createDirectory(
                     at: destination.deletingLastPathComponent(),
                     withIntermediateDirectories: true)
@@ -235,17 +306,17 @@ final class MLXModelStore {
             try FileManager.default.moveItem(at: staging, to: destination)
             refresh()
         } catch is CancellationError {
-            // Only the current generation cleans up: the staging
-            // folder a stale attempt would delete may already be a
-            // restarted download's (audit B-41).
+            // Audit E-11: staging is KEPT (see step 2) — the files
+            // fetched so far are the next attempt's head start.
+            // Only the state resets, and only for the current
+            // generation (a stale attempt touches nothing, B-41).
             guard isCurrent() else { return }
-            try? FileManager.default.removeItem(at: Self.stagingDirectory(for: info))
             if states[repoID] != .notDownloaded {
                 states[repoID] = .notDownloaded
             }
         } catch let failure as StoreFailure {
             guard isCurrent() else { return }
-            try? FileManager.default.removeItem(at: Self.stagingDirectory(for: info))
+            // Staging kept for reuse on retry (E-11), as above.
             // If the task entry is already gone, the user cancelled and
             // set the state themselves — don't overwrite it with a
             // failure that was really just the cancellation landing.
@@ -254,7 +325,6 @@ final class MLXModelStore {
             }
         } catch {
             guard isCurrent() else { return }
-            try? FileManager.default.removeItem(at: Self.stagingDirectory(for: info))
             if downloadTasks[repoID] != nil {
                 states[repoID] = .failed(
                     message: "The download failed: \(error.localizedDescription)")
@@ -264,17 +334,17 @@ final class MLXModelStore {
 
     // MARK: - Folders
 
-    static func directory(for info: MLXModelInfo) -> URL {
+    nonisolated static func directory(for info: MLXModelInfo) -> URL {
         modelsDirectory.appendingPathComponent(info.directoryName,
                                                isDirectory: true)
     }
 
-    static func stagingDirectory(for info: MLXModelInfo) -> URL {
+    nonisolated static func stagingDirectory(for info: MLXModelInfo) -> URL {
         modelsDirectory.appendingPathComponent(info.directoryName + ".partial",
                                                isDirectory: true)
     }
 
-    private static func sizeOfDirectory(_ url: URL) -> Int64 {
+    nonisolated private static func sizeOfDirectory(_ url: URL) -> Int64 {
         guard let enumerator = FileManager.default.enumerator(
             at: url, includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
         var total: Int64 = 0
@@ -285,7 +355,7 @@ final class MLXModelStore {
         return total
     }
 
-    private static func sizeOfFile(_ url: URL) -> Int64 {
+    nonisolated private static func sizeOfFile(_ url: URL) -> Int64 {
         Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
     }
 

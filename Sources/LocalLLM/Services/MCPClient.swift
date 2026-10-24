@@ -76,6 +76,12 @@ final class MCPServerConnection: @unchecked Sendable {
     private var parser = MCPStreamParser()
     private var nextID = 1
     private var pending: [Int: CheckedContinuation<JSONValue, Error>] = [:]
+    /// Audit E-91: each pending request's timeout task, so it can
+    /// be CANCELLED when the response lands — previously every
+    /// request left a task sleeping for its full 15–30 s timeout
+    /// and then expiring an already-answered id (harmless, but
+    /// pure waste, and the tasks piled up under load).
+    private var timeoutTasks: [Int: Task<Void, Never>] = [:]
     private var stderrTail = ""
     private var isDead = false
     private(set) var remoteTools: [MCPRemoteTool] = []
@@ -244,15 +250,17 @@ final class MCPServerConnection: @unchecked Sendable {
                 return
             }
             pending[id] = continuation
-            lock.unlock()
             // The timeout races the response: whichever resumes the
             // continuation first wins, and the loser finds the entry
-            // already gone.
-            Task { [weak self] in
+            // already gone. Audit E-91: the task is STORED so the
+            // winner can cancel it — every completion path below
+            // (response, expiry, exit) removes and cancels it.
+            timeoutTasks[id] = Task { [weak self] in
                 try? await Task.sleep(for: .seconds(timeoutSeconds))
                 self?.expireRequest(id: id,
                                     error: MCPClientError.timeout(what: timeoutWhat))
             }
+            lock.unlock()
             if !writeToStdin(Data(line.utf8)) {
                 expireRequest(id: id, error: MCPClientError.serverStopped)
             }
@@ -288,7 +296,9 @@ final class MCPServerConnection: @unchecked Sendable {
     private func expireRequest(id: Int, error: Error) {
         lock.lock()
         let continuation = pending.removeValue(forKey: id)
+        let timeoutTask = timeoutTasks.removeValue(forKey: id)
         lock.unlock()
+        timeoutTask?.cancel()
         continuation?.resume(throwing: error)
     }
 
@@ -301,7 +311,12 @@ final class MCPServerConnection: @unchecked Sendable {
             case .response(let id, let result, let error):
                 lock.lock()
                 let continuation = pending.removeValue(forKey: id)
+                // Audit E-91: the response won the race — cancel
+                // the timeout task instead of letting it sleep out
+                // its full timeout.
+                let timeoutTask = timeoutTasks.removeValue(forKey: id)
                 lock.unlock()
+                timeoutTask?.cancel()
                 if let error {
                     continuation?.resume(
                         throwing: MCPClientError.serverError(message: error))
@@ -359,7 +374,13 @@ final class MCPServerConnection: @unchecked Sendable {
         let leftovers = parser.finish()
         let waiting = pending
         pending = [:]
+        // Audit E-91: every pending request is being answered (or
+        // failed) right here — none of their timeout tasks should
+        // outlive the connection.
+        let timeouts = timeoutTasks
+        timeoutTasks = [:]
         lock.unlock()
+        for (_, task) in timeouts { task.cancel() }
         for message in leftovers {
             if case .response(let id, let result, let error) = message {
                 if let continuation = waiting[id] {

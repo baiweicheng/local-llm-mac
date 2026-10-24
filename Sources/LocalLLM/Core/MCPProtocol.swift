@@ -240,12 +240,52 @@ struct MCPStreamParser {
     /// the newline byte and only completed lines are decoded.
     private var buffer = Data()
 
+    /// The most bytes one line may buffer without a newline
+    /// (audit E-12): a server that writes a huge unterminated line
+    /// (a log dump with no newlines, a misbehaving server) used to
+    /// grow this buffer without bound for the app's lifetime.
+    /// Past the cap the buffered line is reported once as
+    /// `.malformed` and dropped; framing resumes at the next
+    /// newline.
+    static let maxBufferedLineBytes = 1_048_576
+
+    /// True while an over-cap line is being discarded: incoming
+    /// bytes are dropped (not buffered) until its newline arrives.
+    private var discardingOversizedLine = false
+
     mutating func feed(_ chunk: Data) -> [MCPIncoming] {
-        buffer.append(chunk)
         var messages: [MCPIncoming] = []
-        while let newline = buffer.firstIndex(of: 0x0A) {
+        var rest = chunk
+        // Index-based splitting (audit E-12): consume each line by
+        // slicing ranges out of the accumulating buffer instead of
+        // repeatedly removing from its front (which shifted the
+        // whole remainder per line, O(k·B) per chunk).
+        while true {
+            if discardingOversizedLine {
+                guard let newline = rest.firstIndex(of: 0x0A) else {
+                    return messages // still inside the dropped line
+                }
+                rest = rest[rest.index(after: newline)...]
+                discardingOversizedLine = false
+                continue
+            }
+            buffer.append(rest)
+            rest = Data()
+            guard let newline = buffer.firstIndex(of: 0x0A) else {
+                if buffer.count > Self.maxBufferedLineBytes {
+                    // One malformed report for the overlong line,
+                    // then drop it and everything up to its
+                    // newline (which hasn't arrived yet).
+                    messages.append(.malformed(
+                        text: String(decoding: buffer.prefix(200),
+                                     as: UTF8.self)))
+                    buffer.removeAll()
+                    discardingOversizedLine = true
+                }
+                return messages
+            }
             let lineData = buffer[buffer.startIndex..<newline]
-            buffer.removeSubrange(buffer.startIndex...newline)
+            buffer = Data(buffer[buffer.index(after: newline)...])
             // A completed line from a conforming server is valid
             // UTF-8; decode lossily so a damaged line surfaces as
             // one `.malformed` message instead of vanishing.
@@ -255,7 +295,6 @@ struct MCPStreamParser {
                 messages.append(Self.parseLine(trimmed))
             }
         }
-        return messages
     }
 
     mutating func feed(_ text: String) -> [MCPIncoming] {

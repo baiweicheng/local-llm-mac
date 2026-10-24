@@ -103,6 +103,9 @@ struct ContentView: View {
         }
         .frame(minWidth: 760, minHeight: 480)
         .onAppear {
+            // Audit E-05: prune backup folders whose plan records
+            // are gone (or no longer undoable) — once per launch.
+            engine.pruneOrphanedActionBackups(context: modelContext)
             engine.configureBackendProvider { selection in
                 resolveBackend(selection)
             }

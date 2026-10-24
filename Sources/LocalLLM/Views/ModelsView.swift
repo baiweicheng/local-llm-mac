@@ -57,6 +57,21 @@ struct ModelsView: View {
             ForEach(MLXCatalog.models) { info in
                 mlxRow(info)
             }
+            // Audit E-11: the honest storage total. Each downloaded
+            // model exists TWICE on disk — the app's copy (managed
+            // and deletable here) and the MLX bridge's own Hugging
+            // Face cache copy, which loading a model fills. Showing
+            // only the app's half understated a 6.5 GB model as
+            // 6.5 GB when it really costs ~13 GB.
+            let appTotal = mlxStore.diskSizes.values.reduce(0, +)
+            if appTotal > 0 || mlxStore.huggingFaceCacheBytes > 0 {
+                Text("On disk: \(MLXCatalog.formatBytes(appTotal)) in this app's model folder"
+                     + (mlxStore.huggingFaceCacheBytes > 0
+                        ? ", plus \(MLXCatalog.formatBytes(mlxStore.huggingFaceCacheBytes)) in the Hugging Face cache the model loader keeps (each downloaded model lives in both places)."
+                        : "."))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 

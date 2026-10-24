@@ -1,7 +1,7 @@
 import Foundation
 
 /// Phase 5: the shared-folder scope check — the security boundary of
-/// the file tools, and the same scope Phase 6's write tools will
+/// the file tools, and the same scope the Phase 6 write tools
 /// reuse. A path is readable only if it is a designated folder itself
 /// or strictly inside one.
 ///

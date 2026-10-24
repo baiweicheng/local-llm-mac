@@ -69,4 +69,67 @@ enum ImageAttachmentCodec {
         else { return [] }
         return decoded.filter { isValid(data: $0.data) }
     }
+
+    /// How many images a stored blob holds, WITHOUT decoding any
+    /// image data (audit E-03). The blob is a JSON array of objects
+    /// whose first key is `data` (the JSONEncoder's declaration
+    /// order for `ImageAttachment`) — each image contributes exactly
+    /// one `"data":` key per object (brace-depth 2: array → object
+    /// → key), and base64 image
+    /// data can never contain a quote or colon, so counting those
+    /// key markers at depth 2 counts images. A blob that isn't the
+    /// expected array shape counts 0 (matching `decode`'s "unreadable
+    /// means none"). This is a byte scan, not a decode: no `Data`
+    /// payloads are materialized, validated, or copied — callers
+    /// that need the images themselves still use `decode`.
+    static func count(in blob: Data?) -> Int {
+        guard let blob, !blob.isEmpty else { return 0 }
+        let bytes = [UInt8](blob)
+        // Must look like a JSON array.
+        var index = 0
+        while index < bytes.count,
+              bytes[index] == 0x20 || bytes[index] == 0x09
+                || bytes[index] == 0x0A || bytes[index] == 0x0D {
+            index += 1
+        }
+        guard index < bytes.count, bytes[index] == 0x5B /* [ */ else {
+            return 0
+        }
+        let marker: [UInt8] = [0x22, 0x64, 0x61, 0x74, 0x61, 0x22, 0x3A] // "data":
+        var count = 0
+        var depth = 0
+        var inString = false
+        var escaped = false
+        var cursor = index
+        while cursor < bytes.count {
+            let byte = bytes[cursor]
+            if inString {
+                if escaped {
+                    escaped = false
+                } else if byte == 0x5C { // backslash
+                    escaped = true
+                } else if byte == 0x22 { // closing quote
+                    inString = false
+                }
+                cursor += 1
+                continue
+            }
+            switch byte {
+            case 0x22: // quote — but first, is it the "data": key?
+                if depth == 2,
+                   bytes[cursor...].starts(with: marker) {
+                    count += 1
+                    cursor += marker.count
+                    inString = false
+                    continue
+                }
+                inString = true
+            case 0x7B, 0x5B: depth += 1 // { [
+            case 0x7D, 0x5D: depth -= 1 // } ]
+            default: break
+            }
+            cursor += 1
+        }
+        return min(count, maxAttachmentsPerMessage)
+    }
 }

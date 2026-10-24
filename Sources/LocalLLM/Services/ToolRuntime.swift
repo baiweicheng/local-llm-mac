@@ -306,7 +306,7 @@ actor ToolRuntime {
         }
         guard let tool = configuration.mcpTools.first(
             where: { $0.namespacedName == descriptor.name }) else {
-            return "That tool isn't available — its MCP server may be off or may have stopped. The user can check it in Settings → Power tools."
+            return SharedWording.mcpToolUnavailable
         }
         let inputs = ActionInputs(mcpTool: tool,
                                   mcpArgumentsRaw: arguments.argumentsJSON)

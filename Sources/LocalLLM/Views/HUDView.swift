@@ -77,13 +77,22 @@ struct HUDConversationView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
+        // Audit E-02: the sorted messages and merged rows are
+        // computed ONCE per body pass and passed down — the old
+        // shape re-sorted in `rows`, the empty check, and the
+        // scroll target, per evaluation (and the panel re-evaluates
+        // on every streaming chunk, like the main window).
+        let sorted = conversation.sortedMessages
+        let mergedRows = Self.mergedRows(messages: sorted,
+                                         toolRecords: toolRecords,
+                                         planRecords: planRecords)
+        return VStack(spacing: 0) {
             header
             if !coordinator.contextSnapshot.chips.isEmpty {
                 chipsRow
             }
             Divider()
-            transcript
+            transcript(sortedMessages: sorted, rows: mergedRows)
             if let error = engine.errorMessages[conversationID] {
                 compactBanner(text: error, symbol: "exclamationmark.triangle",
                               color: .orange) {
@@ -200,18 +209,23 @@ struct HUDConversationView: View {
         }
     }
 
-    private var rows: [Row] {
-        var all: [Row] = conversation.sortedMessages.map(Row.message)
+    /// The merged rows for one body pass, from ALREADY-SORTED
+    /// messages (audit E-02) — a static so tests can pin the merge.
+    static func mergedRows(messages: [Message],
+                           toolRecords: [ToolActivityRecord],
+                           planRecords: [ActionPlanRecord]) -> [Row] {
+        var all: [Row] = messages.map(Row.message)
         all += toolRecords.map(Row.tool)
         all += planRecords.map(Row.plan)
         return all.sorted { $0.createdAt < $1.createdAt }
     }
 
-    private var transcript: some View {
+    private func transcript(sortedMessages: [Message],
+                            rows: [Row]) -> some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 12) {
-                    if conversation.sortedMessages.isEmpty && !isResponding {
+                    if sortedMessages.isEmpty && !isResponding {
                         VStack(spacing: 6) {
                             Text("Ask anything — this uses the same models and lookups as the main window, and the chat is saved in the sidebar like any other.")
                                 .font(.callout)
@@ -245,22 +259,23 @@ struct HUDConversationView: View {
                 .padding(12)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .onChange(of: conversation.sortedMessages.count) {
-                scrollToBottom(proxy)
+            .onChange(of: sortedMessages.count) {
+                scrollToBottom(proxy, sortedMessages: sortedMessages)
             }
             .onChange(of: engine.streamingText[conversationID]) {
-                scrollToBottom(proxy)
+                scrollToBottom(proxy, sortedMessages: sortedMessages)
             }
             .onChange(of: coordinator.summonGeneration) {
-                scrollToBottom(proxy)
+                scrollToBottom(proxy, sortedMessages: sortedMessages)
             }
         }
     }
 
-    private func scrollToBottom(_ proxy: ScrollViewProxy) {
+    private func scrollToBottom(_ proxy: ScrollViewProxy,
+                                sortedMessages: [Message]) {
         if isResponding {
             proxy.scrollTo("streaming", anchor: .bottom)
-        } else if let last = conversation.sortedMessages.last {
+        } else if let last = sortedMessages.last {
             proxy.scrollTo(last.id, anchor: .bottom)
         }
     }

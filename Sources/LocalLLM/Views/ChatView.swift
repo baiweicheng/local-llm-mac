@@ -86,6 +86,11 @@ struct ChatView: View {
     @State private var presetNameDraft = ""
     /// Images staged in the composer, waiting to go with the next send.
     @State private var pendingAttachments: [ImageAttachment] = []
+    /// Audit E-03: the thumbnail cache's identity for the composer
+    /// strip (staged images have no message yet) — one stable id
+    /// per chat view, reset whenever the strip empties so a later
+    /// batch never shows an earlier batch's cached thumbnails.
+    @State private var pendingStripID = UUID()
     /// Re-read on appear and after each send; the system state can change
     /// while the app is open (e.g. the model finishes downloading).
     @State private var availability: ModelAvailabilityState = .current
@@ -97,14 +102,33 @@ struct ChatView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
+        // Audit E-02: ONE sort and ONE transcript merge per body
+        // pass, shared by everything below. The old shape re-sorted
+        // the whole conversation and re-merged the transcript in
+        // `contextMeterText`, `transcriptItems`, the empty check,
+        // the onChange value, and the scroll target — and body
+        // re-evaluates on EVERY streaming chunk, so a long chat paid
+        // several full sorts per token.
+        let sorted = conversation.sortedMessages
+        let items = TranscriptBuilder.items(
+            messages: sorted,
+            summarizedCount: conversation.summarizedMessageCount,
+            toolRecords: toolRecords, planRecords: planRecords)
+        let allDescriptors = descriptors
+        let currentDescriptor = allDescriptors.first {
+            $0.selection == conversation.modelSelection
+        }
+        return VStack(spacing: 0) {
+            header(descriptors: allDescriptors,
+                   selectedDescriptor: currentDescriptor,
+                   sortedMessages: sorted)
             if conversation.modelSelection.isAuto,
                let note = engine.routingNotes[conversationID] {
                 routingNoteBar(note)
             }
             Divider()
-            messageList
+            messageList(sortedMessages: sorted, items: items,
+                        selectedDescriptor: currentDescriptor)
             if let error = engine.errorMessages[conversationID] {
                 errorBanner(error)
             }
@@ -116,7 +140,7 @@ struct ChatView: View {
             }
             if showsAvailabilityBanner {
                 availabilityBanner
-            } else if selectedDescriptor == nil {
+            } else if currentDescriptor == nil {
                 modelMissingBanner
             }
             if !engine.pendingPlan(for: conversationID).isEmpty {
@@ -186,17 +210,22 @@ struct ChatView: View {
 
     // MARK: - Header
 
-    private var header: some View {
+    private func header(descriptors: [BackendDescriptor],
+                          selectedDescriptor: BackendDescriptor?,
+                          sortedMessages: [Message]) -> some View {
         HStack(spacing: 10) {
             Text(conversation.title)
                 .font(.headline)
                 .lineLimit(1)
             Spacer()
-            Text(contextMeterText)
+            Text(contextMeterText(
+                sortedMessages: sortedMessages,
+                window: selectedDescriptor?.budget.windowTokens))
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            modelPicker
-            statusPill
+            modelPicker(descriptors: descriptors,
+                        selectedDescriptor: selectedDescriptor)
+            statusPill(selectedDescriptor: selectedDescriptor)
             if conversation.modelSelection.isCloud {
                 cloudBadge
             }
@@ -298,21 +327,22 @@ struct ChatView: View {
                 customOpenRouterModelID: settings.openRouterCustomModelID))
     }
 
-    /// The row for this chat's current selection — nil when the model
-    /// it points at was deleted or removed.
-    private var selectedDescriptor: BackendDescriptor? {
-        descriptors.first { $0.selection == conversation.modelSelection }
-    }
-
     /// Whether the selected backend can take a message right now. For
     /// the built-in model this is the Apple Intelligence state; a local
     /// server counts as ready when configured (whether it's running is
     /// only known at send time, and the error then says so).
+    /// (Audit E-02: the descriptor itself is computed ONCE in
+    /// `body` and passed down; this check recomputes the registry
+    /// lookup only for the composer's enable state, off the render
+    /// path of the transcript.)
     private var canChatWithSelection: Bool {
-        selectedDescriptor?.isReady ?? false
+        descriptors.first {
+            $0.selection == conversation.modelSelection
+        }?.isReady ?? false
     }
 
-    private var modelPicker: some View {
+    private func modelPicker(descriptors: [BackendDescriptor],
+                             selectedDescriptor: BackendDescriptor?) -> some View {
         Menu {
             ForEach(descriptors) { descriptor in
                 Button {
@@ -355,7 +385,7 @@ struct ChatView: View {
 
     /// Status pill for the selected backend: the Apple Intelligence
     /// state for the built-in model, the model's name for the others.
-    private var statusPill: some View {
+    private func statusPill(selectedDescriptor: BackendDescriptor?) -> some View {
         let onDevice = conversation.modelSelection.isOnDevice
         return HStack(spacing: 5) {
             Circle()
@@ -376,10 +406,11 @@ struct ChatView: View {
     /// approximate on purpose (see `PromptHistory`) and labeled as such;
     /// it counts the summary plus the live turns, which is what the
     /// model actually holds.
-    private var contextMeterText: String {
+    private func contextMeterText(sortedMessages: [Message],
+                                  window: Int?) -> String {
         let instructions = PromptHistory.mergedInstructions(
             userInstructions: conversation.systemInstructions)
-        let all = conversation.sortedMessages
+        let all = sortedMessages
         let prefix = min(conversation.summarizedMessageCount, all.count)
         let turns = all.dropFirst(prefix).map { $0.chatTurn }
         var used = PromptHistory.estimatedContextTokens(
@@ -387,8 +418,7 @@ struct ChatView: View {
         if let summary = conversation.contextSummary {
             used += PromptHistory.approximateTokenCount(for: summary)
         }
-        let window = selectedDescriptor?.budget.windowTokens
-            ?? ContextBudget.onDevice.windowTokens
+        let window = window ?? ContextBudget.onDevice.windowTokens
         return "≈ \(used) / \(window) tokens"
     }
 
@@ -401,7 +431,7 @@ struct ChatView: View {
     /// semantics — it belongs to the message sequence (tool records
     /// are not messages and never affect the compaction prefix), so
     /// it's placed by message position within the merged list.
-    private enum TranscriptItem: Identifiable {
+    enum TranscriptItem: Identifiable {
         case message(Message)
         case tool(ToolActivityRecord)
         case plan(ActionPlanRecord)
@@ -428,46 +458,57 @@ struct ChatView: View {
         }
     }
 
-    private var transcriptItems: [TranscriptItem] {
-        let messages = conversation.sortedMessages
-        let summarized = conversation.summarizedMessageCount
-        // Tool cards and plan cards share one time-ordered stream of
-        // non-message items; the divider stays placed by message
-        // position, exactly as before.
-        var events: [TranscriptItem] = toolRecords.map(TranscriptItem.tool)
-        events += planRecords.map(TranscriptItem.plan)
-        events.sort { $0.createdAt < $1.createdAt }
-        var items: [TranscriptItem] = []
-        var eventIndex = 0
-        for (index, message) in messages.enumerated() {
-            while eventIndex < events.count,
-                  events[eventIndex].createdAt <= message.createdAt {
+    /// Builds the merged transcript from ALREADY-SORTED messages
+    /// (audit E-02): kept separate from the view so the merge logic
+    /// is exercised by tests, and so `body` computes it exactly
+    /// once per pass from the one sorted array it shares with the
+    /// context meter, the empty check, and the scroll target.
+    enum TranscriptBuilder {
+        static func items(messages: [Message],
+                          summarizedCount: Int,
+                          toolRecords: [ToolActivityRecord],
+                          planRecords: [ActionPlanRecord]) -> [TranscriptItem] {
+            let summarized = summarizedCount
+            // Tool cards and plan cards share one time-ordered stream of
+            // non-message items; the divider stays placed by message
+            // position, exactly as before.
+            var events: [TranscriptItem] = toolRecords.map(TranscriptItem.tool)
+            events += planRecords.map(TranscriptItem.plan)
+            events.sort { $0.createdAt < $1.createdAt }
+            var items: [TranscriptItem] = []
+            var eventIndex = 0
+            for (index, message) in messages.enumerated() {
+                while eventIndex < events.count,
+                      events[eventIndex].createdAt <= message.createdAt {
+                    items.append(events[eventIndex])
+                    eventIndex += 1
+                }
+                if index == summarized, summarized > 0 {
+                    items.append(.divider)
+                }
+                items.append(.message(message))
+            }
+            if summarized > 0, summarized >= messages.count {
+                items.append(.divider)
+            }
+            while eventIndex < events.count {
                 items.append(events[eventIndex])
                 eventIndex += 1
             }
-            if index == summarized, summarized > 0 {
-                items.append(.divider)
-            }
-            items.append(.message(message))
+            return items
         }
-        if summarized > 0, summarized >= messages.count {
-            items.append(.divider)
-        }
-        while eventIndex < events.count {
-            items.append(events[eventIndex])
-            eventIndex += 1
-        }
-        return items
     }
 
-    private var messageList: some View {
+    private func messageList(sortedMessages: [Message],
+                             items: [TranscriptItem],
+                             selectedDescriptor: BackendDescriptor?) -> some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 16) {
-                    if conversation.sortedMessages.isEmpty && !isResponding {
-                        emptyState
+                    if sortedMessages.isEmpty && !isResponding {
+                        emptyState(selectedDescriptor: selectedDescriptor)
                     }
-                    ForEach(transcriptItems) { item in
+                    ForEach(items) { item in
                         switch item {
                         case .message(let message):
                             MessageBubble(message: message)
@@ -488,32 +529,32 @@ struct ChatView: View {
                 .padding(16)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .onChange(of: conversation.sortedMessages.count) {
-                scrollToBottom(proxy)
+            .onChange(of: sortedMessages.count) {
+                scrollToBottom(proxy, sortedMessages: sortedMessages)
             }
             .onChange(of: toolRecords.count) {
-                scrollToBottom(proxy)
+                scrollToBottom(proxy, sortedMessages: sortedMessages)
             }
             .onChange(of: planRecords.count) {
-                scrollToBottom(proxy)
+                scrollToBottom(proxy, sortedMessages: sortedMessages)
             }
             .onChange(of: engine.pendingPlan(for: conversationID).count) {
-                scrollToBottom(proxy)
+                scrollToBottom(proxy, sortedMessages: sortedMessages)
             }
             .onChange(of: engine.streamingText[conversationID]) {
-                scrollToBottom(proxy)
+                scrollToBottom(proxy, sortedMessages: sortedMessages)
             }
         }
     }
 
-    private var emptyState: some View {
+    private func emptyState(selectedDescriptor: BackendDescriptor?) -> some View {
         VStack(spacing: 8) {
             Image(systemName: "sparkles")
                 .font(.largeTitle)
                 .foregroundStyle(.secondary)
             Text("Ask anything")
                 .font(.title3)
-            Text(emptyStateText)
+            Text(emptyStateText(selectedDescriptor: selectedDescriptor))
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -522,10 +563,11 @@ struct ChatView: View {
         .padding(.vertical, 48)
     }
 
-    private func scrollToBottom(_ proxy: ScrollViewProxy) {
+    private func scrollToBottom(_ proxy: ScrollViewProxy,
+                                sortedMessages: [Message]) {
         if isResponding {
             proxy.scrollTo("streaming", anchor: .bottom)
-        } else if let last = conversation.sortedMessages.last {
+        } else if let last = sortedMessages.last {
             proxy.scrollTo(last.id, anchor: .bottom)
         }
     }
@@ -549,7 +591,7 @@ struct ChatView: View {
         .background(Color.orange.opacity(0.15))
     }
 
-    private var emptyStateText: String {
+    private func emptyStateText(selectedDescriptor: BackendDescriptor?) -> String {
         if conversation.modelSelection.isAuto {
             return "This chat is on Auto: each message is sorted on your Mac and given to the best model for the job — the built-in model for quick things, a bigger downloaded model for hard ones, and a cloud model when a prompt really needs one and a cloud route is set up. The note under the header always says which model got each message."
         }
@@ -638,7 +680,7 @@ struct ChatView: View {
     private var modelMissingBanner: some View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: "info.circle")
-            Text("The model this chat was using isn't available anymore — it was deleted or removed. Pick a model in the header to keep chatting.")
+            Text(SharedWording.modelUnavailableBanner)
                 .font(.callout)
             Spacer()
         }
@@ -721,24 +763,27 @@ struct ChatView: View {
     private var pendingStrip: some View {
         HStack(spacing: 8) {
             ForEach(Array(pendingAttachments.enumerated()), id: \.offset) { index, attachment in
-                if let image = NSImage(data: attachment.data) {
-                    Image(nsImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                        .frame(width: 44, height: 44)
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                        .overlay(alignment: .topTrailing) {
-                            Button {
-                                pendingAttachments.remove(at: index)
-                            } label: {
-                                Image(systemName: "xmark.circle.fill")
-                                    .foregroundStyle(.white, .black.opacity(0.55))
+                // Audit E-03: cached downscaled thumbnail, like the
+                // transcript's — not a full decode per render.
+                AttachmentThumbnailView(messageID: pendingStripID,
+                                        index: index,
+                                        data: attachment.data,
+                                        side: 44)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .overlay(alignment: .topTrailing) {
+                        Button {
+                            pendingAttachments.remove(at: index)
+                            if pendingAttachments.isEmpty {
+                                pendingStripID = UUID()
                             }
-                            .buttonStyle(.borderless)
-                            .offset(x: 5, y: -5)
-                            .help("Remove image")
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.white, .black.opacity(0.55))
                         }
-                }
+                        .buttonStyle(.borderless)
+                        .offset(x: 5, y: -5)
+                        .help("Remove image")
+                    }
             }
             Spacer()
         }
@@ -755,6 +800,7 @@ struct ChatView: View {
         let attachments = pendingAttachments
         input = ""
         pendingAttachments = []
+        pendingStripID = UUID()
         availability = .current
         engine.send(text: text, attachments: attachments,
                     in: conversation, context: modelContext)

@@ -51,12 +51,46 @@ enum ChatSearch {
         return ChatSearchHit(titleMatched: titleMatched, snippet: snippet)
     }
 
+    /// Every hit in a list of chats, computed in ONE pass (audit
+    /// E-01): the sidebar caches this keyed by (query, corpus
+    /// fingerprint) instead of re-running `hit` per row per body
+    /// evaluation — the old shape rescanned (and re-flattened)
+    /// every message of every conversation several times per
+    /// keystroke.
+    static func hits(
+        in chats: [(id: UUID, title: String, messageTexts: [String])],
+        query rawQuery: String
+    ) -> [UUID: ChatSearchHit] {
+        let query = normalizedQuery(rawQuery)
+        guard !query.isEmpty else { return [:] }
+        var result: [UUID: ChatSearchHit] = [:]
+        for chat in chats {
+            if let found = hit(title: chat.title,
+                               messageTexts: chat.messageTexts,
+                               query: query) {
+                result[chat.id] = found
+            }
+        }
+        return result
+    }
+
     /// The snippet for one message's text, or nil when the text
     /// doesn't contain the query.
     static func snippet(in text: String, matching rawQuery: String,
                         context: Int = snippetContext) -> String? {
         let query = normalizedQuery(rawQuery)
         guard !query.isEmpty else { return nil }
+        // Audit E-01: test the match BEFORE flattening. Flattening
+        // allocates a split+join over the WHOLE text; doing it first
+        // meant every non-matching message paid that cost before
+        // the range test could fail. The cheap test runs on the raw
+        // text with whitespace runs collapsed in the QUERY instead:
+        // a query whose words appear in order, separated only by
+        // whitespace, is the only way the flattened text can match.
+        // When that test passes, the text is flattened exactly once
+        // and the snippet is built from the flattened form, as
+        // before — identical results, a fraction of the allocation.
+        guard rawTextMayMatch(text, query: query) else { return nil }
         let flat = flatten(text)
         guard let match = flat.range(of: query,
                                      options: [.caseInsensitive,
@@ -87,6 +121,32 @@ enum ChatSearch {
     private static func contains(_ text: String, _ query: String) -> Bool {
         text.range(of: query,
                    options: [.caseInsensitive, .diacriticInsensitive]) != nil
+    }
+
+    /// The pre-flatten match test (audit E-01): could `flatten(text)`
+    /// contain `query`? Flattening only collapses whitespace runs
+    /// to single spaces, so a flattened match means the query's
+    /// whitespace-separated words occur in `text` in order, each
+    /// found (case/diacritic-insensitively) after the previous
+    /// one's end, with nothing but whitespace allowed BETWEEN
+    /// words beyond what the words themselves span. Single-word
+    /// queries (the overwhelmingly common case) reduce to the
+    /// plain `contains` test on the raw text.
+    static func rawTextMayMatch(_ text: String, query: String) -> Bool {
+        let words = query.split(whereSeparator: { $0.isWhitespace })
+            .map(String.init)
+        guard let first = words.first else { return false }
+        guard words.count > 1 else { return contains(text, first) }
+        var searchFrom = text.startIndex
+        for word in words {
+            let slice = text[searchFrom...]
+            guard let found = slice.range(
+                of: word,
+                options: [.caseInsensitive, .diacriticInsensitive])
+            else { return false }
+            searchFrom = found.upperBound
+        }
+        return true
     }
 
     /// Message text as a snippet can show it: newlines and runs of

@@ -614,7 +614,7 @@ enum ActionProposal {
     private static func mcpCall(inputs: ActionInputs, roots: [String],
                                 probe: FileSystemProbe, home: String) -> ProposalOutcome {
         guard let tool = inputs.mcpTool else {
-            return .refused("That tool isn't available — its MCP server may be off or may have stopped. The user can check it in Settings → Power tools.")
+            return .refused(SharedWording.mcpToolUnavailable)
         }
         switch MCPArguments.canonicalize(inputs.mcpArgumentsRaw) {
         case .refused(let reason):
@@ -921,7 +921,6 @@ struct ExecutedActionItem: Codable, Sendable, Equatable {
         self.modelDetail = modelDetail
     }
 
-    var succeeded: Bool { outcome == .done }
 }
 
 /// JSON coding for plan records, in one place so the record model
@@ -1086,5 +1085,60 @@ enum ActionUndo {
             if case .notUndoable = step.kind { return false }
             return true
         }
+    }
+}
+
+extension ActionPlanRecord {
+
+    /// `canUndo` against an ALREADY-DECODED item list (audit E-09):
+    /// the transcript card decodes `items` once per body pass and
+    /// passes them here, instead of the record property's version
+    /// decoding the whole JSON blob again for the check.
+    func canUndo(items: [ExecutedActionItem]) -> Bool {
+        status == .executed && !isUndone
+            && ActionUndo.hasUndoableSteps(for: items)
+    }
+}
+
+// MARK: - Backup retention (audit E-05)
+
+/// Which per-plan backup folders may be deleted, decided purely.
+///
+/// Every approved plan that edits an existing file keeps a copy
+/// of the old contents under `ActionBackups/<record id>/` — that
+/// copy is what Undo restores. The safety rule is therefore
+/// absolute: **a backup is deletable only when NO retained plan
+/// record can still reach it** — i.e. the record is gone (rotated
+/// away, its conversation deleted, the log cleared), or the record
+/// is retained but can never undo again (already undone, or
+/// discarded — a discarded plan never ran and never made backups).
+/// A retained, executed, not-yet-undone record keeps its folder,
+/// however old it is.
+enum ActionBackupRetention {
+
+    /// The backup folder's name for a plan record: its id.
+    static func folderName(recordID: UUID) -> String {
+        recordID.uuidString
+    }
+
+    /// The folder names (subdirectory names under `ActionBackups/`)
+    /// that may be deleted, given the names present on disk and a
+    /// snapshot of every RETAINED plan record.
+    ///
+    /// - Parameters:
+    ///   - folderNames: directory names currently on disk.
+    ///   - retained: (record id, status, isUndone) for each record
+    ///     still in the store.
+    static func deletableFolders(
+        folderNames: [String],
+        retained: [(id: UUID, status: ActionPlanRecord.Status,
+                    isUndone: Bool)]
+    ) -> [String] {
+        var protected: Set<String> = []
+        for record in retained
+        where record.status == .executed && !record.isUndone {
+            protected.insert(folderName(recordID: record.id))
+        }
+        return folderNames.filter { !protected.contains($0) }
     }
 }

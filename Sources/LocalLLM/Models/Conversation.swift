@@ -153,9 +153,19 @@ final class Message {
         ImageAttachmentCodec.decode(attachmentsData)
     }
 
+    /// How many images this message carries, WITHOUT decoding them
+    /// (audit E-03): the count comes from the codec's header-only
+    /// scan of the blob — no image data is validated or copied.
+    var attachmentCount: Int {
+        ImageAttachmentCodec.count(in: attachmentsData)
+    }
+
     /// This message as a detached turn for the context logic.
+    /// Uses the cheap count above — the old form decoded the whole
+    /// blob (every image's full JPEG data) just to count it, on
+    /// every context-meter render and every send (audit E-03).
     var chatTurn: ChatTurn {
         ChatTurn(role: messageRole, text: text,
-                 attachmentCount: attachments.count)
+                 attachmentCount: attachmentCount)
     }
 }

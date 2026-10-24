@@ -1,4 +1,5 @@
 import XCTest
+import SwiftData
 @testable import LocalLLM
 
 /// Tests for the pure logic — instructions merging, token estimation,
@@ -371,18 +372,37 @@ final class LocalLLMTests: XCTestCase {
             ContextBudget.mlxLocal.windowTokens)
     }
 
-    func testConversationPersistsModelSelection() {
+    func testConversationPersistsModelSelection() throws {
+        // Audit E-19: this test's name promised PERSISTENCE but
+        // the body only exercised the in-memory codec (already
+        // covered by `testModelSelectionStorageRoundTrip`). It now
+        // does what it says: insert into a real (in-memory)
+        // container, save, refetch through a FRESH context, and
+        // compare — the Phase 3 guarantee that a chat's model
+        // choice survives.
+        let container = try ModelContainer(
+            for: Conversation.self, Message.self,
+            configurations: ModelConfiguration(isStoredInMemoryOnly: true))
+        let context = ModelContext(container)
         let conversation = Conversation()
         // Phase 4: a brand-new chat starts on Auto.
         XCTAssertEqual(conversation.modelSelection, .auto)
 
         let mlx = ModelSelection.mlx(repoID: "mlx-community/Qwen2.5-14B-Instruct-4bit")
         conversation.modelSelection = mlx
-        XCTAssertEqual(conversation.modelSelectionRaw, mlx.storageKey)
-        XCTAssertEqual(conversation.modelSelection, mlx)
+        context.insert(conversation)
+        try context.save()
 
-        conversation.modelSelectionRaw = "endpoint:not-a-uuid"
-        XCTAssertEqual(conversation.modelSelection, .onDevice)
+        let refetch = ModelContext(container)
+        let fetched = try XCTUnwrap(
+            try refetch.fetch(FetchDescriptor<Conversation>()).first)
+        XCTAssertEqual(fetched.modelSelectionRaw, mlx.storageKey)
+        XCTAssertEqual(fetched.modelSelection, mlx)
+
+        // The codec fallback still holds: an unrecognized stored
+        // value reads back as the built-in model.
+        fetched.modelSelectionRaw = "endpoint:not-a-uuid"
+        XCTAssertEqual(fetched.modelSelection, .onDevice)
     }
 
     // MARK: - Phase 3: backend registry

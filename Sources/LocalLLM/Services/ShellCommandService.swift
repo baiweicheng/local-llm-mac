@@ -94,8 +94,30 @@ private final class ShellRunState: @unchecked Sendable {
     }
 
     private let lock = NSLock()
-    private var output = ""
+    /// Audit E-13: captured output is kept as a list of chunks with
+    /// an INCREMENTALLY tracked character count. The old shape —
+    /// one growing String, `output.count` (a full grapheme walk)
+    /// plus a 200k copy on EVERY chunk once near the cap — made a
+    /// chatty command pay O(chunks × 200k). Now: appending a chunk
+    /// is O(chunk); compaction is LAZY — only when the buffered
+    /// total passes TWICE the retention cap are the chunks joined
+    /// and cut back to the retained tail in one pass, so the
+    /// O(cap) work happens once per cap's worth of output, not per
+    /// chunk. Memory stays bounded (≈2× cap + one chunk) and the
+    /// retention semantics are exactly B-49's: what survives is
+    /// always the true TAIL of everything printed.
+    private var outputChunks: [String] = []
+    private var outputCharacterCount = 0
     private var outputWasCapped = false
+
+    /// The retained output: the chunks joined and — if they ever
+    /// crossed the cap — cut to the retained tail. Called once, at
+    /// finish.
+    private var output: String {
+        let joined = outputChunks.joined()
+        return outputWasCapped
+            ? ShellOutput.retainedTail(joined) : joined
+    }
     private var continuation: CheckedContinuation<Outcome, Never>?
     private var finalOutcome: Outcome?
     private var timedOut = false
@@ -112,15 +134,21 @@ private final class ShellRunState: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard finalOutcome == nil else { return }
-        output += text
-        if output.count > ShellOutput.retainedCharacterCap {
-            // Audit B-49: retain a true TAIL. The old code kept the
-            // prefix and dropped everything after the cap, then
-            // told the user "the middle was dropped" — in fact the
-            // END was dropped, and the model-facing tail was the
-            // end of the beginning.
-            output = ShellOutput.retainedTail(output)
+        outputChunks.append(text)
+        outputCharacterCount += text.count
+        if outputCharacterCount > ShellOutput.retainedCharacterCap {
+            // Past the cap: something will be dropped (B-49: the
+            // BEGINNING — the retained text is the tail, and the
+            // finish note says so).
             outputWasCapped = true
+        }
+        if outputCharacterCount > 2 * ShellOutput.retainedCharacterCap {
+            // Lazy compaction (E-13): one join + suffix per cap's
+            // worth of output, instead of per chunk.
+            let tail = ShellOutput.retainedTail(
+                outputChunks.joined())
+            outputChunks = [tail]
+            outputCharacterCount = tail.count
         }
     }
 
@@ -128,12 +156,6 @@ private final class ShellRunState: @unchecked Sendable {
         lock.lock()
         timedOut = true
         lock.unlock()
-    }
-
-    var isTimedOut: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return timedOut
     }
 
     /// The process exited. Finishes the run only once the pipe has

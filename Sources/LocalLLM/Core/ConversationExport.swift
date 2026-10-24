@@ -116,15 +116,34 @@ enum ConversationExport {
         }
     }
 
+    /// One cached formatter per time zone (audit E-15): an export
+    /// stamps 3 + one-per-message dates, and `DateFormatter`
+    /// creation is expensive enough that a 2,000-message export
+    /// used to build ~2,003 of them. Formatters here are only ever
+    /// used on the caller's thread during a single export pass;
+    /// the cache itself is lock-guarded.
+    private static var formattersByTimeZone: [String: DateFormatter] = [:]
+    private static let formatterLock = NSLock()
+
     /// "Oct 23, 2026 at 2:15 PM" — an explicit format (not a
     /// locale style) so the output is identical on every Mac and
     /// the golden tests are stable; `timeZone` is injectable for
     /// the same reason and defaults to the reader's own zone.
     private static func stamp(_ date: Date, timeZone: TimeZone) -> String {
+        formatter(for: timeZone).string(from: date)
+    }
+
+    private static func formatter(for timeZone: TimeZone) -> DateFormatter {
+        formatterLock.lock()
+        defer { formatterLock.unlock() }
+        if let cached = formattersByTimeZone[timeZone.identifier] {
+            return cached
+        }
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US")
         formatter.timeZone = timeZone
         formatter.dateFormat = "MMM d, yyyy 'at' h:mm a"
-        return formatter.string(from: date)
+        formattersByTimeZone[timeZone.identifier] = formatter
+        return formatter
     }
 }

@@ -58,10 +58,6 @@ final class MCPServerStore {
         configs.first { $0.id == id }
     }
 
-    var enabledConfigs: [MCPServerConfig] {
-        configs.filter { $0.isEnabled }
-    }
-
     private func persist() {
         if let data = MCPServerConfigCodec.encode(configs) {
             defaults.set(data, forKey: defaultsKey)

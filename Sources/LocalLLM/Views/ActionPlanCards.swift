@@ -192,13 +192,20 @@ struct ActionPlanCard: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        // Audit E-09: decode the item list ONCE per body pass and
+        // pass it down — the header, the rows, and the undo check
+        // used to each decode the whole JSON blob separately (at
+        // least four full decodes per card per pass, and passes
+        // happen at streaming-chunk rate while any reply streams).
+        let items = record.items
+        let canUndo = record.canUndo(items: items)
+        return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 Image(systemName: record.status == .discarded
                       ? "checklist.unchecked" : "checklist.checked")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text(headerText)
+                Text(headerText(items: items))
                     .font(.caption)
                     .fontWeight(.semibold)
                 Spacer()
@@ -206,7 +213,7 @@ struct ActionPlanCard: View {
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
-            ForEach(record.items, id: \.action.id) { item in
+            ForEach(items, id: \.action.id) { item in
                 itemRow(item)
             }
             if showsUndoButton, record.status == .executed, !record.isUndone {
@@ -222,8 +229,8 @@ struct ActionPlanCard: View {
                         Label("Undo these changes", systemImage: "arrow.uturn.backward")
                             .font(.caption)
                     }
-                    .disabled(!record.canUndo || busy)
-                    .help(record.canUndo
+                    .disabled(!canUndo || busy)
+                    .help(canUndo
                           ? "Reverse what can be reversed, newest change first"
                           : "Nothing in this list can be reversed anymore")
                 }
@@ -241,18 +248,18 @@ struct ActionPlanCard: View {
                     in: RoundedRectangle(cornerRadius: 8))
     }
 
-    private var headerText: String {
-        let count = record.items.count
+    private func headerText(items: [ExecutedActionItem]) -> String {
+        let count = items.count
         // Phase 9: a plan holding commands or server calls speaks
         // of "actions", and its discards promise nothing RAN either.
-        let hasPowerItems = record.items.contains { !$0.action.kind.isUndoable }
+        let hasPowerItems = items.contains { !$0.action.kind.isUndoable }
         let noun = hasPowerItems
             ? (count == 1 ? "action" : "actions")
             : (count == 1 ? "file change" : "file changes")
         if record.status == .discarded {
             return "\(count) \(noun) discarded — nothing was changed or run"
         }
-        let done = record.items.filter { $0.outcome == .done }.count
+        let done = items.filter { $0.outcome == .done }.count
         if done == count {
             return count == 1 ? "\(noun.capitalized) done" : "\(count) \(noun) done"
         }

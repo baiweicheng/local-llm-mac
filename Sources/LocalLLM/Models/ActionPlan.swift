@@ -30,8 +30,9 @@ final class ActionPlanRecord {
     init(conversationID: UUID,
          status: Status,
          items: [ExecutedActionItem],
-         createdAt: Date = Date()) {
-        self.id = UUID()
+         createdAt: Date = Date(),
+         id: UUID = UUID()) {
+        self.id = id
         self.conversationID = conversationID
         self.createdAt = createdAt
         self.statusRaw = status.rawValue

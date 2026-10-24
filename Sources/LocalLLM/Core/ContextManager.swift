@@ -85,9 +85,14 @@ enum ContextManager {
         // Pick the longest suffix of whole exchanges that fits alongside
         // the fixed parts. Candidate suffixes start at user turns;
         // scanning from the oldest candidate gives the longest fit.
+        // Audit E-07: suffix sums are computed ONCE, in a single
+        // pass from the end — the old loop re-summed the suffix
+        // from scratch for every user-turn candidate, O(u·n) adds
+        // per plan, and planning runs up to four times per send.
+        let suffixTokens = suffixSums(turnTokens)
         var suffixStart: Int? = nil
         for candidate in liveTurns.indices where liveTurns[candidate].role == .user {
-            if turnTokens[candidate...].reduce(0, +) <= recentAllowance {
+            if suffixTokens[candidate] <= recentAllowance {
                 suffixStart = candidate
                 break
             }
@@ -112,8 +117,9 @@ enum ContextManager {
         if toSummarize.count > 1 {
             var used = 0
             var kept = 0
-            for turn in toSummarize {
-                let cost = tokens(for: turn)
+            // `toSummarize` is a prefix of `liveTurns`, so its
+            // costs are `turnTokens`' prefix — reuse them (E-07).
+            for cost in turnTokens.prefix(toSummarize.count) {
                 if kept > 0, used + cost > summarizerAllowance { break }
                 used += cost
                 kept += 1
@@ -135,14 +141,33 @@ enum ContextManager {
         }
 
         let recent = Array(liveTurns.dropFirst(toSummarize.count))
+        // Audit E-07: the projection reuses `turnTokens` (the
+        // counts this plan already computed) instead of recounting
+        // every recent turn's text a second time.
+        let recentTokens = turnTokens.dropFirst(toSummarize.count)
+            .reduce(0, +)
         let projected = instructionsTokens + summaryAllowance
-            + recent.map { tokens(for: $0) }.reduce(0, +) + promptTokens
+            + recentTokens + promptTokens
         return CompactionPlan(
             needsCompaction: !toSummarize.isEmpty,
             turnsToSummarize: toSummarize,
             recentTurns: recent,
             overflowWarning: projected > budget.promptAllowanceTokens,
             projectedTokens: projected)
+    }
+
+    /// Suffix sums of per-turn token counts (audit E-07):
+    /// `result[i]` is the total tokens of turns `i...`, computed in
+    /// one pass from the end. Pure, and pinned by tests — the
+    /// planning loop above used to recompute these per candidate.
+    static func suffixSums(_ turnTokens: [Int]) -> [Int] {
+        var result = [Int](repeating: 0, count: turnTokens.count)
+        var running = 0
+        for index in turnTokens.indices.reversed() {
+            running += turnTokens[index]
+            result[index] = running
+        }
+        return result
     }
 
     /// Estimated tokens for one turn: its text plus a flat allowance per

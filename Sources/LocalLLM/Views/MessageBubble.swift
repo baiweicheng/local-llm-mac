@@ -1,5 +1,70 @@
 import SwiftUI
 import AppKit
+import ImageIO
+
+/// Audit E-03: decoded attachment thumbnails, cached by identity.
+///
+/// Rendering a thumbnail used to run `NSImage(data:)` — a FULL
+/// JPEG decode to a bitmap (≈4 MB for a 1024² image) — inside
+/// `body`, for every attachment, on every re-evaluation (scroll,
+/// streaming updates elsewhere, any state change). This cache
+/// decodes each attachment ONCE, downscaled to thumbnail size via
+/// ImageIO (which decodes at the requested size), and hands the
+/// same `NSImage` to every later render. Keyed by the owning
+/// message's id + the attachment's index in it; bounded, with
+/// simple oldest-first eviction — thumbnails are small (≈72 px)
+/// and re-decodable, so eviction is harmless.
+@MainActor
+enum AttachmentThumbnailCache {
+
+    static let maxPixelSize = 72
+    private static let maxEntries = 128
+    private static var cache: [String: NSImage] = [:]
+    private static var insertionOrder: [String] = []
+
+    static func thumbnail(messageID: UUID, index: Int,
+                          data: Data) -> NSImage? {
+        let key = "\(messageID.uuidString)-\(index)"
+        if let cached = cache[key] { return cached }
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let cgImage = CGImageSourceCreateThumbnailAtIndex(
+                source, 0, [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+                ] as CFDictionary) else { return nil }
+        let image = NSImage(cgImage: cgImage,
+                            size: NSSize(width: cgImage.width,
+                                         height: cgImage.height))
+        cache[key] = image
+        insertionOrder.append(key)
+        if insertionOrder.count > maxEntries {
+            let evicted = insertionOrder.removeFirst()
+            cache[evicted] = nil
+        }
+        return image
+    }
+}
+
+/// One thumbnail slot, shared by the message bubble and the
+/// composer's pending strip: cache-first, aspect-fill, fixed frame.
+struct AttachmentThumbnailView: View {
+    let messageID: UUID
+    let index: Int
+    let data: Data
+    var side: CGFloat = 72
+
+    var body: some View {
+        if let image = AttachmentThumbnailCache.thumbnail(
+            messageID: messageID, index: index, data: data) {
+            Image(nsImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .frame(width: side, height: side)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+        }
+    }
+}
 
 /// One message in the transcript.
 ///
@@ -11,11 +76,16 @@ struct MessageBubble: View {
 
     var body: some View {
         if message.messageRole == .user {
+            // Audit E-03: decode the blob ONCE per body pass and
+            // share the result — the emptiness check and the
+            // thumbnails used to decode it separately, every pass.
+            let attachments = message.attachments
             HStack {
                 Spacer(minLength: 80)
                 VStack(alignment: .trailing, spacing: 6) {
-                    if !message.attachments.isEmpty {
-                        AttachmentThumbnails(attachments: message.attachments)
+                    if !attachments.isEmpty {
+                        AttachmentThumbnails(messageID: message.id,
+                                             attachments: attachments)
                     }
                     if !message.text.isEmpty {
                         Text(message.text)
@@ -84,22 +154,21 @@ struct TelemetryPill: View {
 /// The images attached to a message, as a row of thumbnails. Clicking one
 /// opens it full-size in Preview — the stored image is what the model saw.
 struct AttachmentThumbnails: View {
+    let messageID: UUID
     let attachments: [ImageAttachment]
 
     var body: some View {
         HStack(spacing: 6) {
-            ForEach(Array(attachments.enumerated()), id: \.offset) { _, attachment in
-                if let image = NSImage(data: attachment.data) {
-                    Image(nsImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                        .frame(width: 72, height: 72)
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
-                        .overlay(RoundedRectangle(cornerRadius: 10)
-                            .strokeBorder(Color.secondary.opacity(0.25)))
-                        .onTapGesture { openInPreview(attachment) }
-                        .help("Open in Preview")
-                }
+            ForEach(Array(attachments.enumerated()), id: \.offset) { index, attachment in
+                // Audit E-03: the cached, downscaled thumbnail —
+                // not a full-size decode per render.
+                AttachmentThumbnailView(messageID: messageID,
+                                        index: index,
+                                        data: attachment.data)
+                    .overlay(RoundedRectangle(cornerRadius: 10)
+                        .strokeBorder(Color.secondary.opacity(0.25)))
+                    .onTapGesture { openInPreview(attachment) }
+                    .help("Open in Preview")
             }
         }
     }
@@ -148,7 +217,14 @@ struct StreamingBubble: View {
                         .foregroundStyle(.secondary)
                 }
             } else {
-                MarkdownText(content: text)
+                // Audit E-04: while streaming, render PLAIN text —
+                // the Markdown renderer re-parses the whole reply
+                // so far on every chunk (O(reply²) per reply). The
+                // moment the stream finishes, the saved message
+                // renders through `MessageBubble` with full
+                // Markdown, exactly as before.
+                Text(text)
+                    .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }

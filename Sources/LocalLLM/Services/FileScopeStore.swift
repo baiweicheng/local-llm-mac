@@ -8,7 +8,7 @@ import Foundation
 /// the persisted, user-granted form of access, which works whether or
 /// not the app ends up sandboxed. The resolved, symlink-standardized
 /// root paths are also what `FileScope` checks tool paths against,
-/// and the same store is what Phase 6's write tools will reuse.
+/// and the same store is what the Phase 6 write tools reuse.
 @MainActor
 @Observable
 final class FileScopeStore {

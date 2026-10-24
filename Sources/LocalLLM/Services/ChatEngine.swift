@@ -280,23 +280,53 @@ final class ChatEngine {
         }
     }
 
+    /// Audit E-10: the access log's in-memory record count, per
+    /// container — seeded lazily by ONE `fetchCount`, then kept by
+    /// counting inserts, so rotation no longer pays a full-table
+    /// count for every single tool event (a tool-heavy reply — or
+    /// approving a 20-item plan, which loops this function per
+    /// item — used to pay 20 counts + 20 saves back-to-back).
+    /// Rotation semantics are unchanged: same `AccessLogPolicy`
+    /// cap, oldest first, and still one `save()` per call, so a
+    /// crash mid-reply loses no more than it did before.
+    private static var activityCounts: [ObjectIdentifier: Int] = [:]
+
     /// Persists one tool event as an access-log record, rotating the
     /// oldest entries away past the policy cap.
     private static func recordToolEvent(_ event: ToolEvent,
                                         context: ModelContext) {
         context.insert(ToolActivityRecord(event: event))
-        let total = (try? context.fetchCount(
-            FetchDescriptor<ToolActivityRecord>())) ?? 0
+        let key = ObjectIdentifier(context.container)
+        let total: Int
+        if let known = activityCounts[key] {
+            total = known + 1
+        } else {
+            total = (try? context.fetchCount(
+                FetchDescriptor<ToolActivityRecord>())) ?? 1
+        }
+        activityCounts[key] = total
         let excess = AccessLogPolicy.excessCount(totalRecords: total)
         if excess > 0 {
             var oldest = FetchDescriptor<ToolActivityRecord>(
                 sortBy: [SortDescriptor(\.createdAt)])
             oldest.fetchLimit = excess
+            var deleted = 0
             for record in (try? context.fetch(oldest)) ?? [] {
                 context.delete(record)
+                deleted += 1
             }
+            activityCounts[key] = total - deleted
         }
         try? context.save()
+    }
+
+    /// Audit E-05: forget the in-memory access-log count for a
+    /// container whose records were removed OUTSIDE
+    /// `recordToolEvent` (Settings' Clear Log deletes them
+    /// directly) — the next event re-seeds from a real count
+    /// instead of rotating against a stale total.
+    static func resetActivityCount(for container: ModelContainer) {
+        activityCounts[ObjectIdentifier(container)] = nil
     }
 
     // MARK: - Action plans (Phase 6)
@@ -404,6 +434,12 @@ final class ChatEngine {
                         action: action, outcome: .declined,
                         resultNote: "Not run — it was left unchecked when the list was approved."))
                 } else {
+                    // Audit E-90: `executePlanItem` is `nonisolated`
+                    // (see its declaration), so this await runs the
+                    // item's blocking disk/image work OFF the main
+                    // actor — a big file copy or photo resize used
+                    // to freeze the UI for its duration. Only the
+                    // record-keeping below is on the main actor.
                     executed.append(await Self.executePlanItem(
                         action, roots: roots,
                         backupDirectory: backupDirectory,
@@ -422,9 +458,15 @@ final class ChatEngine {
                 // this completion must not resurrect any of it.
                 guard !self.forgottenIDs.contains(conversationID),
                       !wasCancelled else { return }
+                // Audit E-05: the record carries the plan's key as
+                // its id, so its backup folder is named by the
+                // record (`ActionBackups/<record id>`) and rotation
+                // can find — and delete — the folder when the
+                // record goes.
                 let record = ActionPlanRecord(conversationID: conversationID,
                                               status: .executed,
-                                              items: executed)
+                                              items: executed,
+                                              id: planKey)
                 Self.insertPlanRecord(record, context: context)
                 try? context.save()
                 for item in executed {
@@ -447,6 +489,12 @@ final class ChatEngine {
     /// records away past `ActionPlanLogPolicy`'s cap (audit S-04 —
     /// plan records store full payloads and previously grew without
     /// bound, unlike the access log beside them).
+    ///
+    /// Audit E-05: rotation now also deletes each pruned record's
+    /// pre-edit backup folder — a rotated record can never be
+    /// undone (its card is gone), so its backups are unreachable;
+    /// before this, the folders accumulated forever even though
+    /// the records themselves were capped.
     private static func insertPlanRecord(_ record: ActionPlanRecord,
                                          context: ModelContext) {
         context.insert(record)
@@ -459,16 +507,78 @@ final class ChatEngine {
             oldest.fetchLimit = excess
             for stale in (try? context.fetch(oldest)) ?? [] {
                 context.delete(stale)
+                Self.deleteBackupFolder(forRecordID: stale.id)
             }
         }
     }
+
+    // MARK: - Backup-folder retention (audit E-05)
+
+    /// The `ActionBackups` root: one folder per decided plan,
+    /// named by the plan record's id.
+    private static var actionBackupsRoot: URL {
+        let support = FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory())
+                .appendingPathComponent("Library/Application Support")
+        return support.appendingPathComponent(
+            "LocalLLM/ActionBackups", isDirectory: true)
+    }
+
+    /// Deletes one plan record's backup folder, if it has one.
+    /// Called when the record itself goes away (rotation), and by
+    /// the views when records are deleted directly (a conversation
+    /// delete, Clear Log).
+    static func deleteBackupFolder(forRecordID recordID: UUID) {
+        let folder = actionBackupsRoot.appendingPathComponent(
+            ActionBackupRetention.folderName(recordID: recordID),
+            isDirectory: true)
+        try? FileManager.default.removeItem(at: folder)
+    }
+
+    /// Audit E-05: the startup orphan sweep, run once per launch
+    /// from the app shell. Backup folders whose plan record is
+    /// gone — or retained but no longer undoable (already undone,
+    /// or a discard, which never made backups) — are deleted; a
+    /// retained, executed, not-yet-undone record's folder is NEVER
+    /// touched, because its Undo still restores from it.
+    /// `ActionBackupRetention` makes the call, purely.
+    func pruneOrphanedActionBackups(context: ModelContext) {
+        guard !didSweepActionBackups else { return }
+        didSweepActionBackups = true
+        let root = Self.actionBackupsRoot
+        let folderNames = (try? FileManager.default
+            .contentsOfDirectory(atPath: root.path)) ?? []
+        guard !folderNames.isEmpty else { return }
+        let records = (try? context.fetch(
+            FetchDescriptor<ActionPlanRecord>())) ?? []
+        let retained = records.map {
+            (id: $0.id, status: $0.status, isUndone: $0.isUndone)
+        }
+        for name in ActionBackupRetention.deletableFolders(
+            folderNames: folderNames, retained: retained) {
+            try? FileManager.default.removeItem(
+                at: root.appendingPathComponent(name, isDirectory: true))
+        }
+    }
+
+    /// Audit E-05: the startup backup sweep runs once per launch.
+    private var didSweepActionBackups = false
 
     /// Runs one approved item through the executor for its kind:
     /// file changes in `FileActionService`, commands in
     /// `ShellCommandService`, MCP calls through the shell-provided
     /// executor. Every path applies the same pure pre-check first —
     /// the world may have changed since the proposal.
-    private static func executePlanItem(
+    ///
+    /// Audit E-90: `nonisolated` — this dispatcher (and the
+    /// executors it awaits) does blocking disk/image work, and it
+    /// used to inherit the engine's @MainActor isolation through
+    /// the plan task, freezing the UI for a big copy or resize.
+    /// It touches no engine state; the MCP executor it awaits hops
+    /// to the main actor internally for the manager call, as
+    /// before.
+    nonisolated private static func executePlanItem(
         _ action: PlannedAction, roots: [String], backupDirectory: URL,
         localOnly: Bool = false,
         mcpExecutor: (PlannedAction) async -> ExecutedActionItem?
@@ -588,8 +698,12 @@ final class ChatEngine {
             for step in steps {
                 // Stop between steps when cancelled (audit B-52).
                 if Task.isCancelled { break }
-                let note = FileActionService.executeUndoStep(
-                    step, roots: undoRoots)
+                // Audit E-90: undo's disk work also runs off the
+                // main actor, like approval's (see `approvePlan`).
+                let note = await Task.detached {
+                    FileActionService.executeUndoStep(
+                        step, roots: undoRoots)
+                }.value
                 if let index = items.firstIndex(
                     where: { $0.action.id == step.itemID }) {
                     items[index].undoNote = note
@@ -878,8 +992,7 @@ final class ChatEngine {
                     + "uses the built-in on-device model."
             } else {
                 errorMessages[conversationID] =
-                    "The model this chat was using isn't available anymore, "
-                    + "so it switched back to the built-in on-device model."
+                    SharedWording.modelUnavailableFallback
             }
         }
 
@@ -909,12 +1022,18 @@ final class ChatEngine {
         }
 
         // Live turns: stored history minus the summarized prefix and
-        // minus the message about to be sent.
-        func liveTurns() -> [ChatTurn] {
+        // minus the message about to be sent. Audit E-07: the array
+        // is built ONCE per send — the old code rebuilt it (a sort
+        // plus a `chatTurn` per message) before the first plan and
+        // after EVERY compaction pass. A pass only ever folds a
+        // PREFIX of the live turns into the summary, so between
+        // passes the array is updated by dropping that prefix —
+        // the same turns, no rebuild.
+        var liveTurns: [ChatTurn] = {
             let all = conversation.sortedMessages.dropLast()
             let prefix = min(conversation.summarizedMessageCount, all.count)
             return Array(all.dropFirst(prefix)).map { $0.chatTurn }
-        }
+        }()
 
         // Compaction passes — always before streaming, never mid-stream.
         // One pass summarizes a bounded chunk; a very long history can
@@ -922,7 +1041,7 @@ final class ChatEngine {
         var plan = ContextManager.plan(budget: budget,
                                        instructions: instructions,
                                        existingSummary: conversation.contextSummary,
-                                       liveTurns: liveTurns(),
+                                       liveTurns: liveTurns,
                                        newPrompt: newPromptTurn)
         var passes = 0
         while plan.needsCompaction, passes < 4 {
@@ -946,10 +1065,12 @@ final class ChatEngine {
             conversation.updatedAt = Date()
             try? context.save()
             retireSession(conversationID) // its context is now stale
+            // The folded chunk was a prefix of the live turns.
+            liveTurns = Array(liveTurns.dropFirst(chunk.count))
             plan = ContextManager.plan(budget: budget,
                                        instructions: instructions,
                                        existingSummary: conversation.contextSummary,
-                                       liveTurns: liveTurns(),
+                                       liveTurns: liveTurns,
                                        newPrompt: newPromptTurn)
         }
 
@@ -978,7 +1099,14 @@ final class ChatEngine {
         // inside the runtime before they can enter a cloud prompt.
         // Local tool hosts keep raw results.
         let toolAvailability = toolAvailabilityProvider()
-        let toolsSignature = backend.supportsTools
+        // Audit E-08: this value is only the PRE-discovery
+        // signature, used for the reuse check. When a session is
+        // actually BUILT below, the stored signature is recomputed
+        // after MCP discovery returns (see the build branch) — the
+        // first discovery used to poison the stored signature, so
+        // the following send always paid a spurious full rebuild +
+        // reseed even though nothing had changed.
+        var toolsSignature = backend.supportsTools
             ? toolAvailability.signature
             : "none"
 
@@ -1051,6 +1179,16 @@ final class ChatEngine {
             } else {
                 sessionTools = nil
             }
+            // Audit E-08: store the signature of the tool set
+            // ACTUALLY built — recomputed now that MCP discovery
+            // has returned and the provider's signature reflects
+            // the discovered tools. The terms hash and the rest of
+            // the availability composition are unchanged by
+            // discovery; only the MCP component moved. (For a
+            // tool-less build the signature stays "none".)
+            if backend.supportsTools {
+                toolsSignature = toolAvailabilityProvider().signature
+            }
             session = backend.makeSession(instructions: effectiveInstructions,
                                           tools: sessionTools)
             // The fresh session knows nothing yet: prepend the stored
@@ -1059,7 +1197,7 @@ final class ChatEngine {
             // alone.
             let seed = ContextManager.seedText(
                 existingSummary: conversation.contextSummary,
-                recentTurns: liveTurns())
+                recentTurns: liveTurns)
             if !seed.isEmpty {
                 promptText = seed + "\n\n" + lastMessage.text
             }

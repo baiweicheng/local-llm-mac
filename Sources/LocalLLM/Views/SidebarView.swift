@@ -20,39 +20,72 @@ struct SidebarView: View {
     @State private var deleteTarget: Conversation?
     @State private var searchText = ""
 
+    /// Audit E-01: search hits are computed ONCE per (query, corpus
+    /// fingerprint) and cached here. The old shape recomputed the
+    /// full-corpus scan at least three times per keystroke — the
+    /// `visibleConversations` filter, the empty check, and once
+    /// more per row for its snippet — each hit re-sorting and
+    /// re-scanning every message of every conversation.
+    @State private var cachedHits: [UUID: ChatSearchHit] = [:]
+    @State private var cachedHitKey: SearchCacheKey?
+
+    /// What identifies a valid hit cache: the query plus a cheap
+    /// fingerprint of the corpus (conversation count and the
+    /// newest `updatedAt` — any send, rename, or delete moves it).
+    private struct SearchCacheKey: Equatable {
+        let query: String
+        let count: Int
+        let latestUpdate: Date?
+    }
+
     /// The trimmed search text; empty means "not searching".
     private var query: String { ChatSearch.normalizedQuery(searchText) }
 
-    /// The chats to show: every chat when not searching, otherwise
-    /// only the ones that match (the match proof is recomputed per
-    /// row by `hit(for:)` — cheap at sidebar scale).
-    private var visibleConversations: [Conversation] {
-        guard !query.isEmpty else { return conversations }
-        return conversations.filter { hit(for: $0) != nil }
+    private var currentKey: SearchCacheKey {
+        SearchCacheKey(query: query,
+                       count: conversations.count,
+                       latestUpdate: conversations.map(\.updatedAt).max())
     }
 
-    /// This chat's search hit under the current query (nil when not
-    /// searching or not matching).
-    private func hit(for conversation: Conversation) -> ChatSearchHit? {
-        guard !query.isEmpty else { return nil }
-        return ChatSearch.hit(
-            title: conversation.title,
-            messageTexts: conversation.sortedMessages.map(\.text),
+    /// The cached hits for the current key, recomputing (once)
+    /// when the key has moved.
+    private func hits() -> [UUID: ChatSearchHit] {
+        guard !query.isEmpty else { return [:] }
+        if cachedHitKey == currentKey { return cachedHits }
+        let computed = ChatSearch.hits(
+            in: conversations.map {
+                (id: $0.id, title: $0.title,
+                 messageTexts: $0.sortedMessages.map(\.text))
+            },
             query: query)
+        // We're inside a view computation; the writes land in the
+        // next update cycle (the values returned THIS pass are the
+        // freshly computed ones, so nothing renders stale).
+        DispatchQueue.main.async {
+            cachedHits = computed
+            cachedHitKey = currentKey
+        }
+        return computed
     }
 
     var body: some View {
-        List(selection: $selection) {
-            if !query.isEmpty, visibleConversations.isEmpty {
+        // Audit E-01: one hits computation per body pass, shared by
+        // the empty check, the filter, and every row's snippet.
+        let found = query.isEmpty ? [:] : hits()
+        let visible = query.isEmpty
+            ? conversations
+            : conversations.filter { found[$0.id] != nil }
+        return List(selection: $selection) {
+            if !query.isEmpty, visible.isEmpty {
                 Text("No chats match \u{201C}\(query)\u{201D}.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
-            ForEach(visibleConversations) { conversation in
+            ForEach(visible) { conversation in
                 VStack(alignment: .leading, spacing: 2) {
                     Text(conversation.title)
                         .lineLimit(1)
-                    if let snippet = hit(for: conversation)?.snippet {
+                    if let snippet = found[conversation.id]?.snippet {
                         Text(snippet)
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -169,8 +202,15 @@ struct SidebarView: View {
         let planRecords = FetchDescriptor<ActionPlanRecord>(
             predicate: #Predicate { $0.conversationID == id })
         for record in (try? modelContext.fetch(planRecords)) ?? [] {
+            // Audit E-05: the record's on-disk backup folder goes
+            // with it — the records were the only thing that could
+            // ever reach those backups.
+            ChatEngine.deleteBackupFolder(forRecordID: record.id)
             modelContext.delete(record)
         }
+        // The direct deletions above bypass the engine's rotation
+        // bookkeeping; keep its in-memory log count honest (E-10).
+        ChatEngine.resetActivityCount(for: modelContext.container)
         modelContext.delete(conversation)
         try? modelContext.save()
     }

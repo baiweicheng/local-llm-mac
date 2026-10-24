@@ -630,15 +630,6 @@ enum ToolCatalog {
         }
     }
 
-    /// Just the file-action tools (Phase 6), in catalog order.
-    static var writeActions: [ToolDescriptor] {
-        all.filter { $0.isWriteAction }
-    }
-
-    /// Just the static power tools (Phase 9) — `run_command`.
-    static var powerActions: [ToolDescriptor] {
-        all.filter { $0.isPowerAction }
-    }
 }
 
 // MARK: - Result sizing

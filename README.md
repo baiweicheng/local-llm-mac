@@ -237,11 +237,10 @@ could ever leave this Mac.
   picks the backend to match: quick things go to the built-in model,
   hard local work goes to your largest downloaded MLX model (or a
   local server, if no model is downloaded), and a cloud-worthy
-  question gets the best local stand-in available **plus a plain note
-  that cloud models arrive in a later phase** — the app never pretends
-  a cloud call happened. (Phase 8, below, made the cloud route real;
-  the stand-in now only appears when no cloud route is available, and
-  its note says what would unlock one.) A quiet line under the chat header says what
+  question gets the best local stand-in available when no cloud route
+  is set up (Phase 8 made the cloud route real — the stand-in now
+  only appears when no cloud route is available, and its note says
+  what would unlock one). A quiet line under the chat header says what
   Auto decided and why ("Auto: a quick edit or question — Apple
   On-Device handles those instantly and privately."). If the sorting
   step ever fails or takes too long, the message just goes to the

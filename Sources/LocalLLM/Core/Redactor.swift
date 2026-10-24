@@ -67,7 +67,8 @@ enum Redactor {
             count += hits
         }
 
-        // 2–8. The built-in rules.
+        // 2–6. The built-in rules that precede the opaque-token
+        // rule in the documented sequence.
         for rule in rules {
             let (next, hits) = apply(rule.regex, to: current,
                                      template: rule.template)
@@ -75,7 +76,75 @@ enum Redactor {
             count += hits
         }
 
+        // 7 (audit E-80): the opaque-token rule runs as a linear
+        // code-driven scan, not a regex — its old pattern carried
+        // two lookaheads over the whole token charset, which is
+        // quadratic on long token-shaped runs. It runs at exactly
+        // the point in the sequence the regex occupied (after the
+        // card rule, before phone numbers), with identical match
+        // semantics.
+        let tokens = maskOpaqueTokens(in: current)
+        current = tokens.text
+        count += tokens.count
+
+        // 8. Phone numbers — after the token scan, as before.
+        if let phoneRule {
+            let (next, hits) = apply(phoneRule.regex, to: current,
+                                     template: phoneRule.template)
+            current = next
+            count += hits
+        }
+
         return RedactionResult(text: current, replacementCount: count)
+    }
+
+    // MARK: - Opaque tokens (rule 7, code-driven)
+
+    /// The opaque-token charset: base64/hex alphabet.
+    private static let opaqueCharset =
+        Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/_=-")
+
+    /// Masks every maximal run of the opaque charset that is at
+    /// least 24 characters long AND contains at least one letter
+    /// and one digit — exactly the old regex
+    /// `(?=[A-Za-z0-9+/_=-]*\d)(?=[A-Za-z0-9+/_=-]*[A-Za-z])[A-Za-z0-9+/_=-]{24,}`.
+    /// (Regex and scan agree on maximal runs: the pattern is
+    /// greedy, unanchored, and its lookaheads range over the same
+    /// charset, so a match always extends to the whole run — a
+    /// run qualifies iff its full length qualifies.) One linear
+    /// pass, no backtracking.
+    static func maskOpaqueTokens(in text: String) -> (text: String, count: Int) {
+        var output = ""
+        output.reserveCapacity(text.count)
+        var masked = 0
+        var index = text.startIndex
+        while index < text.endIndex {
+            guard opaqueCharset.contains(text[index]) else {
+                output.append(text[index])
+                index = text.index(after: index)
+                continue
+            }
+            // One maximal run of the charset.
+            var runEnd = index
+            var hasLetter = false
+            var hasDigit = false
+            var length = 0
+            while runEnd < text.endIndex, opaqueCharset.contains(text[runEnd]) {
+                let char = text[runEnd]
+                if char.isLetter { hasLetter = true }
+                if char.isNumber { hasDigit = true }
+                length += 1
+                runEnd = text.index(after: runEnd)
+            }
+            if length >= 24, hasLetter, hasDigit {
+                output += mask
+                masked += 1
+            } else {
+                output += text[index..<runEnd]
+            }
+            index = runEnd
+        }
+        return (output, masked)
     }
 
     // MARK: - Rules
@@ -138,17 +207,27 @@ enum Redactor {
 
         // 7. Long opaque tokens: 24+ chars of the base64/hex alphabet
         // containing at least one letter AND one digit (a long plain
-        // word never qualifies).
-        add(#"(?=[A-Za-z0-9+/_=-]*\d)(?=[A-Za-z0-9+/_=-]*[A-Za-z])[A-Za-z0-9+/_=-]{24,}"#)
-
-        // 8. Phone numbers: country code optional; the area code may
-        // be parenthesized. A separator is required between the
-        // later groups, but after a parenthesized area code it is
-        // optional — "(404)555-0123" is as common as "(404) 555-0123"
-        // (audit B-17).
-        add(#"(?:\+\d{1,3}[\s-]?)?(?:\(\d{3}\)\s?|\d{3}[\s.-])\d{3}[\s.-]\d{4}"#)
+        // word never qualifies). NOT a regex — audit E-80: the
+        // lookahead pattern was quadratic on long token-shaped runs,
+        // so this slot in the sequence is filled by the linear
+        // `maskOpaqueTokens` scan in `redact`, between this rule
+        // list and the phone rule below.
 
         return rules
+    }()
+
+    /// Rule 8, phone numbers — kept apart from `rules` only so it
+    /// still runs AFTER the code-driven opaque-token scan, exactly
+    /// where it sat in the original sequence (audit E-80).
+    /// Country code optional; the area code may be parenthesized.
+    /// A separator is required between the later groups, but after
+    /// a parenthesized area code it is optional — "(404)555-0123"
+    /// is as common as "(404) 555-0123" (audit B-17).
+    private static let phoneRule: Rule? = {
+        guard let regex = compile(
+            #"(?:\+\d{1,3}[\s-]?)?(?:\(\d{3}\)\s?|\d{3}[\s.-])\d{3}[\s.-]\d{4}"#)
+        else { return nil }
+        return Rule(regex: regex, template: mask)
     }()
 
     // MARK: - Applying

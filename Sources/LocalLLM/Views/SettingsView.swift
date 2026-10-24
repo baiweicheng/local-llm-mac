@@ -75,6 +75,13 @@ struct SettingsView: View {
     /// Audit S-10: set when a key save fails in the Keychain, so
     /// the failure is said out loud instead of silently losing it.
     @State private var keySaveError: String?
+    /// Audit E-16: the custom OpenRouter model id is edited as a
+    /// LOCAL DRAFT and committed to the persisted setting on submit
+    /// / when the sheet goes away — binding the field straight to
+    /// `settings` wrote UserDefaults (and invalidated every reader
+    /// of the id, including the chat header's descriptors) on EVERY
+    /// keystroke, and made half-typed ids the live picker value.
+    @State private var customModelIDDraft: String?
     /// Phase 9: the MCP add-server form's drafts.
     @State private var mcpName = ""
     @State private var mcpCommand = ""
@@ -135,6 +142,7 @@ struct SettingsView: View {
             permissionCenter.refresh()
             loginItemState = LoginItemService.state
         }
+        .onDisappear { commitCustomModelID() }
     }
 
     // MARK: - General (Phase 10)
@@ -441,8 +449,27 @@ struct SettingsView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
             TextField("Custom model id (e.g. x-ai/grok-4.7)",
-                      text: $settings.openRouterCustomModelID)
+                      text: customModelIDBinding)
                 .textFieldStyle(.roundedBorder)
+                .onSubmit { commitCustomModelID() }
+        }
+    }
+
+    /// The custom-id field's binding: reads the draft once it
+    /// exists (seeded from the persisted value), writes only the
+    /// draft (audit E-16).
+    private var customModelIDBinding: Binding<String> {
+        Binding(
+            get: { customModelIDDraft ?? settings.openRouterCustomModelID },
+            set: { customModelIDDraft = $0 })
+    }
+
+    /// Commits the custom-id draft to the persisted setting — on
+    /// submit and when the sheet disappears, the same moments the
+    /// MCP and preset forms commit theirs.
+    private func commitCustomModelID() {
+        if let customModelIDDraft {
+            settings.openRouterCustomModelID = customModelIDDraft
         }
     }
 
@@ -823,8 +850,17 @@ struct SettingsView: View {
                         // commands, server answers) the log only
                         // excerpts.
                         for record in recentPlanRecords {
+                            // Audit E-05: their on-disk backup
+                            // folders go too — nothing retained can
+                            // reach them once the records are gone.
+                            ChatEngine.deleteBackupFolder(
+                                forRecordID: record.id)
                             modelContext.delete(record)
                         }
+                        // Audit E-10: the engine's in-memory log
+                        // count re-seeds after this direct deletion.
+                        ChatEngine.resetActivityCount(
+                            for: modelContext.container)
                         try? modelContext.save()
                     }
                     .font(.callout)

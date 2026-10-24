@@ -570,6 +570,35 @@ enum ShellOutput {
     }
 }
 
+/// User/model-facing wording that more than one code path must
+/// produce IDENTICALLY (audit E-18): each string lives here once,
+/// so a future wording fix can't land on one copy and silently
+/// leave the other stale (which had already happened to the
+/// model-missing pair below).
+enum SharedWording {
+
+    /// An MCP tool was named that no live server offers — produced
+    /// by both the runtime's proposal path and the pure proposal
+    /// validation, which must agree word for word.
+    static let mcpToolUnavailable =
+        "That tool isn't available — its MCP server may be off or "
+        + "may have stopped. The user can check it in Settings → Power tools."
+
+    /// The model a chat was using went away and the chat fell back
+    /// to the built-in model — the engine's send-time banner.
+    static let modelUnavailableFallback =
+        "The model this chat was using isn't available anymore, "
+        + "so it switched back to the built-in on-device model."
+
+    /// The same event as a persistent chat-header banner (the
+    /// selection still points at the missing model, so the banner
+    /// also says what to do next).
+    static let modelUnavailableBanner =
+        "The model this chat was using isn't available anymore — "
+        + "it was deleted or removed. Pick a model in the header "
+        + "to keep chatting."
+}
+
 /// The one-line verdict on a finished command, shared by the plan
 /// card, the audit log, and the model's outcome note.
 enum ShellResultWording {
