@@ -63,9 +63,16 @@ struct ModelsView: View {
             // Face cache copy, which loading a model fills. Showing
             // only the app's half understated a 6.5 GB model as
             // 6.5 GB when it really costs ~13 GB.
+            // UAT-03: kept partial downloads count too — they live
+            // in the same app folder, and leaving them out made a
+            // cancelled multi-GB download invisible in the total.
             let appTotal = mlxStore.diskSizes.values.reduce(0, +)
-            if appTotal > 0 || mlxStore.huggingFaceCacheBytes > 0 {
-                Text("On disk: \(MLXCatalog.formatBytes(appTotal)) in this app's model folder"
+            let partialTotal = mlxStore.totalPartialBytes
+            if appTotal + partialTotal > 0 || mlxStore.huggingFaceCacheBytes > 0 {
+                Text("On disk: \(MLXCatalog.formatBytes(appTotal + partialTotal)) in this app's model folder"
+                     + (partialTotal > 0
+                        ? " (including \(MLXCatalog.formatBytes(partialTotal)) in partial downloads)"
+                        : "")
                      + (mlxStore.huggingFaceCacheBytes > 0
                         ? ", plus \(MLXCatalog.formatBytes(mlxStore.huggingFaceCacheBytes)) in the Hugging Face cache the model loader keeps (each downloaded model lives in both places)."
                         : "."))
@@ -117,11 +124,33 @@ struct ModelsView: View {
     private func mlxRowControls(_ info: MLXModelInfo) -> some View {
         switch mlxStore.state(for: info) {
         case .notDownloaded:
-            HStack {
-                Button("Download") { mlxStore.startDownload(info) }
-                Text("Free · from Hugging Face (mlx-community)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            // UAT-03: a kept partial download (a cancelled or
+            // failed attempt, audit E-11) gets its own presentation
+            // — Resume, its size, and a way to delete it — instead
+            // of the row silently reverting to a plain "Download"
+            // while gigabytes sit in the staging folder.
+            if mlxStore.partialBytes(for: info) > 0 {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 10) {
+                        Button("Resume Download") {
+                            mlxStore.startDownload(info)
+                        }
+                        Button("Delete Partial", role: .destructive) {
+                            mlxStore.deleteModel(info)
+                        }
+                        .controlSize(.small)
+                    }
+                    Text("Partial download on disk: \(MLXCatalog.formatBytes(mlxStore.partialBytes(for: info))) — Resume picks up where it left off.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                HStack {
+                    Button("Download") { mlxStore.startDownload(info) }
+                    Text("Free · from Hugging Face (mlx-community)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
         case .downloading(let fraction):
             HStack(spacing: 10) {
@@ -156,8 +185,22 @@ struct ModelsView: View {
                 Text(message)
                     .font(.callout)
                     .foregroundStyle(.red)
-                Button("Try Again") { mlxStore.startDownload(info) }
-                    .controlSize(.small)
+                HStack(spacing: 10) {
+                    Button("Try Again") { mlxStore.startDownload(info) }
+                        .controlSize(.small)
+                    // UAT-03: the failed attempt's kept partial is
+                    // shown (and removable) here too, not only after
+                    // a cancel.
+                    if mlxStore.partialBytes(for: info) > 0 {
+                        Text("Partial download on disk: \(MLXCatalog.formatBytes(mlxStore.partialBytes(for: info))) — trying again reuses it.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Button("Delete Partial", role: .destructive) {
+                            mlxStore.deleteModel(info)
+                        }
+                        .controlSize(.small)
+                    }
+                }
             }
         }
     }

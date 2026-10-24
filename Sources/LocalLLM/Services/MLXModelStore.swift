@@ -61,6 +61,14 @@ final class MLXModelStore {
     private(set) var states: [String: DownloadState] = [:]
     /// Exact on-disk bytes per downloaded model (the app's copy).
     private(set) var diskSizes: [String: Int64] = [:]
+    /// UAT-03: exact on-disk bytes per KEPT PARTIAL download (the
+    /// staging folder a cancelled or failed attempt left behind,
+    /// audit E-11). Before this, a partial was invisible: the row
+    /// went back to a plain "Download", the bytes weren't counted
+    /// in the panel's on-disk total, and no Delete control could
+    /// reach them — a multi-GB partial could sit on disk forever
+    /// with no way to see or reclaim it.
+    private(set) var partialSizes: [String: Int64] = [:]
     /// Audit E-11: the MLX bridge keeps its OWN copy of each model
     /// in its Hugging Face cache (see the header note), so a model
     /// costs roughly twice what `diskSizes` alone says. The total
@@ -100,6 +108,19 @@ final class MLXModelStore {
 
     func isDownloaded(_ repoID: String) -> Bool {
         states[repoID] == .downloaded
+    }
+
+    /// UAT-03: bytes of this model's kept partial download (its
+    /// staging folder), or 0 when there is none worth showing.
+    func partialBytes(for info: MLXModelInfo) -> Int64 {
+        partialSizes[info.repoID] ?? 0
+    }
+
+    /// UAT-03: every kept partial's bytes together — the Models
+    /// panel's on-disk total includes them (they live in the same
+    /// app folder as finished models).
+    var totalPartialBytes: Int64 {
+        partialSizes.values.reduce(0, +)
     }
 
     var downloadedRepoIDs: Set<String> {
@@ -145,6 +166,12 @@ final class MLXModelStore {
                 self.diskSizes = sizes.sizes.filter {
                     self.states[$0.key] == .downloaded
                 }
+                // UAT-03: partials for models that aren't finished
+                // (a downloaded model's staging was moved into
+                // place, so anything measured for it is stale).
+                self.partialSizes = sizes.partials.filter {
+                    $0.value > 0 && self.states[$0.key] != .downloaded
+                }
                 self.huggingFaceCacheBytes = sizes.cacheBytes
             }
         }
@@ -165,15 +192,24 @@ final class MLXModelStore {
 
     /// The detached half of a refresh: the byte totals.
     nonisolated private static func measureSizes()
-        -> (sizes: [String: Int64], cacheBytes: Int64) {
+        -> (sizes: [String: Int64], partials: [String: Int64],
+            cacheBytes: Int64) {
         var sizes: [String: Int64] = [:]
+        var partials: [String: Int64] = [:]
         for info in MLXCatalog.models {
             let directory = directory(for: info)
             if FileManager.default.fileExists(atPath: directory.path) {
                 sizes[info.repoID] = sizeOfDirectory(directory)
             }
+            // UAT-03: the staging folder gets measured too, so a
+            // kept partial is visible (and countable, and
+            // deletable) instead of silent disk usage.
+            let staging = stagingDirectory(for: info)
+            if FileManager.default.fileExists(atPath: staging.path) {
+                partials[info.repoID] = sizeOfDirectory(staging)
+            }
         }
-        return (sizes, sizeOfDirectory(huggingFaceCacheDirectory))
+        return (sizes, partials, sizeOfDirectory(huggingFaceCacheDirectory))
     }
 
     // MARK: - Downloading
@@ -205,6 +241,10 @@ final class MLXModelStore {
         // (see `performDownload`). Reset the visible state right
         // away; `deleteModel` is the path that removes staging.
         states[info.repoID] = .notDownloaded
+        // UAT-03: measure the kept partial right away, so the row
+        // can show it (with its size, a Resume, and a Delete)
+        // instead of silently reverting to a plain "Download".
+        refresh()
     }
 
     func deleteModel(_ info: MLXModelInfo) {
@@ -322,12 +362,16 @@ final class MLXModelStore {
             // failure that was really just the cancellation landing.
             if downloadTasks[repoID] != nil {
                 states[repoID] = .failed(message: failure.message)
+                // UAT-03: measure the kept partial for the row.
+                refresh()
             }
         } catch {
             guard isCurrent() else { return }
             if downloadTasks[repoID] != nil {
                 states[repoID] = .failed(
                     message: "The download failed: \(error.localizedDescription)")
+                // UAT-03: measure the kept partial for the row.
+                refresh()
             }
         }
     }

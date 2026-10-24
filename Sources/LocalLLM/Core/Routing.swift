@@ -10,8 +10,7 @@ import Foundation
 /// `.quickTransform` and the send proceeds on the built-in model.
 enum PromptIntent: String, Equatable, Sendable, CaseIterable {
     /// Wants something done on this Mac — files, photos, calendar,
-    /// apps, system state. (The tools themselves arrive in
-    /// Phases 5–6; routing there now is already correct.)
+    /// apps, system state — the built-in model's tool work.
     case osAction = "os_action"
     /// A quick edit or answer: summarize, rewrite, reformat, translate,
     /// a short simple question — the built-in model's home turf.
@@ -125,7 +124,7 @@ enum RoutingPolicy {
             return onDeviceSlot(
                 reason: "Auto: this sounds like something to do on "
                     + "your Mac, and the built-in model is where those "
-                    + "tools will live — Apple On-Device has it.")
+                    + "tools live — Apple On-Device has it.")
 
         case .quickTransform:
             return onDeviceSlot(
@@ -206,9 +205,22 @@ enum RoutingPolicy {
             // built-in model — and say plainly what happened.
             let why = "Auto: this one really wants a frontier cloud "
                 + "model, but no cloud route is ready — "
+            // UAT-05: under the lock with NO key and NO PCC, turning
+            // the lock off still leaves no cloud route — the note
+            // must name that second missing unlock too, not imply
+            // the lock is the only thing standing in the way. (With
+            // a key or PCC present, the lock really is the only
+            // blocker, and the plain lock note is the whole truth.)
             let cloudNote: String? = inputs.localOnly
                 ? "Local Only is on, so cloud models are off-limits "
                     + "while the lock is on — nothing leaves this Mac."
+                    + (inputs.cloudAvailable
+                        ? ""
+                        : " Even with the lock off, no cloud route "
+                            + "is ready yet: to use one, add your "
+                            + "OpenRouter key in Settings → Cloud "
+                            + "models; Apple Private Cloud also joins "
+                            + "on its own when macOS offers it.")
                 : "To use a cloud model for prompts like this, add "
                     + "your OpenRouter key in Settings → Cloud models; "
                     + "Apple Private Cloud also joins on its own when "

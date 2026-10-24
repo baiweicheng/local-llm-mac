@@ -197,14 +197,17 @@ struct ChatView: View {
                       allowedContentTypes: [.image],
                       allowsMultipleSelection: true) { result in
             if case .success(let urls) = result {
-                for url in urls { attachImage(fromFile: url) }
+                attachImages(fromFiles: urls)
             }
         }
         .dropDestination(for: URL.self) { urls, _ in
             let imageURLs = urls.filter { $0.isFileURL }
             guard !imageURLs.isEmpty else { return false }
-            for url in imageURLs { attachImage(fromFile: url) }
-            return true
+            // UAT-08: the drop only claims success for what it
+            // actually staged — claiming it for files that all
+            // failed to attach (or didn't fit) lied to the user
+            // twice over, here and in the silent composer.
+            return attachImages(fromFiles: imageURLs) > 0
         }
     }
 
@@ -634,9 +637,24 @@ struct ChatView: View {
     /// Phase 8 adds the same gap for OpenRouter chats (Apple Private
     /// Cloud CAN make lookups — its results pass the privacy check
     /// first — so it never shows this note).
+    ///
+    /// UAT-06: the note judges the backend that actually answers,
+    /// not the picker. For an Auto chat that's the engine's last
+    /// routed selection — an Auto Mac-action prompt stood in by a
+    /// server has no tools even though the picker says "Auto", and
+    /// keying off the picker hid exactly that case. For a manual
+    /// pick, the pick itself is the answer (nothing routes it).
+    private var toolsNoteSelection: ModelSelection {
+        if conversation.modelSelection.isAuto,
+           let routed = engine.lastEffectiveSelections[conversationID] {
+            return routed
+        }
+        return conversation.modelSelection
+    }
+
     private var showsToolsNote: Bool {
         guard settings.anyVisibilitySourceEnabled else { return false }
-        switch conversation.modelSelection {
+        switch toolsNoteSelection {
         case .endpoint, .openRouter: return true
         case .auto, .onDevice, .mlx, .privateCloudCompute: return false
         }
@@ -654,7 +672,7 @@ struct ChatView: View {
     }
 
     private var toolsNoteText: String {
-        if case .openRouter = conversation.modelSelection {
+        if case .openRouter = toolsNoteSelection {
             return "Lookups are off for this chat: they work with the models that run on this Mac and with Apple Private Cloud — a cloud chat like this one can't look things up on your Mac."
         }
         return "Lookups are off for this chat: they work with the Apple On-Device model and downloaded MLX models for now — a server chat like this one can't look things up on your Mac."
@@ -812,15 +830,70 @@ struct ChatView: View {
 
     // MARK: - Attaching images
 
+    /// What happened to one attach attempt (UAT-08) — the batch
+    /// callers tally these so a failed or over-limit image is
+    /// never just silently missing from the composer.
+    private enum AttachOutcome {
+        case added
+        case unreadable
+        case overLimit
+    }
+
     /// Reads an image file (picker, drag-and-drop) and stages it,
     /// downscaled, in the composer.
-    private func attachImage(fromFile url: URL) {
-        guard canAttachMore else { return }
+    private func attachImage(fromFile url: URL) -> AttachOutcome {
+        guard canAttachMore else { return .overLimit }
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         guard let data = try? Data(contentsOf: url),
-              let prepared = ImagePreparer.prepare(data) else { return }
+              let prepared = ImagePreparer.prepare(data)
+        else { return .unreadable }
         pendingAttachments.append(prepared)
+        return .added
+    }
+
+    /// Attaches a batch of files (picker, drop, paste) and reports
+    /// the outcome in the chat's info banner when anything didn't
+    /// make it. Returns how many were staged.
+    @discardableResult
+    private func attachImages(fromFiles urls: [URL]) -> Int {
+        var added = 0, unreadable = 0, overLimit = 0
+        for url in urls {
+            switch attachImage(fromFile: url) {
+            case .added: added += 1
+            case .unreadable: unreadable += 1
+            case .overLimit: overLimit += 1
+            }
+        }
+        reportAttachProblems(added: added, unreadable: unreadable,
+                              overLimit: overLimit)
+        return added
+    }
+
+    /// UAT-08: the visible half of attach failures — one plain
+    /// sentence in the info banner naming how many images were
+    /// read, and how many didn't fit. Silent when all attached.
+    private func reportAttachProblems(added: Int, unreadable: Int,
+                                      overLimit: Int) {
+        guard unreadable > 0 || overLimit > 0 else { return }
+        var problems: [String] = []
+        if unreadable > 0 {
+            problems.append(unreadable == 1
+                ? "one image couldn't be read as an image"
+                : "\(unreadable) images couldn't be read as images")
+        }
+        if overLimit > 0 {
+            problems.append(overLimit == 1
+                ? "one image didn't fit — up to "
+                    + "\(ImageAttachmentCodec.maxAttachmentsPerMessage) per message"
+                : "\(overLimit) images didn't fit — up to "
+                    + "\(ImageAttachmentCodec.maxAttachmentsPerMessage) per message")
+        }
+        let joined = problems.joined(separator: "; ")
+        engine.infoMessages[conversationID] = added > 0
+            ? "\(added) of \(added + unreadable + overLimit) images "
+                + "attached — \(joined)."
+            : "Couldn't attach: \(joined)."
     }
 
     /// Stages whatever image a paste delivered. `onPasteCommand` fires
@@ -834,17 +907,28 @@ struct ChatView: View {
         if let urls = pasteboard.readObjects(forClasses: [NSURL.self],
                                              options: options) as? [URL],
            !urls.isEmpty {
-            for url in urls where url.isFileURL {
-                attachImage(fromFile: url)
-            }
+            attachImages(fromFiles: urls.filter { $0.isFileURL })
             return
         }
         for type in [NSPasteboard.PasteboardType.tiff, .png] {
-            if let data = pasteboard.data(forType: type),
-               let prepared = ImagePreparer.prepare(data) {
-                if canAttachMore { pendingAttachments.append(prepared) }
+            guard let data = pasteboard.data(forType: type),
+                  let prepared = ImagePreparer.prepare(data)
+            else { continue }
+            // A readable image was pasted: stage it, or say why
+            // not (UAT-08 — the cap used to swallow this silently).
+            guard canAttachMore else {
+                reportAttachProblems(added: 0, unreadable: 0,
+                                     overLimit: 1)
                 return
             }
+            pendingAttachments.append(prepared)
+            return
+        }
+        // UAT-08: image data was offered but none of it could be
+        // prepared — say so instead of silently staging nothing.
+        if [NSPasteboard.PasteboardType.tiff, .png].contains(
+            where: { pasteboard.data(forType: $0) != nil }) {
+            reportAttachProblems(added: 0, unreadable: 1, overLimit: 0)
         }
     }
 

@@ -27,10 +27,16 @@ enum ChatSearch {
     static let snippetContext = 42
 
     /// The query as matching sees it: trimmed of surrounding
-    /// whitespace. An empty result means "not searching" — the
-    /// sidebar shows everything, and `hit` is never called.
+    /// whitespace AND with internal whitespace runs collapsed to
+    /// single spaces (UAT-09) — message text is matched in its
+    /// flattened (single-spaced) form, so a query typed with a
+    /// double space ("body  fat") must be collapsed the same way
+    /// or it can never match. An empty result means "not
+    /// searching" — the sidebar shows everything, and `hit` is
+    /// never called.
     static func normalizedQuery(_ raw: String) -> String {
-        raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        raw.split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
     }
 
     /// Whether a chat matches, and the proof. Nil means no match:
@@ -39,7 +45,10 @@ enum ChatSearch {
                     query rawQuery: String) -> ChatSearchHit? {
         let query = normalizedQuery(rawQuery)
         guard !query.isEmpty else { return nil }
-        let titleMatched = contains(title, query)
+        // The title is flattened before the verbatim test, for the
+        // same reason the query is collapsed (UAT-09): irregular
+        // spacing on EITHER side shouldn't hide a match.
+        let titleMatched = contains(flatten(title), query)
         var snippet: String? = nil
         for text in messageTexts {
             if let found = snippet(in: text, matching: query) {

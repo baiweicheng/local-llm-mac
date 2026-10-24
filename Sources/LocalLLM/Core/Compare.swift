@@ -45,3 +45,52 @@ enum CompareSeeding {
         !answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 }
+
+/// UAT-01: compare-mode honesty notes. A column is headed by the
+/// model the user PICKED, but the shared factory can resolve that
+/// pick to a different backend (Local Only refuses the cloud, an
+/// OpenRouter pick has no key yet, a model was removed) — in chat,
+/// the engine banners exactly that switch; compare originally said
+/// nothing, so a local answer could appear under a cloud header
+/// and two "different" columns could be the same model. These
+/// pure wordings are what the column shows instead: before a run,
+/// why a pick can't run at all; after a run, which backend
+/// actually answered.
+enum CompareNotices {
+
+    /// The note under a column whose pick can't run right now —
+    /// shown before any run, and the reason "Ask both" stays off
+    /// for that column. (Readiness itself comes from the picker
+    /// descriptors, the same source chat's send gate uses.)
+    static func unavailableNote(for selection: ModelSelection) -> String {
+        switch selection {
+        case .openRouter:
+            return "Needs your OpenRouter key first — add it in "
+                + "Settings → Cloud models, or pick another model "
+                + "for this column."
+        case .privateCloudCompute:
+            return "Apple Private Cloud isn't available on this "
+                + "Mac right now — pick another model for this column."
+        case .onDevice:
+            return "The built-in model isn't ready right now — "
+                + "pick another model for this column."
+        case .auto, .mlx, .endpoint:
+            return "This model isn't available right now — pick "
+                + "another one for this column."
+        }
+    }
+
+    /// The note a column shows after a run when the backend that
+    /// answered differs from the one picked: it names BOTH, so the
+    /// answer is never read as coming from the picked model.
+    /// Nil when the pick ran as picked.
+    static func fallbackNotice(pickedSelection: ModelSelection,
+                               effectiveSelection: ModelSelection,
+                               pickedName: String,
+                               effectiveName: String) -> String? {
+        guard pickedSelection != effectiveSelection else { return nil }
+        return "You picked \(pickedName), but it isn't available "
+            + "right now — \(effectiveName) answered this column "
+            + "instead."
+    }
+}

@@ -134,9 +134,22 @@ actor ToolRuntime {
                   source.needsSystemPermission,
                   permissionProvider(source) != .authorized {
             let state = permissionProvider(source)
-            result = "The app doesn't have permission for \(source.displayName) yet. "
-                + (PermissionGuidance.text(source: source, state: state)
-                    ?? "The user can allow it in Settings → What this app can see.")
+            if state == .notDetermined {
+                // UAT-10: the source is already ON (that's why the
+                // tool exists) — the Settings guidance's "turn this
+                // on" would dead-end here. The actual fix is the
+                // Allow… button next to the source in Settings, so
+                // the relayed refusal names it.
+                result = "The app doesn't have permission for "
+                    + "\(source.displayName) yet — macOS hasn't been "
+                    + "asked. The user can allow it in Settings → "
+                    + "What this app can see: there's an Allow… "
+                    + "button next to \(source.displayName)."
+            } else {
+                result = "The app doesn't have permission for \(source.displayName) yet. "
+                    + (PermissionGuidance.text(source: source, state: state)
+                        ?? "The user can allow it in Settings → What this app can see.")
+            }
         } else if descriptor.isWriteAction, !configuration.fileWritingEnabled {
             // Defense in depth: write tools aren't offered while the
             // toggle is off, but a session built earlier could still

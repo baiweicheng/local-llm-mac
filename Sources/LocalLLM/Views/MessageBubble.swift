@@ -14,18 +14,29 @@ import ImageIO
 /// message's id + the attachment's index in it; bounded, with
 /// simple oldest-first eviction — thumbnails are small (≈72 px)
 /// and re-decodable, so eviction is harmless.
+///
+/// UAT-07: a cache hit is only served when the stored fingerprint
+/// matches the DATA being asked for. The composer's staged strip
+/// reuses one strip id across edits, so removing an image shifted
+/// the rest into earlier indices — and the bare key happily served
+/// the REMOVED image's thumbnail for its neighbour. A hit now has
+/// to be the same image, not just the same slot.
 @MainActor
 enum AttachmentThumbnailCache {
 
     static let maxPixelSize = 72
     private static let maxEntries = 128
-    private static var cache: [String: NSImage] = [:]
+    private static var cache: [String: (fingerprint: UInt64,
+                                         image: NSImage)] = [:]
     private static var insertionOrder: [String] = []
 
     static func thumbnail(messageID: UUID, index: Int,
                           data: Data) -> NSImage? {
         let key = "\(messageID.uuidString)-\(index)"
-        if let cached = cache[key] { return cached }
+        let fingerprint = dataFingerprint(data)
+        if let entry = cache[key], entry.fingerprint == fingerprint {
+            return entry.image
+        }
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let cgImage = CGImageSourceCreateThumbnailAtIndex(
                 source, 0, [
@@ -36,13 +47,48 @@ enum AttachmentThumbnailCache {
         let image = NSImage(cgImage: cgImage,
                             size: NSSize(width: cgImage.width,
                                          height: cgImage.height))
-        cache[key] = image
-        insertionOrder.append(key)
+        if cache[key] == nil { insertionOrder.append(key) }
+        cache[key] = (fingerprint, image)
         if insertionOrder.count > maxEntries {
             let evicted = insertionOrder.removeFirst()
             cache[evicted] = nil
         }
         return image
+    }
+
+    /// A cheap identity for image data: the byte count mixed into
+    /// an FNV-1a hash over three samples (head, middle, tail).
+    /// Two different photos practically never agree on all of it,
+    /// and computing it costs a few KB of scanning instead of a
+    /// hash of the whole (possibly 2 MB) blob on every render.
+    /// Internal (not private) so the tests can pin its behavior;
+    /// nonisolated because it touches no cache state.
+    nonisolated static func dataFingerprint(_ data: Data) -> UInt64 {
+        var hash: UInt64 = 0xcbf29ce484222325
+        func mix(_ byte: UInt8) {
+            hash ^= UInt64(byte)
+            hash &*= 0x100000001b3
+        }
+        mix(UInt8(truncatingIfNeeded: data.count))
+        mix(UInt8(truncatingIfNeeded: data.count >> 8))
+        mix(UInt8(truncatingIfNeeded: data.count >> 16))
+        mix(UInt8(truncatingIfNeeded: data.count >> 24))
+        let sample = 4096
+        data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress?
+                    .assumingMemoryBound(to: UInt8.self),
+                  raw.count > 0 else { return }
+            let count = raw.count
+            for i in 0..<min(sample, count) { mix(base[i]) }
+            if count > sample {
+                let middle = count / 2
+                for i in middle..<min(middle + sample, count) {
+                    mix(base[i])
+                }
+                for i in (count - sample)..<count { mix(base[i]) }
+            }
+        }
+        return hash
     }
 }
 

@@ -367,6 +367,22 @@ final class VisibilityToolsTests: XCTestCase {
         XCTAssertTrue(result.contains("Calendars"))
     }
 
+    func testRuntimePermissionNotDeterminedPointsAtAllowButton() async {
+        // UAT-10: the source is ON (that's why the tool exists)
+        // but macOS was never asked — the refusal must point at
+        // the Settings Allow… button, not tell the user to "turn
+        // this on" (it already is).
+        let box = EventBox()
+        let runtime = makeRuntime(enabled: [.calendar],
+                                  permission: .notDetermined, box: box)
+        let result = await runtime.execute(
+            toolName: "calendar_events", arguments: ToolArguments())
+        XCTAssertTrue(result.contains("doesn't have permission"))
+        XCTAssertTrue(result.contains("Allow…"))
+        XCTAssertTrue(result.contains("What this app can see"))
+        XCTAssertFalse(result.contains("Turn this on"))
+    }
+
     func testRuntimeUnknownToolIsADeadEndWithoutAnEvent() async {
         let box = EventBox()
         let runtime = makeRuntime(enabled: [.system], box: box)

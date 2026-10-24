@@ -854,6 +854,67 @@ final class LocalLLMTests: XCTestCase {
         XCTAssertNotNil(decision.note)
     }
 
+    func testRoutingActionCaptionIsPresentTense() {
+        // UAT-04: the Mac tools shipped in Phase 5 — the Auto
+        // caption must not announce them in the future tense.
+        let action = RoutingPolicy.decide(intent: .osAction,
+                                          inputs: bareInputs())
+        XCTAssertTrue(action.reason.contains("tools live"))
+        XCTAssertFalse(action.reason.contains("will live"))
+    }
+
+    func testRoutingFrontierLockedStandInNamesBothMissingUnlocks() {
+        // UAT-05: lock on with NO key and NO PCC — turning the
+        // lock off alone still leaves no cloud route, and the
+        // stand-in note must say so (naming both missing unlocks)
+        // instead of implying the lock is the only blocker.
+        let decision = RoutingPolicy.decide(
+            intent: .frontierCloud, inputs: bareInputs(localOnly: true))
+        XCTAssertEqual(decision.selection, .onDevice)
+        XCTAssertTrue(decision.note?.contains("Local Only is on") == true)
+        XCTAssertTrue(decision.note?.contains("Even with the lock off") == true)
+        XCTAssertTrue(decision.note?.contains("OpenRouter key") == true)
+        XCTAssertTrue(decision.note?.contains("Private Cloud") == true)
+    }
+
+    func testRoutingFrontierLockedWithACloudRouteNoteIsLockOnly() {
+        // UAT-05 (other half): with a key saved — or PCC offered —
+        // the lock really is the only blocker, so the note stays
+        // the plain lock note with no extra unlock sentence.
+        var keyed = bareInputs(localOnly: true)
+        keyed.openRouterKeyPresent = true
+        let keyedDecision = RoutingPolicy.decide(intent: .frontierCloud,
+                                                 inputs: keyed)
+        XCTAssertTrue(keyedDecision.note?.contains("Local Only is on") == true)
+        XCTAssertFalse(keyedDecision.note?.contains("Even with the lock off") == true)
+
+        var pcc = bareInputs(localOnly: true)
+        pcc.pccReady = true
+        let pccDecision = RoutingPolicy.decide(intent: .frontierCloud,
+                                               inputs: pcc)
+        XCTAssertFalse(pccDecision.note?.contains("Even with the lock off") == true)
+    }
+
+    func testThumbnailFingerprintDistinguishesImages() {
+        // UAT-07: the composer thumbnail cache serves a hit only
+        // when the data's fingerprint matches — two different
+        // images must not share one, and the same data must
+        // always match itself. (The fingerprint samples head,
+        // middle, and tail; the spot difference below sits in
+        // the tail sample.)
+        let a = Data((0..<100_000).map { UInt8($0 % 251) })
+        let other = Data((0..<100_000).map { UInt8(($0 * 7 + 3) % 251) })
+        var tail = a
+        tail[97_000] = tail[97_000] &+ 1
+        let fingerprint = AttachmentThumbnailCache.dataFingerprint
+        XCTAssertEqual(fingerprint(a), fingerprint(a))
+        XCTAssertNotEqual(fingerprint(a), fingerprint(other))
+        XCTAssertNotEqual(fingerprint(a), fingerprint(tail))
+        XCTAssertNotEqual(fingerprint(a),
+                          fingerprint(Data(a.prefix(50_000))))
+        XCTAssertEqual(fingerprint(Data()), fingerprint(Data()))
+    }
+
     func testRoutingStandsInWhenOnDeviceNotReady() {
         var inputs = bareInputs(onDeviceReady: false)
         inputs.downloadedMLX = [MLXCatalog.models[0]]

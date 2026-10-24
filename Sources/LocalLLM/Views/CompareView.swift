@@ -103,6 +103,18 @@ struct CompareView: View {
     private var canRun: Bool {
         !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !leftColumn.isRunning && !rightColumn.isRunning
+            && columnIsReady(leftColumn) && columnIsReady(rightColumn)
+    }
+
+    /// UAT-01: a column may only run a pick that can actually run —
+    /// the same readiness the chat send button gates on (a cloud
+    /// pick with no key, PCC the OS isn't offering, a model that
+    /// was removed). Without this, the factory quietly resolved
+    /// such a pick to the built-in model and the column answered
+    /// under the picked model's name.
+    private func columnIsReady(_ column: CompareColumn) -> Bool {
+        descriptors.first { $0.selection == column.selection }?.isReady
+            ?? false
     }
 
     private func runBoth() {
@@ -110,10 +122,12 @@ struct CompareView: View {
         let text = prompt
         leftColumn.run(prompt: text, resolver: resolver,
                        endpoints: endpoints,
-                       customRedactionTerms: customRedactionTerms)
+                       customRedactionTerms: customRedactionTerms,
+                       pickedDisplayName: descriptorName(leftColumn.selection))
         rightColumn.run(prompt: text, resolver: resolver,
                         endpoints: endpoints,
-                        customRedactionTerms: customRedactionTerms)
+                        customRedactionTerms: customRedactionTerms,
+                        pickedDisplayName: descriptorName(rightColumn.selection))
     }
 
     // MARK: - One column
@@ -146,8 +160,24 @@ struct CompareView: View {
             .fixedSize()
             .help("Choose this column's model")
 
+            // UAT-01: an unready pick says why, in place of running.
+            if !columnIsReady(column) {
+                Label(CompareNotices.unavailableNote(
+                        for: column.selection),
+                      systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             ScrollView {
                 VStack(alignment: .leading, spacing: 8) {
+                    if let notice = column.fallbackNotice {
+                        Label(notice, systemImage: "info.circle")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                     if let notice = column.privacyNotice {
                         Label(notice, systemImage: "lock.shield")
                             .font(.caption)
@@ -244,9 +274,15 @@ final class CompareColumn {
     private(set) var effectiveSelection: ModelSelection
     private(set) var text = ""
     private(set) var errorText: String?
-    /// Audit S-01: the privacy-check notice for the last run, when
-    /// the prompt had to be scrubbed for this column's destination
-    /// (same wording pattern as the chat engine's banner).
+    /// UAT-01: after a run whose pick resolved to a different
+    /// backend (the factory's fallback), the note naming the
+    /// backend that actually answered — the column header keeps
+    /// the picked name, so this is what keeps it honest.
+    private(set) var fallbackNotice: String?
+    /// Audit S-01: the privacy-check notice for the last run (same
+    /// wording pattern as the chat engine's banner). UAT-02: set
+    /// for EVERY remote send, as in chat (audit S-09) — not only
+    /// when something was scrubbed.
     private(set) var privacyNotice: String?
     private(set) var telemetry: MessageTelemetry?
     private(set) var isRunning = false
@@ -264,16 +300,28 @@ final class CompareColumn {
     func run(prompt: String,
              resolver: (ModelSelection) -> ResolvedBackend,
              endpoints: [EndpointConfig] = [],
-             customRedactionTerms: [String] = []) {
+             customRedactionTerms: [String] = [],
+             pickedDisplayName: String = "") {
         task?.cancel()
         text = ""
         errorText = nil
         telemetry = nil
         privacyNotice = nil
+        fallbackNotice = nil
         isRunning = true
         let resolved = resolver(selection)
         effectiveSelection = resolved.effectiveSelection
         let backend = resolved.backend
+        // UAT-01: the pick can resolve to a different backend than
+        // the header names (Local Only, a missing key, a removed
+        // model). The gate in the view stops the known cases; this
+        // notice catches any other, so the answer is never
+        // credited to a model that didn't produce it.
+        fallbackNotice = CompareNotices.fallbackNotice(
+            pickedSelection: selection,
+            effectiveSelection: effectiveSelection,
+            pickedName: pickedDisplayName,
+            effectiveName: backend.displayName)
         // Audit S-01: the same privacy firewall the chat engine
         // applies — a column whose EFFECTIVE destination is remote
         // (cloud, or a server that isn't on this Mac) receives the
@@ -282,7 +330,12 @@ final class CompareColumn {
         let scrubbed = RemoteDestination.scrubbed(
             prompt, selection: effectiveSelection,
             endpoints: endpoints, customTerms: customRedactionTerms)
-        if scrubbed.didRedact {
+        // UAT-02: the notice is set for every remote send (the
+        // zero-redaction wording says the check ran and hid
+        // nothing), matching chat's S-09 rule — previously a
+        // clean prompt left the Mac with no sign at all.
+        if RemoteDestination.isRemote(selection: effectiveSelection,
+                                      endpoints: endpoints) {
             privacyNotice = RemoteDestination.noticeText(
                 redactions: scrubbed.replacementCount,
                 backendDisplayName: backend.displayName,

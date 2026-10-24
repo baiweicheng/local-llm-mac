@@ -171,6 +171,35 @@ final class PolishTests: XCTestCase {
                                     query: "revenue"))
     }
 
+    func testSearchNormalizesQueryWhitespace() {
+        // UAT-09: the query is collapsed exactly like the text it
+        // is matched against.
+        XCTAssertEqual(ChatSearch.normalizedQuery("  body \t fat \n"),
+                       "body fat")
+        XCTAssertEqual(ChatSearch.normalizedQuery("revenue"), "revenue")
+        XCTAssertEqual(ChatSearch.normalizedQuery("   "), "")
+    }
+
+    func testSearchQueryWithIrregularSpacingStillMatches() {
+        // UAT-09: "body  fat" (double space) must find the
+        // single-spaced message text — before the fix this
+        // falsely reported "No chats match".
+        let hit = ChatSearch.hit(
+            title: "Chat",
+            messageTexts: ["Notes on my body fat goal"],
+            query: "body  fat")
+        XCTAssertNotNil(hit)
+        XCTAssertEqual(hit?.snippet, "Notes on my body fat goal")
+    }
+
+    func testSearchTitleWithIrregularSpacingStillMatches() {
+        // UAT-09, mirror image: irregular spacing in the TITLE
+        // must not hide it from a normally typed query either.
+        let hit = ChatSearch.hit(title: "Body  fat log",
+                                 messageTexts: [], query: "body fat")
+        XCTAssertEqual(hit?.titleMatched, true)
+    }
+
     func testSnippetCollapsesWhitespaceAndMarksCuts() {
         let text = (0..<30).map { _ in "word" }.joined(separator: " ")
             + " target here "

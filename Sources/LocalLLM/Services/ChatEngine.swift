@@ -147,6 +147,13 @@ final class ChatEngine {
     /// ("Auto: a quick edit or question — Apple On-Device has it."),
     /// shown as a small caption while the chat is on Auto.
     private(set) var routingNotes: [UUID: String] = [:]
+    /// UAT-06: the selection that actually answered the most recent
+    /// send in each conversation — after Auto routing AND the
+    /// factory's fallbacks. The chat's "lookups are off" note keys
+    /// off this for Auto chats: an Auto Mac-action prompt stood in
+    /// by a server has no tools even though the picker says Auto,
+    /// and keying the note off the picker hid exactly that case.
+    private(set) var lastEffectiveSelections: [UUID: ModelSelection] = [:]
     /// Phase 4: informational banners that aren't errors — currently
     /// the privacy-check notice when a prompt was scrubbed before
     /// being sent to a server that isn't on this Mac.
@@ -855,6 +862,7 @@ final class ChatEngine {
         respondingIDs.remove(conversationID)
         errorMessages[conversationID] = nil
         routingNotes[conversationID] = nil
+        lastEffectiveSelections[conversationID] = nil
         infoMessages[conversationID] = nil
         pendingPlans[conversationID] = nil
         excludedPlanItems[conversationID] = nil
@@ -963,6 +971,8 @@ final class ChatEngine {
         let resolved = backendProvider(targetSelection)
         let backend = resolved.backend
         let selection = resolved.effectiveSelection
+        // UAT-06: remember who is really answering this send.
+        lastEffectiveSelections[conversationID] = selection
         let budget = backend.budget
         if selection != targetSelection {
             // The picked (or routed) model can't run: it was deleted,

@@ -504,6 +504,46 @@ final class CloudTests: XCTestCase {
         XCTAssertTrue(CompareSeeding.canContinue(answer: "an answer"))
     }
 
+    // MARK: - Compare honesty (UAT-01)
+
+    func testCompareFallbackNoticeNamesTheBackendThatAnswered() {
+        // A cloud pick resolved to the built-in model: the notice
+        // must name BOTH, so the answer is never read as the
+        // cloud model's work.
+        let notice = CompareNotices.fallbackNotice(
+            pickedSelection: .openRouter(
+                modelID: "anthropic/claude-opus-5.5"),
+            effectiveSelection: .onDevice,
+            pickedName: "Claude Opus 5.5",
+            effectiveName: "Apple On-Device")
+        XCTAssertNotNil(notice)
+        XCTAssertTrue(notice!.contains("Claude Opus 5.5"))
+        XCTAssertTrue(notice!.contains("Apple On-Device"))
+        XCTAssertTrue(notice!.contains("answered"))
+    }
+
+    func testCompareFallbackNoticeSilentWhenPickRan() {
+        XCTAssertNil(CompareNotices.fallbackNotice(
+            pickedSelection: .privateCloudCompute,
+            effectiveSelection: .privateCloudCompute,
+            pickedName: "Apple Private Cloud",
+            effectiveName: "Apple Private Cloud"))
+        XCTAssertNil(CompareNotices.fallbackNotice(
+            pickedSelection: .onDevice,
+            effectiveSelection: .onDevice,
+            pickedName: "Apple On-Device",
+            effectiveName: "Apple On-Device"))
+    }
+
+    func testCompareUnavailableNotesNameTheRemedy() {
+        XCTAssertTrue(CompareNotices.unavailableNote(
+            for: .openRouter(modelID: "x/y")).contains("OpenRouter key"))
+        XCTAssertTrue(CompareNotices.unavailableNote(
+            for: .privateCloudCompute).contains("isn't available"))
+        XCTAssertTrue(CompareNotices.unavailableNote(
+            for: .onDevice).contains("isn't ready"))
+    }
+
     // MARK: - Tool-result redaction, in its cloud configuration
 
     private actor EventBox {
