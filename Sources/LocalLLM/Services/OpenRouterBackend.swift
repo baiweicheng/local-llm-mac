@@ -73,10 +73,22 @@ final class OpenRouterChatSession: ChatSession, UsageReportingChatSession {
                     continuation.finish()
                     return
                 }
+                // Audit B-46: same partial-exchange rule as the
+                // endpoint session — the engine keeps a stopped or
+                // interrupted reply's partial text as a stored
+                // message, so this session appends the same exchange
+                // (tracked here, in the consuming loop) before
+                // finishing with the error, instead of silently
+                // diverging from the transcript. A user turn is
+                // still never appended alone.
+                var latestText = ""
                 do {
                     let reply = try await self.performSend(
                         promptText: promptText,
-                        onText: { continuation.yield($0) })
+                        onText: { text in
+                            latestText = text
+                            continuation.yield(text)
+                        })
                     if !reply.isEmpty {
                         self.history.append(ChatMessagePayload(
                             role: "user", content: promptText))
@@ -85,6 +97,12 @@ final class OpenRouterChatSession: ChatSession, UsageReportingChatSession {
                     }
                     continuation.finish()
                 } catch {
+                    if !latestText.isEmpty {
+                        self.history.append(ChatMessagePayload(
+                            role: "user", content: promptText))
+                        self.history.append(ChatMessagePayload(
+                            role: "assistant", content: latestText))
+                    }
                     continuation.finish(throwing: error)
                 }
             }
@@ -94,6 +112,15 @@ final class OpenRouterChatSession: ChatSession, UsageReportingChatSession {
 
     private func performSend(promptText: String,
                              onText: @escaping (String) -> Void) async throws -> String {
+        // Audit B-45: every reply starts with NO usage report. The
+        // old code only ever set `lastUsageReport` when a reply
+        // carried one, so a later reply without a usage block
+        // inherited the previous reply's real cost on its telemetry
+        // pill — a wrong dollar figure presented as measured. (The
+        // engine reads the report after every stream, including a
+        // throw after partial text, so the reset must happen here,
+        // at the start of the send, not on success.)
+        lastUsageReport = nil
         var request = URLRequest(url: OpenRouterCatalog.chatCompletionsURL)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -126,7 +153,18 @@ final class OpenRouterChatSession: ChatSession, UsageReportingChatSession {
             if let text = accumulator.consume(line: line) {
                 onText(text)
             }
+            // Audit B-08: an error reported inside the stream is a
+            // failed send, not a finished (or empty) reply.
+            if let message = accumulator.errorMessage {
+                throw BackendError.openRouterStreamError(message: message)
+            }
             if accumulator.isDone { break }
+        }
+        if let final = accumulator.flush() {
+            onText(final)
+        }
+        if let message = accumulator.errorMessage {
+            throw BackendError.openRouterStreamError(message: message)
         }
         if let usage = accumulator.usage {
             lastUsageReport = usage

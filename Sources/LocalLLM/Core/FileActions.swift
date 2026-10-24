@@ -375,8 +375,17 @@ enum ActionProposal {
         guard destination != source else {
             return .refused("“\(newName)” is the name it already has.")
         }
-        guard !probe.exists(atPath: destination) else {
-            return .refused(alreadyExistsMessage(name: newName, folder: folder, home: home))
+        // Audit B-09: these comparisons fold case, like FileScope
+        // (and like the default case-insensitive macOS volume). A
+        // destination differing from the source only by case IS the
+        // source — a case-only rename (Photo.jpg → photo.jpg) — so
+        // the existence check must not refuse it by pointing at the
+        // very file being renamed. A genuinely different existing
+        // destination still refuses: never overwrite.
+        if destination.lowercased() != source.lowercased() {
+            guard !probe.exists(atPath: destination) else {
+                return .refused(alreadyExistsMessage(name: newName, folder: folder, home: home))
+            }
         }
         let summary = "Rename “\(PathDisplay.fileName(source))” → “\(newName)” in \(PathDisplay.shortened(folder, home: home))"
         return .proposed(PlannedAction(kind: .rename, sourcePath: source,
@@ -396,12 +405,17 @@ enum ActionProposal {
         guard let destination = inputs.destinationPath, !destination.isEmpty else {
             return .refused("That change needs the full destination path (destination) — where the \(kind == .move ? "moved" : "copied") item should end up.")
         }
-        guard destination != source else {
+        // Case-folded, like FileScope (audit B-09): on the default
+        // volume, spellings that differ only by case are one place.
+        let destinationFolded = destination.lowercased()
+        let sourceFolded = source.lowercased()
+        guard destinationFolded != sourceFolded else {
             return .refused("That's where it already is.")
         }
         // A folder can never land inside itself.
         if probe.isDirectory(atPath: source),
-           destination == source || destination.hasPrefix(source + "/") {
+           destinationFolded == sourceFolded
+            || destinationFolded.hasPrefix(sourceFolded + "/") {
             return .refused("A folder can't be \(kind == .move ? "moved" : "copied") into itself.")
         }
         if let refusal = checkedDestination(destination, roots: roots, probe: probe, home: home) {
@@ -710,8 +724,17 @@ enum ActionExecution {
                 .hasPrefix(resolved(source).lowercased() + "/") {
                 return "A folder can't be moved into itself."
             }
-            guard !probe.exists(atPath: destination) else {
-                return "Something is already at the destination, and a change never overwrites it."
+            // Audit B-09: a case-only rename's destination IS its
+            // source (case-folded) — the existence check must not
+            // refuse the very item being renamed. Every other kind,
+            // and every genuinely different destination, keeps the
+            // never-overwrite rule.
+            let caseOnlyRename = action.kind == .rename
+                && destination.lowercased() == source.lowercased()
+            if !caseOnlyRename {
+                guard !probe.exists(atPath: destination) else {
+                    return "Something is already at the destination, and a change never overwrites it."
+                }
             }
             return nil
         case .createFolder:
@@ -738,6 +761,18 @@ enum ActionExecution {
             }
             guard probe.exists(atPath: source) else {
                 return "The item isn't there anymore."
+            }
+            // Audit B-10: the proposal's "never trash a shared
+            // folder itself" rule, repeated here as the header
+            // contract promises. The shared set can change between
+            // proposal and approval so the item BECOMES a root —
+            // and scope admits a root by design — so without this
+            // check the executor would trash the designated tree.
+            if roots.contains(where: {
+                FileScope.normalizedPath($0).lowercased()
+                    == FileScope.normalizedPath(resolved(source)).lowercased()
+            }) {
+                return "That's one of the shared folders itself now, so it can't be moved to the Trash."
             }
             return nil
         case .resizePhoto:
@@ -926,6 +961,11 @@ enum ActionPlanRules {
                 && existing.workingDirectory == candidate.workingDirectory
                 && existing.mcpNamespacedName == candidate.mcpNamespacedName
                 && existing.mcpArgumentsJSON == candidate.mcpArgumentsJSON
+                // Audit B-16: for resizePhoto the caps ARE the
+                // payload — a re-proposal with different limits is
+                // a different action, not a duplicate.
+                && existing.maxWidthPx == candidate.maxWidthPx
+                && existing.byteCeiling == candidate.byteCeiling
         }
     }
 }

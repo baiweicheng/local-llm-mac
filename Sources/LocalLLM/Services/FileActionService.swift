@@ -125,6 +125,27 @@ enum FileActionService {
         }
     }
 
+    /// The identity of the file an edit is about to touch, captured
+    /// when its backup is taken and re-checked immediately before
+    /// the write (audit B-59): modification date + size + the
+    /// filesystem file number (inode), which together distinguish
+    /// "the file that was backed up" from "a different file that
+    /// now sits at the same path".
+    private struct FileIdentity: Equatable {
+        let modifiedAt: Date?
+        let size: Int
+        let fileNumber: Int
+    }
+
+    private static func fileIdentity(atPath path: String) -> FileIdentity? {
+        guard let attributes = try? FileManager.default
+            .attributesOfItem(atPath: path) else { return nil }
+        return FileIdentity(
+            modifiedAt: attributes[.modificationDate] as? Date,
+            size: (attributes[.size] as? NSNumber)?.intValue ?? -1,
+            fileNumber: (attributes[.systemFileNumber] as? NSNumber)?.intValue ?? -1)
+    }
+
     /// Writes the text. An existing file is first copied into the
     /// plan's backup folder — that copy is what makes the edit
     /// undoable. Appends work at the byte level so a file's encoding
@@ -140,6 +161,9 @@ enum FileActionService {
         let fileManager = FileManager.default
         let existed = fileManager.fileExists(atPath: path)
         var backupPath: String? = nil
+        // Audit B-59: the backed-up file's identity, verified again
+        // immediately before writing (below).
+        var backedUpIdentity: FileIdentity? = nil
         if existed {
             let backupURL = backupDirectory
                 .appendingPathComponent(action.id.uuidString)
@@ -151,6 +175,7 @@ enum FileActionService {
             } catch {
                 return failed(action, "Couldn't back up the file first, so it wasn't changed — \(error.localizedDescription)")
             }
+            backedUpIdentity = fileIdentity(atPath: path)
         }
         let newText = Data((action.editText ?? "").utf8)
         let data: Data
@@ -161,6 +186,20 @@ enum FileActionService {
             data = existing + newText
         } else {
             data = newText
+        }
+        // Audit B-59: re-stat right before writing. The `existed`
+        // snapshot above drove the backup, the append read, and the
+        // write flavour — if another process replaced the file in
+        // between, writing now would overwrite the NEW content
+        // while the backup (and the undo story) describes the OLD
+        // one. A changed identity aborts this item instead; a file
+        // that vanished aborts it too (the create branch's
+        // `.withoutOverwriting` guard covers the reverse race).
+        if existed {
+            guard let currentIdentity = fileIdentity(atPath: path),
+                  currentIdentity == backedUpIdentity else {
+                return failed(action, "The file changed while the change was being made, so it wasn't overwritten. Ask for the change again if you still want it.")
+            }
         }
         do {
             if existed {

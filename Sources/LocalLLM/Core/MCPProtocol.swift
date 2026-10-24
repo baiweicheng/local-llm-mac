@@ -233,21 +233,23 @@ enum MCPIncoming: Sendable, Equatable {
 /// small — feed it chunks, get back completed messages.
 struct MCPStreamParser {
 
-    private var buffer = ""
+    /// Buffered BYTES, not text (audit B-01): read boundaries are
+    /// arbitrary, so a multi-byte UTF-8 character can straddle two
+    /// chunks — decoding whole chunks dropped the straddling chunk
+    /// (and any complete lines in it) entirely. Bytes are split on
+    /// the newline byte and only completed lines are decoded.
+    private var buffer = Data()
 
     mutating func feed(_ chunk: Data) -> [MCPIncoming] {
-        guard let text = String(data: chunk, encoding: .utf8) else {
-            return []
-        }
-        return feed(text)
-    }
-
-    mutating func feed(_ text: String) -> [MCPIncoming] {
-        buffer += text
+        buffer.append(chunk)
         var messages: [MCPIncoming] = []
-        while let newline = buffer.firstIndex(of: "\n") {
-            let line = String(buffer[buffer.startIndex..<newline])
+        while let newline = buffer.firstIndex(of: 0x0A) {
+            let lineData = buffer[buffer.startIndex..<newline]
             buffer.removeSubrange(buffer.startIndex...newline)
+            // A completed line from a conforming server is valid
+            // UTF-8; decode lossily so a damaged line surfaces as
+            // one `.malformed` message instead of vanishing.
+            let line = String(decoding: lineData, as: UTF8.self)
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty {
                 messages.append(Self.parseLine(trimmed))
@@ -256,11 +258,16 @@ struct MCPStreamParser {
         return messages
     }
 
+    mutating func feed(_ text: String) -> [MCPIncoming] {
+        feed(Data(text.utf8))
+    }
+
     /// Whatever is left when the stream ends — a final message
     /// without its newline still counts.
     mutating func finish() -> [MCPIncoming] {
-        let leftover = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
-        buffer = ""
+        let leftover = String(decoding: buffer, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        buffer = Data()
         return leftover.isEmpty ? [] : [Self.parseLine(leftover)]
     }
 
@@ -269,12 +276,21 @@ struct MCPStreamParser {
               case .object(let object) = value else {
             return .malformed(text: line)
         }
-        let id: Int? = {
-            if case .number(let number)? = object["id"] {
-                return Int(number)
+        // Audit B-03: `Int(number)` traps on a huge id, and a
+        // fractional id would silently truncate and risk matching
+        // the wrong pending request. Only an integral id inside a
+        // safely representable range is an id at all — anything
+        // else makes the whole line malformed, never a crash.
+        let id: Int?
+        if case .number(let number)? = object["id"] {
+            guard number.isFinite, number == number.rounded(),
+                  abs(number) < 9.0e15 else {
+                return .malformed(text: line)
             }
-            return nil
-        }()
+            id = Int(number)
+        } else {
+            id = nil
+        }
         let method = object.string(forKey: "method")
         if let id, let method {
             return .serverRequest(id: id, method: method)

@@ -49,6 +49,10 @@ struct SettingsView: View {
     /// so its rows are exactly the chat picker's rows.
     let mlxStore: MLXModelStore
     let endpointStore: EndpointStore
+    /// Audit B-58: the quick-panel coordinator, read here only for
+    /// its hotkey-registration failure state (shown in the Quick
+    /// panel section below when the shortcut couldn't be taken).
+    let hudCoordinator: HUDCoordinator
     @Environment(\.dismiss) private var dismiss
     @Environment(\.modelContext) private var modelContext
 
@@ -490,6 +494,15 @@ struct SettingsView: View {
             ForEach(VisibilitySource.allCases, id: \.self) { source in
                 sourceRow(source)
             }
+            // Audit B-57: a sharing problem (a folder that couldn't
+            // be saved, re-opened, or accessed) is said out loud
+            // here instead of failing silently.
+            if let scopeError = fileScopeStore.lastError {
+                Text(scopeError)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
@@ -558,21 +571,32 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(fileScopeStore.folders) { folder in
-                    HStack(spacing: 8) {
-                        Image(systemName: "folder")
-                            .foregroundStyle(.secondary)
-                        Text(folder.path)
-                            .font(.caption)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                        Spacer()
-                        Button {
-                            fileScopeStore.removeFolder(id: folder.id)
-                        } label: {
-                            Image(systemName: "trash")
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "folder")
+                                .foregroundStyle(.secondary)
+                            Text(folder.path)
+                                .font(.caption)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer()
+                            Button {
+                                fileScopeStore.removeFolder(id: folder.id)
+                            } label: {
+                                Image(systemName: "trash")
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Stop sharing this folder")
                         }
-                        .buttonStyle(.borderless)
-                        .help("Stop sharing this folder")
+                        // Audit B-57: a folder whose bookmark no
+                        // longer resolves or grants access is OUT
+                        // of scope — say so on its row.
+                        if !fileScopeStore.isAvailable(folder) {
+                            Text("Not available — this folder was moved, deleted, or access wasn't granted. It isn't being shared; remove it and add it again.")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
                 }
             }
@@ -766,6 +790,14 @@ struct SettingsView: View {
                 .fixedSize(horizontal: false, vertical: true)
             Toggle(isOn: $settings.hudEnabled) {
                 Text("Enable the quick panel (⌘⇧Space)")
+            }
+            // Audit B-58: a failed registration is a visible state,
+            // not a silently dead hotkey.
+            if settings.hudEnabled, hudCoordinator.hotkeyRegistrationFailed {
+                Text(HUDCoordinator.hotkeyFailureText)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Text("Turning this off unregisters the shortcut right away; turning it back on re-registers it. No relaunch needed.")
                 .font(.caption)

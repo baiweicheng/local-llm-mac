@@ -72,7 +72,8 @@ import SwiftData
 ///   had any.
 /// - Tool results never pass through this engine: the backends invoke
 ///   the runtime inside their own sessions. What the engine owns is
-///   the *record*: runtime events arrive on a static sink and are
+///   the *record*: runtime events arrive on a per-send sink (audit
+///   B-43: it carries that send's own context) and are
 ///   persisted here as `ToolActivityRecord`s (the access log),
 ///   rotated to `AccessLogPolicy`'s cap.
 /// - Tool results and the privacy firewall: every tool-capable
@@ -254,24 +255,35 @@ final class ChatEngine {
 
     // MARK: - Tool activity log (Phase 5)
 
-    /// The model context of the send currently in flight. Tool calls
-    /// happen deep inside a backend's session, far from any context;
-    /// the runtime's events come back through the sink below and are
-    /// written with this. Tool calls only ever happen during a send,
-    /// and `prepareAndStream` sets this before streaming starts.
-    private static var activityLogContext: ModelContext?
-
-    /// The runtime's event sink: hop to the main actor and persist.
-    private static let toolEventSink: @Sendable (ToolEvent) async -> Void = { event in
-        await MainActor.run {
-            ChatEngine.recordToolEvent(event)
+    /// Builds the runtime event sink for ONE operation (a send, in
+    /// practice): the sink carries that operation's own container,
+    /// and events are written through its main context — the same
+    /// context the operation itself was handed.
+    ///
+    /// Audit B-43: this replaces a single static `activityLogContext`
+    /// that every concurrent send/approve/discard/undo overwrote —
+    /// last writer won, so an event from send A could be inserted
+    /// through send B's context whenever their suspensions
+    /// interleaved. The context now travels WITH the sink (and, for
+    /// plan bookkeeping, as an explicit argument to
+    /// `recordToolEvent`), never through shared mutable state.
+    /// `ModelContainer` is the Sendable handle; its `mainContext`
+    /// is the very context object the views pass to the engine.
+    private static func toolEventSink(
+        container: ModelContainer
+    ) -> @Sendable (ToolEvent) async -> Void {
+        { event in
+            await MainActor.run {
+                ChatEngine.recordToolEvent(event,
+                                           context: container.mainContext)
+            }
         }
     }
 
     /// Persists one tool event as an access-log record, rotating the
     /// oldest entries away past the policy cap.
-    private static func recordToolEvent(_ event: ToolEvent) {
-        guard let context = activityLogContext else { return }
+    private static func recordToolEvent(_ event: ToolEvent,
+                                        context: ModelContext) {
         context.insert(ToolActivityRecord(event: event))
         let total = (try? context.fetchCount(
             FetchDescriptor<ToolActivityRecord>())) ?? 0
@@ -370,16 +382,23 @@ final class ChatEngine {
         let excluded = excludedPlanItems[conversationID] ?? []
         excludedPlanItems[conversationID] = nil
         planBusyIDs.insert(conversationID)
-        Self.activityLogContext = context
         let availability = toolAvailabilityProvider()
         let roots = availability.folderRootPaths
         let localOnly = availability.localOnly
         let mcpExecutor = mcpExecutorProvider
         let planKey = UUID()
-        Task { [weak self] in
+        // Audit B-52: the execution task is STORED per conversation
+        // (like a send task), so `forget` can cancel it — the old
+        // fire-and-forget task kept running file changes, commands,
+        // and MCP calls invisibly after its conversation was
+        // deleted, then wrote records and outcome notes for it.
+        planTasks[conversationID] = Task { [weak self] in
             let backupDirectory = Self.backupDirectory(for: planKey)
             var executed: [ExecutedActionItem] = []
             for action in plan {
+                // Stop between items when cancelled (deletion is
+                // the canceller — see `forget`).
+                if Task.isCancelled { break }
                 if excluded.contains(action.id) {
                     executed.append(ExecutedActionItem(
                         action: action, outcome: .declined,
@@ -392,8 +411,17 @@ final class ChatEngine {
                         mcpExecutor: mcpExecutor))
                 }
             }
+            let wasCancelled = Task.isCancelled
             await MainActor.run {
                 guard let self else { return }
+                self.planTasks[conversationID] = nil
+                self.planBusyIDs.remove(conversationID)
+                // Audit B-51/B-52: a deleted conversation gets no
+                // record, no audit events, and no re-created
+                // outcome note — `forget` already cleared them, and
+                // this completion must not resurrect any of it.
+                guard !self.forgottenIDs.contains(conversationID),
+                      !wasCancelled else { return }
                 let record = ActionPlanRecord(conversationID: conversationID,
                                               status: .executed,
                                               items: executed)
@@ -407,9 +435,8 @@ final class ChatEngine {
                         querySummary: item.action.summary,
                         resultSummary: ToolResultText.summary(
                             of: item.resultNote),
-                        date: Date()))
+                        date: Date()), context: context)
                 }
-                self.planBusyIDs.remove(conversationID)
                 self.pendingOutcomeNotes[conversationID] =
                     Self.approvalOutcomeNote(items: executed)
             }
@@ -516,7 +543,6 @@ final class ChatEngine {
               !planBusyIDs.contains(conversationID) else { return }
         pendingPlans[conversationID] = nil
         excludedPlanItems[conversationID] = nil
-        Self.activityLogContext = context
         let record = ActionPlanRecord(
             conversationID: conversationID, status: .discarded,
             items: plan.map {
@@ -533,7 +559,7 @@ final class ChatEngine {
                 source: Self.auditSource(for: action.kind),
                 querySummary: action.summary,
                 resultSummary: "Discarded by the user — nothing was changed or run.",
-                date: Date()))
+                date: Date()), context: context)
         }
         pendingOutcomeNotes[conversationID] =
             "The user discarded the list of \(plan.count) "
@@ -551,14 +577,17 @@ final class ChatEngine {
         guard record.canUndo, !planBusyIDs.contains(conversationID)
         else { return }
         planBusyIDs.insert(conversationID)
-        Self.activityLogContext = context
         let undoRoots = toolAvailabilityProvider().folderRootPaths
-        Task { [weak self] in
+        // Audit B-52: stored per conversation, like the approve
+        // task, so `forget` can cancel an undo in flight too.
+        planTasks[conversationID] = Task { [weak self] in
             var items = record.items
             let steps = ActionUndo.steps(for: items, home: NSHomeDirectory())
             // Steps are keyed by the action's id, not by position.
             var results: [(item: ExecutedActionItem, note: String)] = []
             for step in steps {
+                // Stop between steps when cancelled (audit B-52).
+                if Task.isCancelled { break }
                 let note = FileActionService.executeUndoStep(
                     step, roots: undoRoots)
                 if let index = items.firstIndex(
@@ -567,8 +596,15 @@ final class ChatEngine {
                     results.append((items[index], note))
                 }
             }
+            let wasCancelled = Task.isCancelled
             await MainActor.run {
                 guard let self else { return }
+                self.planTasks[conversationID] = nil
+                self.planBusyIDs.remove(conversationID)
+                // Audit B-51/B-52: no writes for a deleted
+                // conversation (see `approvePlan`).
+                guard !self.forgottenIDs.contains(conversationID),
+                      !wasCancelled else { return }
                 record.items = items
                 record.undoneAt = Date()
                 try? context.save()
@@ -579,9 +615,8 @@ final class ChatEngine {
                         source: Self.auditSource(for: entry.item.action.kind),
                         querySummary: "Undo: \(entry.item.action.summary)",
                         resultSummary: ToolResultText.summary(of: entry.note),
-                        date: Date()))
+                        date: Date()), context: context)
                 }
-                self.planBusyIDs.remove(conversationID)
                 let lines = results.map {
                     "• \($0.item.action.summary) — \($0.note)"
                 }
@@ -654,10 +689,31 @@ final class ChatEngine {
         /// a changed toggle or folder list must retire the session
         /// exactly like an instructions edit does.
         let toolsSignature: String
+        /// Audit B-47: the resolved backend's configuration digest
+        /// (`SessionConfigDigest`) — endpoint URL + model, or a
+        /// one-way digest of the OpenRouter key. The selection alone
+        /// doesn't capture either, so without this an edited server
+        /// or rotated key never retired a live session. Compared
+        /// in-memory only: `LiveSession` values are never persisted.
+        let configDigest: String
     }
 
     private var liveSessions: [UUID: LiveSession] = [:]
     private var tasks: [UUID: Task<Void, Never>] = [:]
+    /// Audit B-52: plan approve/undo execution tasks, per
+    /// conversation — stored (unlike the old fire-and-forget tasks)
+    /// so `forget` can cancel them and their loops can stop between
+    /// items.
+    private var planTasks: [UUID: Task<Void, Never>] = [:]
+    /// Audit B-51: conversations deleted while work was in flight.
+    /// Cancellation is cooperative and the send/plan pipelines have
+    /// wide suspension windows, so the pipelines consult this
+    /// tombstone set after suspensions and before saving anything;
+    /// a forgotten conversation's late reply or plan record is
+    /// dropped silently instead of being inserted against a deleted
+    /// `Conversation`. Entries are never removed (ids are unique
+    /// and never reused).
+    private var forgottenIDs: Set<UUID> = []
 
     func isResponding(_ conversationID: UUID) -> Bool {
         respondingIDs.contains(conversationID)
@@ -669,8 +725,17 @@ final class ChatEngine {
 
     /// The conversation was deleted — forget its session and any stream.
     func forget(conversationID: UUID) {
+        // Audit B-51/B-52: tombstone FIRST, then cancel everything
+        // in flight for this conversation — the send task AND any
+        // plan approve/undo task. The pipelines check the tombstone
+        // after their suspensions and before saving, so a task
+        // unwinding after the sidebar's delete can't insert a reply
+        // or plan record into the deleted conversation.
+        forgottenIDs.insert(conversationID)
         tasks[conversationID]?.cancel()
         tasks[conversationID] = nil
+        planTasks[conversationID]?.cancel()
+        planTasks[conversationID] = nil
         retireSession(conversationID)
         streamingText[conversationID] = nil
         respondingIDs.remove(conversationID)
@@ -701,7 +766,9 @@ final class ChatEngine {
               promptPrefix: String? = nil) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty,
-              !isResponding(conversation.id) else { return }
+              !isResponding(conversation.id),
+              // Audit B-51: a deleted conversation accepts no sends.
+              !forgottenIDs.contains(conversation.id) else { return }
         if let promptPrefix, !promptPrefix.isEmpty {
             pendingPromptPrefixes[conversation.id] = promptPrefix
         }
@@ -737,9 +804,15 @@ final class ChatEngine {
     private func prepareAndStream(conversation: Conversation,
                                   context: ModelContext) async {
         let conversationID = conversation.id
-        // Tool executions during this send report to the access log
-        // through the sink; give it this send's context to write with.
-        Self.activityLogContext = context
+        // Audit B-43: tool executions during this send report to the
+        // access log through a sink built with THIS send's container
+        // (see the session-creation site below) — no shared static.
+        // Audit B-51: whether this conversation was deleted while
+        // this send was suspended. Checked after each suspension
+        // window and before saving anything.
+        func isForgotten() -> Bool {
+            forgottenIDs.contains(conversationID)
+        }
         let instructions = PromptHistory.mergedInstructions(
             userInstructions: conversation.systemInstructions)
 
@@ -759,7 +832,7 @@ final class ChatEngine {
         if conversation.modelSelection.isAuto {
             let intent = await IntentClassifier.classify(
                 prompt: lastMessage.text) ?? .quickTransform
-            if Task.isCancelled {
+            if Task.isCancelled || isForgotten() {
                 finish(conversationID: conversationID)
                 return
             }
@@ -864,7 +937,7 @@ final class ChatEngine {
                 existingSummary: conversation.contextSummary,
                 turns: chunk,
                 targetTokens: budget.summaryTargetTokens)
-            if Task.isCancelled {
+            if Task.isCancelled || isForgotten() {
                 finish(conversationID: conversationID)
                 return
             }
@@ -921,6 +994,11 @@ final class ChatEngine {
             && existing!.summaryKey == summaryKey
             && existing!.seeded
             && existing!.toolsSignature == toolsSignature
+            // Audit B-47: the backend's configuration must also
+            // match — an edited server (URL/model) or a rotated
+            // OpenRouter key retires the session like any other
+            // signature change.
+            && existing!.configDigest == resolved.configDigest
             && KVCacheMode.sessionReusable(
                 sessionMode: existing!.kvCacheMode,
                 currentMode: routingInputs.kvCacheMode,
@@ -960,7 +1038,11 @@ final class ChatEngine {
                         localOnly: toolAvailability.localOnly,
                         mcpTools: mcpTools,
                         proposalSink: Self.proposalSink),
-                    sink: Self.toolEventSink,
+                    // Audit B-43: the sink carries THIS send's
+                    // container, so its events are written through
+                    // this send's context — never a shared static
+                    // another send may have overwritten.
+                    sink: Self.toolEventSink(container: context.container),
                     permissionProvider: { source in
                         PermissionStatusReader.currentState(for: source)
                     })
@@ -985,7 +1067,16 @@ final class ChatEngine {
                 session: session, selection: selection,
                 instructions: effectiveInstructions, summaryKey: summaryKey,
                 seeded: true, kvCacheMode: routingInputs.kvCacheMode,
-                toolsSignature: toolsSignature)
+                toolsSignature: toolsSignature,
+                configDigest: resolved.configDigest)
+        }
+
+        // Audit B-51: session building suspended (MCP discovery can
+        // take seconds) — if the conversation was deleted meanwhile,
+        // stop here, before anything is sent or saved.
+        if isForgotten() {
+            finish(conversationID: conversationID)
+            return
         }
 
         // Phase 6: if the user decided a proposed file-change list
@@ -993,16 +1084,24 @@ final class ChatEngine {
         // the outcome rides at the head of this prompt. It is part of
         // the sent copy only — never a stored message — and it goes
         // through the same firewall scrub as everything else below.
-        if let outcomeNote = pendingOutcomeNotes.removeValue(
-            forKey: conversationID) {
+        //
+        // Audit B-44: the note (and the Phase 7 prefix below) is
+        // PEEKED here, not consumed. It is the only channel telling
+        // the model what was approved/discarded/undone; consuming it
+        // before the stream meant a failed or stopped send lost it
+        // forever, and the model then re-proposed executed changes
+        // or reported approved work as pending. Both are removed
+        // only after a reply completes successfully (see the stream
+        // handling below); on error or stop they stay queued and
+        // ride the next send instead.
+        if let outcomeNote = pendingOutcomeNotes[conversationID] {
             promptText = outcomeNote + "\n\n" + promptText
         }
 
         // Phase 7: the quick panel's captured context, supplied with
         // the send, rides at the head of the prompt the same way —
         // sent copy only, and the firewall scrub below covers it too.
-        if let promptPrefix = pendingPromptPrefixes.removeValue(
-            forKey: conversationID) {
+        if let promptPrefix = pendingPromptPrefixes[conversationID] {
             promptText = promptPrefix + "\n\n" + promptText
         }
 
@@ -1054,6 +1153,9 @@ final class ChatEngine {
         }
 
         var received = ""
+        // Audit B-44: did the reply complete? The peeked outcome
+        // note / prompt prefix are consumed only when it did.
+        var replyCompleted = false
         let generationStarted = Date()
         do {
             let request = ChatReplyRequest(
@@ -1063,6 +1165,7 @@ final class ChatEngine {
                 received = text
                 streamingText[conversationID] = received
             }
+            replyCompleted = true
         } catch is CancellationError {
             // Stopped by the user — whatever arrived is kept below.
         } catch {
@@ -1070,6 +1173,24 @@ final class ChatEngine {
                 "The model couldn't finish that reply: \(error.localizedDescription)"
         }
         let generationSeconds = Date().timeIntervalSince(generationStarted)
+
+        // Audit B-44: consume the peeked note/prefix now that the
+        // reply completed — on error or stop they were never
+        // removed, so they stay queued ("re-queued") for the next
+        // send and the model still learns the decision.
+        if replyCompleted {
+            pendingOutcomeNotes[conversationID] = nil
+            pendingPromptPrefixes[conversationID] = nil
+        }
+
+        // Audit B-51: the conversation was deleted while the reply
+        // streamed — drop the save silently. Inserting here would
+        // attach a message to a deleted `Conversation` and
+        // resurrect an orphan.
+        if isForgotten() {
+            finish(conversationID: conversationID)
+            return
+        }
 
         let finalText = received.trimmingCharacters(in: .whitespacesAndNewlines)
         if !finalText.isEmpty {

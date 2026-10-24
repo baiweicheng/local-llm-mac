@@ -58,6 +58,20 @@ final class HUDCoordinator: NSObject, NSApplicationDelegate {
     /// keyboard focus and scroll to the latest message.
     private(set) var summonGeneration = 0
 
+    /// Audit B-58: true when the last ⌘⇧Space registration attempt
+    /// failed (another app may hold the shortcut). Settings shows
+    /// it in the Quick panel section so a dead hotkey is a visible
+    /// state with a remedy, not a silent nothing. Cleared by the
+    /// next successful registration.
+    private(set) var hotkeyRegistrationFailed = false
+
+    /// The Settings copy for the failed-registration state.
+    static let hotkeyFailureText =
+        "The ⌘⇧Space shortcut couldn't be registered — another app "
+        + "may be using it right now. Blink keeps trying whenever "
+        + "this setting is toggled or the app is reopened; free the "
+        + "shortcut in the other app if it stays taken."
+
     // MARK: - Wiring (set once by ContentView)
 
     /// Read by the panel's root view to bind its content.
@@ -155,17 +169,27 @@ final class HUDCoordinator: NSObject, NSApplicationDelegate {
         if registerStatus != noErr {
             // Another app may already own ⌘⇧Space system-wide; the
             // panel simply stays unavailable by hotkey — the main
-            // window is unaffected. Settings can't fix a conflict
-            // like that, so there's nothing to surface.
-            if let hotKeyHandlerRef {
-                RemoveEventHandler(hotKeyHandlerRef)
-                self.hotKeyHandlerRef = nil
-            }
+            // window is unaffected.
+            //
+            // Audit B-58: the failure may be TRANSIENT (the other
+            // app later releases the shortcut), so (a) the event
+            // handler stays INSTALLED — only the hotkey ref is
+            // dropped, which is what `applyHotkeyRegistration`
+            // needs to see to retry registration on the next
+            // configure/toggle — and (b) the failure is surfaced
+            // for Settings instead of vanishing silently. The old
+            // code also removed the handler, and nothing ever
+            // re-attempted, so a momentary conflict killed the
+            // hotkey for the whole run with no signal anywhere.
+            hotkeyRegistrationFailed = true
             hotKeyRef = nil
+        } else {
+            hotkeyRegistrationFailed = false
         }
     }
 
     private func unregisterHotkey() {
+        hotkeyRegistrationFailed = false
         if let hotKeyRef {
             UnregisterEventHotKey(hotKeyRef)
             self.hotKeyRef = nil
@@ -269,12 +293,30 @@ final class HUDCoordinator: NSObject, NSApplicationDelegate {
         let filesEnabled = settings.isSourceEnabled(.files)
         contextSnapshot = HUDContextCapture.captureSync(
             includeClipboardText: settings.isSourceEnabled(.clipboard))
+        if !filesEnabled {
+            // No probe for this summon: the flag belongs to the
+            // current generation, so clear any stale probe's claim
+            // on it here (audit B-53's companion case).
+            finderProbeInFlight = false
+        }
         if filesEnabled {
             finderProbeInFlight = true
             HUDContextCapture.probeFinderSelection { [weak self] paths in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
-                    self.finderProbeInFlight = false
+                    // Audit B-53: only the CURRENT summon's probe
+                    // may clear the in-flight flag. The old code
+                    // cleared it unconditionally, before the
+                    // generation check below — a stale probe from
+                    // the previous summon could drop the flag while
+                    // this summon's probe was still running, and
+                    // `panelDidResignKey` would then dismiss the
+                    // panel out from under the live probe's
+                    // Automation prompt (the failure the flag
+                    // exists to prevent).
+                    if generation == self.captureGeneration {
+                        self.finderProbeInFlight = false
+                    }
                     // Only the current summon's probe may merge, and
                     // only while the Files toggle is still on.
                     guard generation == self.captureGeneration,

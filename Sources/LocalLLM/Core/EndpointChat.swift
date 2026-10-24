@@ -197,28 +197,155 @@ struct SSEAccumulator: Equatable, Sendable {
     /// chunk, which usually carries no content at all — so this is
     /// captured independently of the content path below).
     private(set) var usage: UsageReport?
+    /// The server's own error report, when a stream payload carried
+    /// a top-level `error` object (audit B-08). OpenAI-compatible
+    /// servers can deliver one of these inside an HTTP 200 stream;
+    /// without this state it was dropped like a keep-alive and the
+    /// partial (or empty) text looked like a finished reply. Callers
+    /// throw when this is set.
+    private(set) var errorMessage: String?
+    /// The `data:` lines of the event currently being assembled
+    /// (audit B-13): an event's payload may be split across several
+    /// consecutive `data:` lines. Lines are held here until together
+    /// they parse as one JSON object (or the event/stream ends).
+    private var pendingDataLines: [String] = []
 
     /// Consumes one raw stream line. Returns the new cumulative text
-    /// when the line carried a content piece, nil otherwise (blank
-    /// lines, keep-alives, role-only first chunks, malformed JSON, the
-    /// [DONE] marker itself).
+    /// when the line completed an event carrying a content piece,
+    /// nil otherwise (blank lines that complete a contentless event,
+    /// keep-alives, role-only first chunks, still-incomplete
+    /// multi-line payloads, the [DONE] marker itself).
     mutating func consume(line: String) -> String? {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            // A blank line is the SSE event boundary: whatever is
+            // buffered is the whole event, parseable or not.
+            return flush()
+        }
         guard trimmed.hasPrefix("data:") else { return nil }
         let payload = trimmed.dropFirst("data:".count)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if payload == "[DONE]" {
+            _ = flush()
             isDone = true
             return nil
         }
-        if let report = UsageReport.parse(payload: String(payload)) {
+        pendingDataLines.append(String(payload))
+        // Most events are a single line: if the buffered lines now
+        // form a complete JSON object, the event is complete. If
+        // not, the payload may be a multi-line event still in
+        // flight — keep buffering instead of dropping the halves.
+        if let complete = Self.completedPayload(from: pendingDataLines) {
+            pendingDataLines = []
+            return process(payload: complete)
+        }
+        // The buffered lines never completed, but THIS line is a
+        // whole event by itself: the buffered ones were a single
+        // malformed event (a stray "data: {not json"), and holding
+        // onto them would poison every event that follows.
+        if pendingDataLines.count > 1,
+           let single = Self.completedPayload(from: [String(payload)]) {
+            pendingDataLines = []
+            return process(payload: single)
+        }
+        // A payload that is not even a plausible JSON PREFIX (its
+        // brackets balance and it ends outside any string) is a
+        // complete — if garbled — event, not half of one: drop it
+        // now rather than buffering forever.
+        let joined = pendingDataLines.joined(separator: "\n")
+        if !Self.couldBeJSONPrefix(joined) {
+            pendingDataLines = []
+        }
+        return nil
+    }
+
+    /// Whether `text` could still grow into valid JSON by appending
+    /// more lines: it ends inside a string, or with brackets open.
+    /// (A negative depth — more closers than openers — never can.)
+    private static func couldBeJSONPrefix(_ text: String) -> Bool {
+        var depth = 0
+        var inString = false
+        var escaped = false
+        for character in text {
+            if escaped { escaped = false; continue }
+            if character == "\\", inString { escaped = true; continue }
+            if character == "\"" { inString.toggle(); continue }
+            if inString { continue }
+            if character == "{" || character == "[" { depth += 1 }
+            if character == "}" || character == "]" {
+                depth -= 1
+                if depth < 0 { return false }
+            }
+        }
+        return inString || depth > 0
+    }
+
+    /// Ends the stream: processes a trailing event that never got
+    /// its blank line, if the buffered lines form a payload. Returns
+    /// the cumulative text when that event carried content.
+    mutating func flush() -> String? {
+        guard !pendingDataLines.isEmpty else { return nil }
+        let lines = pendingDataLines
+        pendingDataLines = []
+        guard let complete = Self.completedPayload(from: lines)
+        else { return nil }
+        return process(payload: complete)
+    }
+
+    /// Applies one complete event payload: records an error report
+    /// or a usage report when present, and appends any content
+    /// piece. Returns the cumulative text when content arrived.
+    private mutating func process(payload: String) -> String? {
+        if let message = Self.errorMessage(fromPayload: payload) {
+            if errorMessage == nil { errorMessage = message }
+            return nil
+        }
+        if let report = UsageReport.parse(payload: payload) {
             usage = report
         }
-        guard let delta = Self.contentDelta(fromPayload: String(payload)) else {
+        guard let delta = Self.contentDelta(fromPayload: payload) else {
             return nil
         }
         text += delta
         return text
+    }
+
+    /// Joins buffered `data:` lines into a payload once they form a
+    /// complete JSON object — nil while the event is still split.
+    /// Lines are joined with "\n" first (the SSE rule, right for
+    /// payloads split between tokens); if that doesn't parse, the
+    /// raw concatenation is tried (right for payloads split in the
+    /// middle of a token or string).
+    private static func completedPayload(from lines: [String]) -> String? {
+        for candidate in [lines.joined(separator: "\n"),
+                          lines.joined(separator: "")] {
+            guard let data = candidate.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data),
+                  object is [String: Any] else { continue }
+            return candidate
+        }
+        return nil
+    }
+
+    /// Extracts a human-readable message from a payload carrying a
+    /// top-level `error` — an object with a `message`, or a bare
+    /// string. Nil when the payload carries no error.
+    static func errorMessage(fromPayload payload: String) -> String? {
+        guard let data = payload.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let dictionary = object as? [String: Any],
+              let error = dictionary["error"] else {
+            return nil
+        }
+        if let message = error as? String, !message.isEmpty {
+            return message
+        }
+        if let errorObject = error as? [String: Any],
+           let message = errorObject["message"] as? String,
+           !message.isEmpty {
+            return message
+        }
+        return "The server reported an error without details."
     }
 
     /// Extracts `choices[0].delta.content` from one data payload.
@@ -226,6 +353,10 @@ struct SSEAccumulator: Equatable, Sendable {
     /// a finish-reason chunk, usage stats, or unparseable JSON). An
     /// explicitly empty string is a real (if boring) piece and is
     /// returned as "".
+    ///
+    /// The content may also arrive as an ARRAY of parts
+    /// (`[{"type":"text","text":"…"}, …]`, the shape some newer
+    /// servers emit): the parts' text is concatenated (audit B-13).
     static func contentDelta(fromPayload payload: String) -> String? {
         guard let data = payload.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data),
@@ -235,6 +366,13 @@ struct SSEAccumulator: Equatable, Sendable {
               let delta = first["delta"] as? [String: Any] else {
             return nil
         }
-        return delta["content"] as? String
+        if let string = delta["content"] as? String {
+            return string
+        }
+        if let parts = delta["content"] as? [[String: Any]] {
+            return parts.compactMap { $0["text"] as? String }
+                .joined(separator: "")
+        }
+        return nil
     }
 }

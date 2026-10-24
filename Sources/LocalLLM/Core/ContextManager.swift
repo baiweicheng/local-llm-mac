@@ -118,6 +118,19 @@ enum ContextManager {
                 used += cost
                 kept += 1
             }
+            // Audit B-15: the cap is a token budget, but the plan's
+            // contract is whole exchanges. Round the cut DOWN to the
+            // preceding user-turn boundary, so `recentTurns` still
+            // starts at a user turn instead of mid-exchange. (A cut
+            // that would summarize nothing at all keeps the plain
+            // token cut — a summary pass still has to happen.)
+            if kept > 0, kept < liveTurns.count {
+                var rounded = kept
+                while rounded > 0, liveTurns[rounded].role != .user {
+                    rounded -= 1
+                }
+                if rounded > 0 { kept = rounded }
+            }
             toSummarize = Array(toSummarize.prefix(kept))
         }
 

@@ -55,8 +55,15 @@ enum CommandDanger: Sendable, Equatable {
 /// whose blast radius is obviously out of proportion to a chat
 /// request, and make those take one extra deliberate click. The
 /// rules are a documented list, evaluated per command segment
-/// (segments are split on pipes, `;`, `&&`, `||`, and newlines, so
-/// `ls && sudo rm x` is judged on both halves).
+/// (segments are split on pipes, `;`, `&&`, `||`, single `&`, and
+/// newlines, so `ls && sudo rm x` is judged on both halves). Within
+/// a segment the rules judge the command in COMMAND position:
+/// quoting is stripped the way the shell strips it, leading
+/// environment assignments and wrappers (`env`, `xargs`, `find
+/// -exec`, a shell's `-c` string) are unwrapped, and command
+/// substitutions are judged as commands of their own — while a
+/// destructive verb in a mere argument (`grep "rm -rf"`) is just
+/// text and stays clear.
 enum DangerousCommandClassifier {
 
     /// Path prefixes where a recursive chmod/chown can break the
@@ -68,36 +75,142 @@ enum DangerousCommandClassifier {
         "/applications", "/private",
     ]
 
-    /// The one entry point: the per-segment rules first, then the
-    /// pipe-to-shell shape (which needs the whole pipeline).
+    /// The one entry point: command substitutions first (their
+    /// contents run wherever they sit), then the per-segment rules,
+    /// then the pipe-to-shell shape (which needs the whole pipeline).
     static func assess(_ command: String) -> CommandDanger {
+        assess(command, depth: 0)
+    }
+
+    private static func assess(_ command: String, depth: Int) -> CommandDanger {
         let lowered = command.lowercased()
+        if depth < 4 {
+            for inner in substitutionContents(of: lowered) {
+                let verdict = assess(inner, depth: depth + 1)
+                if verdict.isFlagged { return verdict }
+            }
+        }
         for segment in segments(of: lowered) {
-            if let danger = assessSegment(segment) {
+            if let danger = assessSegment(segment, depth: depth) {
                 return danger
             }
         }
         return assessPipeline(lowered)
     }
 
-    /// Splits a command line into its simple-command segments.
+    /// The contents of every `$( )` command substitution and every
+    /// backtick span in the command — the substrings the shell will
+    /// run as commands of their own, wherever they appear (audit
+    /// B-07). Single-quoted spans don't count (the shell doesn't
+    /// substitute inside them); nesting is tracked so `$(a $(b))`
+    /// yields the whole outer span, whose own contents are judged
+    /// when it is assessed in turn.
+    static func substitutionContents(of command: String) -> [String] {
+        var result: [String] = []
+        let chars = Array(command)
+        var index = 0
+        var inSingle = false
+        var inDouble = false
+        var escaped = false
+        while index < chars.count {
+            let char = chars[index]
+            if escaped { escaped = false; index += 1; continue }
+            if char == "\\", !inSingle { escaped = true; index += 1; continue }
+            if char == "'", !inDouble { inSingle.toggle(); index += 1; continue }
+            if char == "\"", !inSingle { inDouble.toggle(); index += 1; continue }
+            if inSingle { index += 1; continue }
+            if char == "`" {
+                var inner = ""
+                var scan = index + 1
+                while scan < chars.count, chars[scan] != "`" {
+                    inner.append(chars[scan])
+                    scan += 1
+                }
+                if scan < chars.count {
+                    result.append(inner)
+                    index = scan + 1
+                    continue
+                }
+                index += 1
+                continue
+            }
+            if char == "$", index + 1 < chars.count, chars[index + 1] == "(" {
+                var inner = ""
+                var nesting = 1
+                var scan = index + 2
+                var innerSingle = false
+                var innerDouble = false
+                var innerEscaped = false
+                while scan < chars.count, nesting > 0 {
+                    let innerChar = chars[scan]
+                    if innerEscaped {
+                        inner.append(innerChar)
+                        innerEscaped = false
+                    } else if innerChar == "\\", !innerSingle {
+                        inner.append(innerChar)
+                        innerEscaped = true
+                    } else if innerChar == "'", !innerDouble {
+                        inner.append(innerChar)
+                        innerSingle.toggle()
+                    } else if innerChar == "\"", !innerSingle {
+                        inner.append(innerChar)
+                        innerDouble.toggle()
+                    } else if !innerSingle, !innerDouble, innerChar == "(" {
+                        nesting += 1
+                        inner.append(innerChar)
+                    } else if !innerSingle, !innerDouble, innerChar == ")" {
+                        nesting -= 1
+                        if nesting > 0 { inner.append(innerChar) }
+                    } else {
+                        inner.append(innerChar)
+                    }
+                    scan += 1
+                }
+                result.append(inner)
+                index = scan
+                continue
+            }
+            index += 1
+        }
+        return result
+    }
+
+    /// Splits a command line into its simple-command segments:
+    /// on pipes, `;`, `&&`, `||`, single `&` (background — it
+    /// separates commands just the same, audit B-07), and newlines.
+    /// Separators inside quotes don't split — the shell doesn't
+    /// treat them as separators either.
     static func segments(of command: String) -> [String] {
         var result: [String] = []
         var current = ""
         let chars = Array(command)
         var index = 0
+        var inSingle = false
+        var inDouble = false
+        var escaped = false
         while index < chars.count {
             let char = chars[index]
             let next: Character? = index + 1 < chars.count ? chars[index + 1] : nil
-            if char == "|" || char == ";" || char == "\n" {
-                // `||` is one separator, not two.
-                if char == "|", next == "|" { index += 1 }
+            if escaped {
+                current.append(char)
+                escaped = false
+            } else if char == "\\", !inSingle {
+                current.append(char)
+                escaped = true
+            } else if char == "'", !inDouble {
+                current.append(char)
+                inSingle.toggle()
+            } else if char == "\"", !inSingle {
+                current.append(char)
+                inDouble.toggle()
+            } else if !inSingle, !inDouble,
+                      char == "|" || char == ";" || char == "\n" || char == "&" {
+                // `||` and `&&` are one separator each, not two.
+                if (char == "|" && next == "|") || (char == "&" && next == "&") {
+                    index += 1
+                }
                 result.append(current)
                 current = ""
-            } else if char == "&", next == "&" {
-                result.append(current)
-                current = ""
-                index += 1
             } else {
                 current.append(char)
             }
@@ -109,16 +222,193 @@ enum DangerousCommandClassifier {
             .filter { !$0.isEmpty }
     }
 
-    private static func assessSegment(_ segment: String) -> CommandDanger? {
-        let words = segment
-            .split(whereSeparator: { $0 == " " || $0 == "\t" })
-            .map(String.init)
-        guard let head = words.first else { return nil }
-        // A leading `sudo` (or `sudo -u x`) runs whatever follows
-        // as root — flag the segment on that alone.
-        if head == "sudo" {
-            return .flagged(reason: "it runs as root (sudo), so it can change anything on this Mac")
+    /// A segment's words with the shell's quoting removed: `'rm'`,
+    /// `"rm"`, and `r\m` are all the word `rm` to the shell, so they
+    /// are here too (audit B-07). A quoted span stays ONE word even
+    /// when it contains spaces — `grep "rm -rf"` has the words
+    /// `grep`, `-rn`, `rm -rf`, `.`, and that argument is not a
+    /// command.
+    static func words(of segment: String) -> [String] {
+        var result: [String] = []
+        var current = ""
+        var hasCurrent = false
+        var inSingle = false
+        var inDouble = false
+        var escaped = false
+        for char in segment {
+            if escaped {
+                current.append(char)
+                escaped = false
+                hasCurrent = true
+            } else if char == "\\", !inSingle {
+                escaped = true
+                hasCurrent = true
+            } else if char == "'", !inDouble {
+                inSingle.toggle()
+                hasCurrent = true
+            } else if char == "\"", !inSingle {
+                inDouble.toggle()
+                hasCurrent = true
+            } else if (char == " " || char == "\t"), !inSingle, !inDouble {
+                if hasCurrent {
+                    result.append(current)
+                    current = ""
+                    hasCurrent = false
+                }
+            } else {
+                current.append(char)
+                hasCurrent = true
+            }
         }
+        if hasCurrent { result.append(current) }
+        return result
+    }
+
+    private static func assessSegment(_ segment: String,
+                                      depth: Int) -> CommandDanger? {
+        if let danger = assessWords(words(of: segment), depth: depth) {
+            return danger
+        }
+        // Writing straight to a block device: `of=/dev/…` anywhere
+        // in the segment, or a redirect to /dev/disk*, /dev/rdisk*,
+        // etc. (`> /dev/null` is the everyday discard and stays
+        // clear.) The redirect check is whitespace- and quote-
+        // tolerant (audit B-07): `>  /dev/disk2`, a tab separator,
+        // and `> "/dev/disk2"` all count.
+        if segment.contains("of=/dev/") {
+            return .flagged(reason: "it writes directly to a device under /dev")
+        }
+        if redirectsToDevice(segment) {
+            return .flagged(reason: "it writes directly to a disk device")
+        }
+        return nil
+    }
+
+    private static let deviceRedirectRegex = try? NSRegularExpression(
+        pattern: #">>?\s*["']?/dev/(?:disk|rdisk|sd|hd|nvme)"#)
+
+    private static func redirectsToDevice(_ segment: String) -> Bool {
+        guard let regex = deviceRedirectRegex else { return false }
+        let range = NSRange(segment.startIndex..., in: segment)
+        return regex.firstMatch(in: segment, range: range) != nil
+    }
+
+    /// `NAME=value` — an environment assignment, which may precede
+    /// a command (or follow `env`) without BEING the command.
+    private static func isAssignment(_ word: String) -> Bool {
+        guard let equals = word.firstIndex(of: "=") else { return false }
+        let name = word[word.startIndex..<equals]
+        guard let first = name.first,
+              first.isLetter || first == "_" else { return false }
+        return name.allSatisfy { $0.isLetter || $0.isNumber || $0 == "_" }
+    }
+
+    /// Judges the words of one segment, starting from the COMMAND
+    /// position — which is not always the first word (audit B-07).
+    /// Leading environment assignments are skipped; wrapper
+    /// commands that run another command (`env`, `xargs`, `find
+    /// -exec`, a shell's `-c` string, `eval`) are unwrapped and the
+    /// command they would run is judged instead. Words in mere
+    /// argument positions are never judged — `grep "rm -rf"` is a
+    /// search for the text, not a deletion.
+    private static func assessWords(_ words: [String],
+                                    depth: Int) -> CommandDanger? {
+        var index = 0
+        while index < words.count, isAssignment(words[index]) { index += 1 }
+        while index < words.count {
+            let base = (words[index] as NSString).lastPathComponent
+            switch base {
+            case "sudo", "doas":
+                // Running as root — flag on that alone, wherever
+                // the sudo sits in the command position chain.
+                return .flagged(reason: "it runs as root (sudo), so it can change anything on this Mac")
+            case "env":
+                index += 1
+                // env's options (some take a value), then any
+                // assignments it sets, precede the real command.
+                while index < words.count {
+                    let word = words[index]
+                    if word == "-u" || word == "--unset" {
+                        index += 2
+                    } else if word.hasPrefix("-") || isAssignment(word) {
+                        index += 1
+                    } else {
+                        break
+                    }
+                }
+            case "command", "builtin", "exec", "nice", "nohup", "time", "stdbuf":
+                index += 1
+                while index < words.count, words[index].hasPrefix("-") {
+                    let flag = words[index]
+                    index += 1
+                    // nice's -n and stdbuf's -i/-o/-e take a value.
+                    if flag == "-n" || flag == "-i" || flag == "-o"
+                        || flag == "-e" {
+                        index += 1
+                    }
+                }
+            case "xargs":
+                index += 1
+                while index < words.count, words[index].hasPrefix("-") {
+                    let flag = words[index]
+                    index += 1
+                    // These xargs options take a value of their own.
+                    if ["-I", "-J", "-L", "-n", "-P", "-s"].contains(flag) {
+                        index += 1
+                    }
+                }
+                // A lone placeholder before the command is xargs'
+                // substitution marker, not a command name.
+                if index < words.count, words[index] == "{}" { index += 1 }
+            case "find":
+                // find itself only looks — until -exec hands it a
+                // command, which is judged like any other.
+                var scan = index + 1
+                while scan < words.count {
+                    if words[scan] == "-exec" || words[scan] == "-execdir",
+                       scan + 1 < words.count {
+                        return assessWords(Array(words[(scan + 1)...]),
+                                           depth: depth)
+                    }
+                    scan += 1
+                }
+                return nil
+            case "sh", "bash", "zsh", "dash", "ksh":
+                // A shell with -c runs the NEXT word as a command
+                // string; judge that string. A shell running a
+                // script FILE is not judged — its contents aren't
+                // in the approved text.
+                var scan = index + 1
+                while scan < words.count, words[scan].hasPrefix("-") {
+                    if words[scan].contains("c"), scan + 1 < words.count {
+                        guard depth < 4 else { return nil }
+                        let verdict = assess(words[scan + 1],
+                                             depth: depth + 1)
+                        return verdict.isFlagged ? verdict : nil
+                    }
+                    scan += 1
+                }
+                return nil
+            case "eval":
+                // eval runs its arguments, joined, as a command.
+                guard depth < 4, index + 1 < words.count else { return nil }
+                let inner = words[(index + 1)...].joined(separator: " ")
+                let verdict = assess(inner, depth: depth + 1)
+                return verdict.isFlagged ? verdict : nil
+            default:
+                return judgeCommand(head: base,
+                                    words: Array(words[index...]))
+            }
+        }
+        return nil
+    }
+
+    /// The destructive-verb rules, applied to a command in command
+    /// position: `head` is the command name (any directory prefix
+    /// already stripped) and `words` are the command and its
+    /// arguments.
+    private static func judgeCommand(head: String,
+                                     words: [String]) -> CommandDanger? {
         switch head {
         case "rm":
             let flags = words.dropFirst().filter { $0.hasPrefix("-") }
@@ -153,8 +443,14 @@ enum DangerousCommandClassifier {
             }
         case "chmod", "chown":
             // The recursive flag is spelled -R, but the command was
-            // lowercased before judging, so it arrives as -r.
-            let recursive = words.contains("-r") || words.contains("--recursive")
+            // lowercased before judging, so it arrives as -r — and
+            // it may be bundled with other flags (-RH, -Rv, -Rf), so
+            // detect it the way the rm case does (audit B-12).
+            let recursive = words.dropFirst().contains { word in
+                word == "--recursive"
+                    || (word.hasPrefix("-") && !word.hasPrefix("--")
+                        && word.contains("r"))
+            }
             if recursive {
                 let targetsSystem = words.dropFirst().contains { word in
                     systemPathPrefixes.contains { word == $0 || word.hasPrefix($0 + "/") }
@@ -181,22 +477,6 @@ enum DangerousCommandClassifier {
         // formats a disk.
         if head.hasPrefix("mkfs") {
             return .flagged(reason: "it formats a disk")
-        }
-        // Writing straight to a block device: `of=/dev/…` on any
-        // segment, or a redirect to /dev/disk*, /dev/rdisk*, etc.
-        // (`> /dev/null` is the everyday discard and stays clear.)
-        if segment.contains("of=/dev/") {
-            return .flagged(reason: "it writes directly to a device under /dev")
-        }
-        if let range = segment.range(of: "> /dev/") ?? segment.range(of: ">/dev/") {
-            let target = segment[range.upperBound...]
-                .split(whereSeparator: { $0 == " " || $0 == "\t" }).first
-                .map(String.init) ?? ""
-            if target.hasPrefix("disk") || target.hasPrefix("rdisk")
-                || target.hasPrefix("sd") || target.hasPrefix("hd")
-                || target.hasPrefix("nvme") {
-                return .flagged(reason: "it writes directly to a disk device")
-            }
         }
         return nil
     }
@@ -226,14 +506,13 @@ enum DangerousCommandClassifier {
         segments.append(current)
         guard segments.count > 1 else { return .clear }
         for segment in segments.dropFirst() {
-            let words = segment
-                .trimmingCharacters(in: .whitespaces)
-                .split(whereSeparator: { $0 == " " || $0 == "\t" })
-                .map(String.init)
+            let words = words(of: segment.trimmingCharacters(in: .whitespaces))
             var head = words.first ?? ""
-            if head == "sudo", words.count > 1 { head = words[1] }
-            if head == "sh" || head == "bash" || head == "zsh"
-                || head == "/bin/sh" || head == "/bin/bash" || head == "/bin/zsh" {
+            if head == "sudo" || head == "doas", words.count > 1 {
+                head = words[1]
+            }
+            let base = (head as NSString).lastPathComponent
+            if base == "sh" || base == "bash" || base == "zsh" {
                 return .flagged(reason: "it pipes into a shell, so whatever comes down the pipe runs as a script, sight unseen")
             }
         }
@@ -275,6 +554,19 @@ enum ShellOutput {
                                cap: Int = retainedCharacterCap) -> String {
         guard output.count > cap else { return output }
         return String(output.prefix(cap))
+    }
+
+    /// Keeps the TAIL of an ever-growing capture bounded while a
+    /// command runs (audit B-49): once past the cap, the BEGINNING
+    /// is dropped and the newest output — where failures and final
+    /// results live, the same reason `forModel` shows the tail —
+    /// is what survives. `ShellCommandService` retains with this;
+    /// `retainedPrefix` above remains for callers that explicitly
+    /// want the head.
+    static func retainedTail(_ output: String,
+                             cap: Int = retainedCharacterCap) -> String {
+        guard output.count > cap else { return output }
+        return String(output.suffix(cap))
     }
 }
 

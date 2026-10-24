@@ -151,6 +151,23 @@ final class CloudTests: XCTestCase {
         XCTAssertTrue(accumulator.isDone)
     }
 
+    func testSSEAccumulatorCapturesStreamErrors() {
+        // Audit B-08, on the OpenRouter route: an in-stream error
+        // payload sets the error state the session throws on,
+        // instead of passing off a truncated reply as finished.
+        var accumulator = SSEAccumulator()
+        XCTAssertEqual(accumulator.consume(
+            line: #"data: {"choices":[{"delta":{"content":"Part"}}]}"#),
+            "Part")
+        XCTAssertNil(accumulator.consume(
+            line: #"data: {"error":{"message":"This model is unavailable right now","code":404}}"#))
+        XCTAssertEqual(accumulator.errorMessage,
+                       "This model is unavailable right now")
+        XCTAssertEqual(accumulator.text, "Part")
+        XCTAssertNil(SSEAccumulator.errorMessage(
+            fromPayload: #"{"choices":[{"delta":{"content":"x"}}]}"#))
+    }
+
     // MARK: - Request building
 
     func testRequestBuilderAddsUsageAccountingOnlyWhenAsked() throws {

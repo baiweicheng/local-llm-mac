@@ -58,13 +58,26 @@ final class EndpointChatSession: ChatSession {
                     continuation.finish()
                     return
                 }
+                // Audit B-46: the text yielded so far, tracked here
+                // in the consuming loop. On success only a completed
+                // exchange joins the history (a user turn is never
+                // appended alone — no dangling turn). But when the
+                // stream ends early — the user pressed Stop (the
+                // stream's termination cancels this task), or a
+                // mid-stream error — the ENGINE keeps whatever
+                // partial reply arrived as a stored message, so the
+                // session appends the same partial exchange before
+                // finishing; otherwise the live session's history
+                // silently diverged from the transcript the user
+                // sees, for the rest of the session's life.
+                var latestText = ""
                 do {
                     let reply = try await self.performSend(
                         promptText: promptText,
-                        onText: { continuation.yield($0) })
-                    // Only a completed exchange joins the history, so
-                    // a failed or stopped send doesn't leave a dangling
-                    // user message the next send would trip over.
+                        onText: { text in
+                            latestText = text
+                            continuation.yield(text)
+                        })
                     if !reply.isEmpty {
                         self.history.append(ChatMessagePayload(
                             role: "user", content: promptText))
@@ -73,6 +86,12 @@ final class EndpointChatSession: ChatSession {
                     }
                     continuation.finish()
                 } catch {
+                    if !latestText.isEmpty {
+                        self.history.append(ChatMessagePayload(
+                            role: "user", content: promptText))
+                        self.history.append(ChatMessagePayload(
+                            role: "assistant", content: latestText))
+                    }
                     continuation.finish(throwing: error)
                 }
             }
@@ -119,7 +138,20 @@ final class EndpointChatSession: ChatSession {
             if let text = accumulator.consume(line: line) {
                 onText(text)
             }
+            // Audit B-08: an error reported inside the stream is a
+            // failed send, not a finished (or empty) reply.
+            if let message = accumulator.errorMessage {
+                throw BackendError.endpointStreamError(
+                    name: config.name, message: message)
+            }
             if accumulator.isDone { break }
+        }
+        if let final = accumulator.flush() {
+            onText(final)
+        }
+        if let message = accumulator.errorMessage {
+            throw BackendError.endpointStreamError(
+                name: config.name, message: message)
         }
         return accumulator.text
     }

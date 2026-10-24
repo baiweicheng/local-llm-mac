@@ -200,6 +200,11 @@ final class LocalLLMTests: XCTestCase {
         // 10,000 tokens of history: one pass may only fold the oldest
         // chunk that itself fits the window (~3,364 tokens here); the
         // rest stays verbatim until the next pass.
+        // Audit B-15: the raw token cut lands after 13 turns, which
+        // would leave the kept turns starting mid-exchange (at an
+        // assistant turn). The cut is rounded down to the preceding
+        // user-turn boundary — 12 turns summarized, 28 kept, and the
+        // kept history still opens with a user turn.
         let turns = pairs(20, turnTokens: 250)
         let plan = ContextManager.plan(budget: .onDevice,
                                        instructions: "Be brief.",
@@ -207,8 +212,9 @@ final class LocalLLMTests: XCTestCase {
                                        liveTurns: turns,
                                        newPrompt: turn(.user, tokens: 100))
         XCTAssertTrue(plan.needsCompaction)
-        XCTAssertEqual(plan.turnsToSummarize.count, 13)
-        XCTAssertEqual(plan.recentTurns.count, 27)
+        XCTAssertEqual(plan.turnsToSummarize.count, 12)
+        XCTAssertEqual(plan.recentTurns.count, 28)
+        XCTAssertEqual(plan.recentTurns.first?.role, .user)
         XCTAssertTrue(plan.overflowWarning) // until later passes run
     }
 
@@ -618,6 +624,60 @@ final class LocalLLMTests: XCTestCase {
         XCTAssertTrue(accumulator.isDone)
     }
 
+    func testSSEAccumulatorSurfacesStreamErrors() {
+        // Audit B-08: an error object inside an HTTP 200 stream is
+        // state, not a keep-alive — the backends throw on it.
+        var accumulator = SSEAccumulator()
+        XCTAssertEqual(accumulator.consume(
+            line: #"data: {"choices":[{"delta":{"content":"Hel"}}]}"#),
+            "Hel")
+        XCTAssertNil(accumulator.consume(
+            line: #"data: {"error":{"message":"model overloaded","code":429}}"#))
+        XCTAssertEqual(accumulator.errorMessage, "model overloaded")
+        // The partial text is kept (the caller decides it's a
+        // failure; the accumulator just reports both facts).
+        XCTAssertEqual(accumulator.text, "Hel")
+
+        // The bare-string error form.
+        var other = SSEAccumulator()
+        XCTAssertNil(other.consume(line: #"data: {"error":"boom"}"#))
+        XCTAssertEqual(other.errorMessage, "boom")
+    }
+
+    func testSSEAccumulatorBuffersMultiLineEvents() {
+        // Audit B-13: one event split across two data: lines.
+        // Split between tokens (lines join with a newline)…
+        var betweenTokens = SSEAccumulator()
+        XCTAssertNil(betweenTokens.consume(
+            line: #"data: {"choices":[{"delta":"#))
+        XCTAssertEqual(betweenTokens.consume(
+            line: #"data: {"content":"Hi"}}]}"#), "Hi")
+        // …and split in the middle of a string (raw concatenation).
+        var midString = SSEAccumulator()
+        XCTAssertNil(midString.consume(
+            line: #"data: {"choices":[{"delta":{"content":"Hel"#))
+        XCTAssertEqual(midString.consume(
+            line: #"data: lo"}}]}"#), "Hello")
+        // A junk line doesn't poison the event after it.
+        var junk = SSEAccumulator()
+        XCTAssertNil(junk.consume(line: "data: {not json"))
+        XCTAssertEqual(junk.consume(
+            line: #"data: {"choices":[{"delta":{"content":"ok"}}]}"#),
+            "ok")
+    }
+
+    func testSSEAccumulatorAcceptsArrayContentParts() {
+        // Audit B-13: delta.content as an array of parts — the
+        // text parts concatenate.
+        var accumulator = SSEAccumulator()
+        XCTAssertEqual(accumulator.consume(
+            line: #"data: {"choices":[{"delta":{"content":[{"type":"text","text":"Hello "},{"type":"text","text":"world"}]}}]}"#),
+            "Hello world")
+        XCTAssertEqual(SSEAccumulator.contentDelta(
+            fromPayload: #"{"choices":[{"delta":{"content":[{"type":"text","text":"a"},{"type":"image"},{"type":"text","text":"b"}]}}]}"#),
+            "ab")
+    }
+
     func testSSEAccumulatorIgnoresJunk() {
         var accumulator = SSEAccumulator()
         XCTAssertNil(accumulator.consume(line: ""))
@@ -699,6 +759,29 @@ final class LocalLLMTests: XCTestCase {
         let bare = RoutingPolicy.decide(intent: .localHeavy, inputs: bareInputs())
         XCTAssertEqual(bare.selection, .onDevice)
         XCTAssertTrue(bare.reason.contains("no bigger local model"))
+    }
+
+    func testRoutingLocalHeavyNamesRemoteEndpointsHonestly() {
+        // Audit B-11: "still runs on this Mac" is only said when
+        // the server is on this Mac.
+        let remote = EndpointConfig(
+            id: UUID(), name: "Office Server",
+            baseURL: "http://192.168.1.20:11434/v1", modelName: "llama3.1")
+        var inputs = bareInputs()
+        inputs.endpoints = [remote]
+        let decision = RoutingPolicy.decide(intent: .localHeavy,
+                                            inputs: inputs)
+        XCTAssertEqual(decision.selection, .endpoint(id: remote.id))
+        XCTAssertFalse(decision.reason.contains("still runs on this Mac"))
+        XCTAssertTrue(decision.reason.contains("isn't on this Mac"))
+
+        var localInputs = bareInputs()
+        localInputs.endpoints = EndpointConfig.defaultConfigs
+        let local = RoutingPolicy.decide(intent: .localHeavy,
+                                         inputs: localInputs)
+        XCTAssertEqual(local.selection,
+                       .endpoint(id: EndpointConfig.ollamaPresetID))
+        XCTAssertTrue(local.reason.contains("still runs on this Mac"))
     }
 
     func testRoutingLocalOnlySkipsEndpoints() {
@@ -824,6 +907,93 @@ final class LocalLLMTests: XCTestCase {
         XCTAssertFalse(result.text.contains("hunter22"))
         XCTAssertFalse(result.text.contains("abcdef123456"))
         XCTAssertEqual(result.replacementCount, 2)
+    }
+
+    func testRedactorMasksSSNs() {
+        // Audit B-05: the 3-2-4 shape fits neither the card rule
+        // (13+ digits) nor the phone rule (3-3-4) — it has its own.
+        let result = Redactor.redact("My SSN is 123-45-6789, ok?")
+        XCTAssertEqual(result.replacementCount, 1)
+        XCTAssertFalse(result.text.contains("123-45-6789"))
+        XCTAssertTrue(result.text.contains(Redactor.mask))
+    }
+
+    func testRedactorMasksPhoneWithoutSpaceAfterParenthesis() {
+        // Audit B-17: "(404)555-0123" — no separator after the
+        // parenthesized area code.
+        let result = Redactor.redact("Call (404)555-0123 today")
+        XCTAssertEqual(result.replacementCount, 1)
+        XCTAssertFalse(result.text.contains("555-0123"))
+    }
+
+    func testRedactorMasksTheWholeLongCardRun() {
+        // Audit B-14: a run longer than 19 digits is hidden whole,
+        // not just its first 19 digits.
+        let digits = Redactor.redact(
+            "Reference 1234567890123456789012345 end")
+        XCTAssertEqual(digits.replacementCount, 1)
+        XCTAssertEqual(digits.text, "Reference \(Redactor.mask) end")
+
+        let dashed = Redactor.redact("Card 4111-1111-1111-1111-1111 ok")
+        XCTAssertEqual(dashed.replacementCount, 1)
+        XCTAssertFalse(dashed.text.contains("1111"))
+    }
+
+    func testRedactorMasksPrefixedAndQuotedLabeledSecrets() {
+        // Audit B-06, class 1: underscore-prefixed labels.
+        let client = Redactor.redact("client_secret = sup3rsecretvalue")
+        XCTAssertEqual(client.text, "client_secret = \(Redactor.mask)")
+        XCTAssertEqual(client.replacementCount, 1)
+
+        let refresh = Redactor.redact("refresh_token: tok_abcdefghij")
+        XCTAssertFalse(refresh.text.contains("tok_abcdefghij"))
+        XCTAssertEqual(refresh.replacementCount, 1)
+
+        let aws = Redactor.redact(
+            "aws_secret_access_key = wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY")
+        XCTAssertFalse(aws.text.contains("wJalrXUtnFEMIK7MDENG"))
+        XCTAssertEqual(aws.replacementCount, 1)
+
+        // Audit B-06, class 2: a JSON-quoted label — and a quoted
+        // value keeps its quotes around the mask.
+        let json = Redactor.redact("{\"password\": \"hunter22\"}")
+        XCTAssertEqual(json.text, "{\"password\": \"\(Redactor.mask)\"}")
+        XCTAssertEqual(json.replacementCount, 1)
+
+        // A quoted value masks at any length.
+        let shortQuoted = Redactor.redact("{\"pwd\": \"abc\"}")
+        XCTAssertEqual(shortQuoted.text, "{\"pwd\": \"\(Redactor.mask)\"}")
+        XCTAssertEqual(shortQuoted.replacementCount, 1)
+    }
+
+    func testRedactorMasksSpacedPassphrasesAndShortValues() {
+        // Audit B-06, class 3: a quoted passphrase hides whole,
+        // spaces and all…
+        let phrase = Redactor.redact(
+            "password: \"correct horse battery staple\"")
+        XCTAssertEqual(phrase.text, "password: \"\(Redactor.mask)\"")
+        XCTAssertFalse(phrase.text.contains("horse"))
+        XCTAssertEqual(phrase.replacementCount, 1)
+
+        // …and a short unquoted value (4+ characters) hides too.
+        let short = Redactor.redact("password: sun9")
+        XCTAssertEqual(short.text, "password: \(Redactor.mask)")
+        XCTAssertEqual(short.replacementCount, 1)
+    }
+
+    func testRedactorLabeledSecretGuards() {
+        // The other side of B-06: short example values and ordinary
+        // prose stay untouched.
+        let example = Redactor.redact("token: abc")
+        XCTAssertEqual(example.replacementCount, 0)
+        XCTAssertEqual(example.text, "token: abc")
+
+        // "secret" running on into a longer word is not a label.
+        let prose = Redactor.redact(
+            "The secretary: notes from the meeting about passwords")
+        XCTAssertEqual(prose.replacementCount, 0)
+        XCTAssertEqual(prose.text,
+                       "The secretary: notes from the meeting about passwords")
     }
 
     func testRedactorMasksEmailsPhonesAndCards() {

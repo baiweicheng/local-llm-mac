@@ -116,6 +116,68 @@ final class PowerToolsTests: XCTestCase {
         }
     }
 
+    // MARK: - Dangerous-command classifier: hidden positions (B-07/B-12)
+
+    func testClassifierFlagsDestructiveVerbsBehindWrappers() {
+        // Audit B-07: the flagship rm -rf rule used to judge only
+        // each segment's first word. Every construct below runs
+        // rm -rf (or a device redirect / recursive chmod) exactly
+        // as written — and must be flagged.
+        let flagged: [(String, String)] = [
+            ("FOO=bar rm -rf x", "force-deletes"),
+            ("ls & rm -rf x", "force-deletes"),
+            ("echo $(rm -rf x)", "force-deletes"),
+            ("echo `rm -rf x`", "force-deletes"),
+            ("'rm' -rf x", "force-deletes"),
+            ("\"rm\" -rf x", "force-deletes"),
+            ("r\\m -rf x", "force-deletes"),
+            ("bash -c \"rm -rf x\"", "force-deletes"),
+            ("sh -c 'rm -rf x'", "force-deletes"),
+            ("env rm -rf x", "force-deletes"),
+            ("env FOO=bar rm -rf x", "force-deletes"),
+            ("xargs rm -rf", "force-deletes"),
+            ("find . -exec rm -rf {} +", "force-deletes"),
+            ("cat img >  /dev/disk2", "disk device"),
+            ("cat img >\t/dev/disk2", "disk device"),
+            ("cat img > \"/dev/disk2\"", "disk device"),
+            // Audit B-12: bundled recursive flags, as rm accepts.
+            ("chmod -RH 777 /etc", "permissions on a system folder"),
+            ("chmod -Rv 755 /usr", "permissions on a system folder"),
+            ("chown -Rf root /Library", "permissions on a system folder"),
+        ]
+        for (command, reasonPart) in flagged {
+            let verdict = DangerousCommandClassifier.assess(command)
+            XCTAssertTrue(verdict.isFlagged, "should be flagged: \(command)")
+            XCTAssertTrue(verdict.reason?.contains(reasonPart) == true,
+                          "\(command) → reason should mention “\(reasonPart)”, got \(verdict.reason ?? "nil")")
+        }
+    }
+
+    func testClassifierLeavesWrappedEverydayCommandsClear() {
+        // The other side of B-07: unwrapping must not turn mere
+        // arguments or benign wrapped commands into flags.
+        let clear = [
+            "FOO=bar ls -la",
+            "env ls",
+            "env FOO=bar git status",
+            "echo $(ls)",
+            "echo `date`",
+            "find . -name '*.txt'",
+            "find . -type f -print",
+            "xargs ls",
+            "bash -c 'echo hi'",
+            "sh -c 'ls -la'",
+            "echo hello & ls",
+            "nice ls",
+            "grep -rn \"rm -rf\" .",
+            "echo \"rm -rf\" is just text",
+        ]
+        for command in clear {
+            XCTAssertEqual(DangerousCommandClassifier.assess(command), .clear,
+                           "should be clear: \(command)")
+        }
+    }
+
     func testClassifierSplitsSegments() {
         let segments = DangerousCommandClassifier.segments(
             of: "ls; pwd && whoami || id | wc -l\nuname")
@@ -407,6 +469,38 @@ final class PowerToolsTests: XCTestCase {
         XCTAssertEqual(parser.finish(),
                        [.response(id: 4, result: .number(1), error: nil)])
         XCTAssertEqual(parser.finish(), [])
+    }
+
+    func testStreamParserSurvivesAUTF8CharacterStraddlingChunks() {
+        // Audit B-01: the Data overload used to decode each chunk
+        // whole — a multi-byte character split across two reads
+        // invalidated (and dropped) the entire first chunk.
+        var parser = MCPStreamParser()
+        let line = "{\"id\":5,\"result\":\"café ☕\"}\n"
+        let data = Data(line.utf8)
+        // Split inside the first multi-byte character (é is two
+        // bytes), so neither chunk is valid UTF-8 on its own.
+        let split = data.firstIndex(where: { $0 >= 0x80 })! + 1
+        XCTAssertEqual(parser.feed(data.prefix(split)), [])
+        let messages = parser.feed(data.suffix(from: split))
+        XCTAssertEqual(messages, [.response(
+            id: 5, result: .string("café ☕"), error: nil)])
+    }
+
+    func testStreamParserRejectsHugeAndFractionalIDs() {
+        // Audit B-03: Int(1e30) would trap; 1.5 would silently
+        // truncate to 1 and risk matching the wrong request. Both
+        // lines are malformed — never a crash, never a match.
+        XCTAssertEqual(
+            MCPStreamParser.parseLine("{\"id\":1e30,\"result\":1}"),
+            .malformed(text: "{\"id\":1e30,\"result\":1}"))
+        XCTAssertEqual(
+            MCPStreamParser.parseLine("{\"id\":1.5,\"result\":1}"),
+            .malformed(text: "{\"id\":1.5,\"result\":1}"))
+        // A well-formed id still correlates as before.
+        XCTAssertEqual(
+            MCPStreamParser.parseLine("{\"id\":42,\"result\":1}"),
+            .response(id: 42, result: .number(1), error: nil))
     }
 
     // MARK: - Result decoding

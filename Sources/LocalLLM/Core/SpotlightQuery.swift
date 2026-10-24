@@ -8,15 +8,23 @@ import Foundation
 /// break out of its quoted literal and rewrite the search. The query
 /// itself matches a file when *every* keyword appears in its name or
 /// its text content.
+///
+/// The built string is used as an `NSPredicate` FORMAT string (see
+/// `SpotlightSearchService`), so escaping has to cover the format
+/// layer too: a raw `%` in a keyword ("100%", "50% off") is a format
+/// specifier there, not a literal percent (audit B-04).
 enum SpotlightQueryBuilder {
 
     static let maxKeywords = 5
     static let maxKeywordLength = 40
 
     /// Escape a raw keyword for a double-quoted Spotlight query
-    /// literal: backslashes first, then quotes.
+    /// literal that will be handed to `NSPredicate(format:)`: percent
+    /// signs first (doubled, so the format layer reads them as a
+    /// literal "%"), then backslashes, then quotes.
     static func escape(_ raw: String) -> String {
-        raw.replacingOccurrences(of: "\\", with: "\\\\")
+        raw.replacingOccurrences(of: "%", with: "%%")
+            .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
     }
 

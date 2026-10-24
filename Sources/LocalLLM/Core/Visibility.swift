@@ -273,7 +273,14 @@ struct ToolArguments: Sendable, Equatable {
         func int(_ field: ToolArgumentField) -> Int? {
             switch values[field.rawValue] {
             case .int(let value): return value
-            case .double(let value): return Int(value)
+            case .double(let value):
+                // Audit B-02: `Int(Double)` traps on out-of-range,
+                // NaN, and infinite values — all things a model can
+                // emit ("limit": 1e30). Out-of-range means "no usable
+                // value": nil, so the clamped accessors apply their
+                // defaults instead of the app crashing.
+                guard value.isFinite, abs(value) < 9.0e18 else { return nil }
+                return Int(value)
             case .string(let value): return Int(value.trimmingCharacters(in: .whitespaces))
             case .bool, nil: return nil
             }

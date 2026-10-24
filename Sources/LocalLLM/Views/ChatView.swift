@@ -29,6 +29,9 @@ struct ChatView: View {
     /// the Settings sheet's Power tools section.
     let mcpServerStore: MCPServerStore
     let mcpManager: MCPServerManager
+    /// Audit B-58: the quick-panel coordinator, passed through to
+    /// the Settings sheet so its hotkey-failure state can show.
+    let hudCoordinator: HUDCoordinator
     @Environment(\.modelContext) private var modelContext
 
     /// Phase 5: this conversation's tool-lookup records, oldest
@@ -48,7 +51,8 @@ struct ChatView: View {
          openRouterKeyStore: OpenRouterKeyStore,
          backendResolver: @escaping (ModelSelection) -> ResolvedBackend,
          onCompareContinue: @escaping (Conversation) -> Void,
-         mcpServerStore: MCPServerStore, mcpManager: MCPServerManager) {
+         mcpServerStore: MCPServerStore, mcpManager: MCPServerManager,
+         hudCoordinator: HUDCoordinator) {
         self.conversation = conversation
         self.engine = engine
         self.mlxStore = mlxStore
@@ -61,6 +65,7 @@ struct ChatView: View {
         self.onCompareContinue = onCompareContinue
         self.mcpServerStore = mcpServerStore
         self.mcpManager = mcpManager
+        self.hudCoordinator = hudCoordinator
         let id = conversation.id
         _toolRecords = Query(
             filter: #Predicate<ToolActivityRecord> { $0.conversationID == id },
@@ -151,7 +156,8 @@ struct ChatView: View {
                          openRouterKeyStore: openRouterKeyStore,
                          mcpServerStore: mcpServerStore,
                          mcpManager: mcpManager,
-                         mlxStore: mlxStore, endpointStore: endpointStore)
+                         mlxStore: mlxStore, endpointStore: endpointStore,
+                         hudCoordinator: hudCoordinator)
         }
         .sheet(isPresented: $showingCompare) {
             CompareView(descriptors: descriptors,

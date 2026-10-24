@@ -192,13 +192,32 @@ final class MCPServerConnection: @unchecked Sendable {
     // MARK: Shutdown
 
     /// Stops the process and fails anything still waiting on it.
+    ///
+    /// Audit B-48: this mirrors the shell runner's escalation —
+    /// close stdin (a well-behaved stdio server exits on that
+    /// alone), SIGTERM, then SIGKILL after a ~1-second grace if the
+    /// process is still running. The old code sent one SIGTERM and
+    /// ran the bookkeeping immediately: a server that ignores
+    /// SIGTERM survived as an orphan while Settings reported it
+    /// stopped. The bookkeeping (`handleExit`) still runs right
+    /// away — pending requests fail promptly — and it stays
+    /// idempotent for the real exit that follows (the termination
+    /// handler calls it again and the `isDead` guard no-ops).
     func terminate() {
         lock.lock()
         let wasDead = isDead
         lock.unlock()
         guard !wasDead else { return }
+        try? stdinHandle.close()
         if process.isRunning {
             process.terminate()
+            let process = self.process
+            DispatchQueue.global(qos: .utility).asyncAfter(
+                deadline: .now() + 1.0) {
+                    if process.isRunning {
+                        kill(process.processIdentifier, SIGKILL)
+                    }
+                }
         }
         handleExit()
     }
@@ -234,9 +253,7 @@ final class MCPServerConnection: @unchecked Sendable {
                 self?.expireRequest(id: id,
                                     error: MCPClientError.timeout(what: timeoutWhat))
             }
-            do {
-                try stdinHandle.write(contentsOf: Data(line.utf8))
-            } catch {
+            if !writeToStdin(Data(line.utf8)) {
                 expireRequest(id: id, error: MCPClientError.serverStopped)
             }
         }
@@ -245,7 +262,27 @@ final class MCPServerConnection: @unchecked Sendable {
 
     private func sendNotification(method: String) {
         let line = MCPJSONRPC.encodeNotification(method: method) + "\n"
-        try? stdinHandle.write(contentsOf: Data(line.utf8))
+        _ = writeToStdin(Data(line.utf8))
+    }
+
+    /// Audit B-55: EVERY write to the server's stdin goes through
+    /// here, serialized under the class lock. Writes used to happen
+    /// from three threads at once — `sendRequest`'s continuation
+    /// executor, `sendNotification`'s caller, and the pipe-callback
+    /// context answering server requests in `receive` — and two
+    /// concurrent writes could interleave, corrupting both JSON
+    /// lines (the symptom was a spurious 30-second timeout). The
+    /// lock is never held across this call by any caller, so taking
+    /// it here cannot deadlock.
+    private func writeToStdin(_ data: Data) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        do {
+            try stdinHandle.write(contentsOf: data)
+            return true
+        } catch {
+            return false
+        }
     }
 
     private func expireRequest(id: Int, error: Error) {
@@ -283,7 +320,7 @@ final class MCPServerConnection: @unchecked Sendable {
                         "message": .string("This app doesn't answer server requests."),
                     ]),
                 ]).canonicalText() + "\n"
-                try? stdinHandle.write(contentsOf: Data(reply.utf8))
+                _ = writeToStdin(Data(reply.utf8))
             case .notification, .malformed:
                 // Log/progress notes and stray prints are noted and
                 // ignored — never fatal.
@@ -370,6 +407,19 @@ final class MCPServerManager {
     /// clears) so reconciliation can tell "same broken config, don't
     /// retry" from "the user edited it — the new form deserves a try."
     private var failedConfigs: [UUID: MCPServerConfig] = [:]
+    /// Audit B-40: one in-flight launch per server, joined by every
+    /// concurrent caller. `availableTools()` suspends for the whole
+    /// handshake, and two conversations sending at once used to
+    /// interleave here — a second launch could overwrite
+    /// `connections[config.id]`, and the exit-wiring identity guard
+    /// then kept the overwritten process from EVER being cleaned
+    /// up (orphaned for the app's life). Now only the launch task
+    /// itself mutates `connections`/`statuses`/`launchedConfigs`/
+    /// `failedConfigs` for its config; concurrent callers await the
+    /// same task and read its result. The token identifies the
+    /// entry so the task clears only its OWN slot on completion.
+    private var launchTasks: [UUID: Task<[MCPToolInfo], Never>] = [:]
+    private var launchTokens: [UUID: UUID] = [:]
 
     /// The saved servers, read fresh at each reconciliation —
     /// wired by ContentView to the store it owns.
@@ -423,32 +473,82 @@ final class MCPServerManager {
                 continue
             }
             if statuses[config.id]?.isFailed == true { continue }
-            statuses[config.id] = .starting
-            do {
-                let connection = try MCPServerConnection.launch(
-                    config: config, slug: slugs[config.id] ?? config.slug)
-                connections[config.id] = connection
-                launchedConfigs[config.id] = config
-                failedConfigs[config.id] = nil
-                wireExit(connection)
-                let remote = try await connection.start()
-                statuses[config.id] = .ready(toolCount: remote.count)
-                tools += toolInfos(for: config,
-                                   slug: connection.slug, remote: remote)
-            } catch {
-                let stderr = connections[config.id]?.stderrSummary ?? ""
-                connections[config.id]?.terminate()
-                connections[config.id] = nil
-                launchedConfigs[config.id] = nil
-                failedConfigs[config.id] = config
-                let detail = (error as? MCPClientError)?.errorDescription
-                    ?? error.localizedDescription
-                statuses[config.id] = .failed(
-                    message: stderr.isEmpty ? detail : detail + " " + stderr)
+            // Audit B-40: join the in-flight launch if there is
+            // one; otherwise become it. Either way this caller only
+            // READS the outcome — the launch task is the sole writer
+            // of the per-server state (see `performLaunch`).
+            if let inFlight = launchTasks[config.id] {
+                tools += await inFlight.value
+                continue
             }
+            let slug = slugs[config.id] ?? config.slug
+            let token = UUID()
+            let task = Task { [weak self] () -> [MCPToolInfo] in
+                guard let self else { return [] }
+                let found = await self.performLaunch(config: config,
+                                                     slug: slug)
+                // Clear only our own slot: a newer launch for this
+                // server (after a reset/edit) owns a different token.
+                if self.launchTokens[config.id] == token {
+                    self.launchTasks[config.id] = nil
+                    self.launchTokens[config.id] = nil
+                }
+                return found
+            }
+            launchTasks[config.id] = task
+            launchTokens[config.id] = token
+            tools += await task.value
         }
         discoveredTools = tools
         return tools
+    }
+
+    /// Audit B-40: the ONE launch path for a server — process
+    /// start, handshake, and every state write for that config
+    /// happen here, inside the in-flight task `availableTools`
+    /// stores and concurrent callers join. Never throws: a failed
+    /// launch contributes no tools and latches its failed status,
+    /// exactly as before.
+    private func performLaunch(config: MCPServerConfig,
+                               slug: String) async -> [MCPToolInfo] {
+        statuses[config.id] = .starting
+        do {
+            let connection = try MCPServerConnection.launch(
+                config: config, slug: slug)
+            connections[config.id] = connection
+            launchedConfigs[config.id] = config
+            failedConfigs[config.id] = nil
+            wireExit(connection)
+            let remote = try await connection.start()
+            // A stop/reset landed while the handshake was in
+            // flight: don't resurrect a server the user just
+            // stopped — shut the fresh process back down.
+            if Task.isCancelled {
+                connection.terminate()
+                if connections[config.id] === connection {
+                    connections[config.id] = nil
+                    launchedConfigs[config.id] = nil
+                }
+                if statuses[config.id]?.isFailed != true {
+                    statuses[config.id] = .notStarted
+                }
+                return []
+            }
+            statuses[config.id] = .ready(toolCount: remote.count)
+            return toolInfos(for: config, slug: connection.slug,
+                             remote: remote)
+        } catch {
+            let stderr = connections[config.id]?.stderrSummary ?? ""
+            connections[config.id]?.terminate()
+            connections[config.id] = nil
+            launchedConfigs[config.id] = nil
+            failedConfigs[config.id] = config
+            let detail = (error as? MCPClientError)?.errorDescription
+                ?? error.localizedDescription
+            statuses[config.id] = .failed(
+                message: stderr.isEmpty ? detail : detail + " " + stderr)
+            return []
+        }
     }
 
     // MARK: Execution (approved plan items)
@@ -537,6 +637,12 @@ final class MCPServerManager {
     /// "Try again" for a failed server: forget the failure (and any
     /// corpse) so the next session build or call retries the launch.
     func resetServer(id: UUID) {
+        // Audit B-40: an in-flight launch for this server is
+        // cancelled too — `performLaunch` checks for it after the
+        // handshake and shuts the fresh process back down.
+        launchTasks[id]?.cancel()
+        launchTasks[id] = nil
+        launchTokens[id] = nil
         connections[id]?.terminate()
         connections[id] = nil
         launchedConfigs[id] = nil
@@ -548,6 +654,9 @@ final class MCPServerManager {
     /// Stops one server now (Settings' switch-off path reaches here
     /// via reconcile, but an explicit stop is immediate).
     func stopServer(id: UUID) {
+        launchTasks[id]?.cancel()
+        launchTasks[id] = nil
+        launchTokens[id] = nil
         connections[id]?.terminate()
         connections[id] = nil
         launchedConfigs[id] = nil
@@ -557,6 +666,11 @@ final class MCPServerManager {
     }
 
     func terminateAll() {
+        for (_, task) in launchTasks {
+            task.cancel()
+        }
+        launchTasks = [:]
+        launchTokens = [:]
         for (_, connection) in connections {
             connection.terminate()
         }

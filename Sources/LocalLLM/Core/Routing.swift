@@ -141,11 +141,23 @@ enum RoutingPolicy {
                         + "your largest downloaded model.")
             }
             if let firstEndpoint {
+                // Audit B-11: "still runs on this Mac" is only true
+                // when the server IS on this Mac. A LAN/remote server
+                // gets the prompt over the network, and the reason
+                // must say so — it's a privacy-relevant fact.
+                if firstEndpoint.isLocalhost {
+                    return RoutingDecision(
+                        selection: .endpoint(id: firstEndpoint.id),
+                        reason: "Auto: this needs a bigger brain and no "
+                            + "MLX model is downloaded, so \(firstEndpoint.name) "
+                            + "gets it — that still runs on this Mac.")
+                }
                 return RoutingDecision(
                     selection: .endpoint(id: firstEndpoint.id),
                     reason: "Auto: this needs a bigger brain and no "
                         + "MLX model is downloaded, so \(firstEndpoint.name) "
-                        + "gets it — that still runs on this Mac.")
+                        + "gets it — that server isn't on this Mac, so "
+                        + "the privacy check runs first.")
             }
             var decision = RoutingDecision(
                 selection: .onDevice,

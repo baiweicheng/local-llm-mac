@@ -90,7 +90,8 @@ struct ContentView: View {
                              selection = conversation
                          },
                          mcpServerStore: mcpServerStore,
-                         mcpManager: mcpManager)
+                         mcpManager: mcpManager,
+                         hudCoordinator: hudCoordinator)
                     .id(conversation.id)
             } else {
                 ContentUnavailableView(

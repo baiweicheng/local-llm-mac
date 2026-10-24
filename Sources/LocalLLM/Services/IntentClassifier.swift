@@ -59,21 +59,25 @@ enum IntentClassifier {
     /// verdict is normal operation — the caller falls back.
     static func classify(prompt: String) async -> PromptIntent? {
         guard ModelAvailabilityState.current.canChat else { return nil }
-        return await withTaskGroup(of: PromptIntent?.self) { group in
-            group.addTask {
-                await runClassification(prompt: prompt)
-            }
-            group.addTask {
-                try? await Task.sleep(for: .seconds(timeoutSeconds))
-                return nil
-            }
-            // Whichever finishes first wins; a timeout verdict of nil
-            // is indistinguishable from a failed classification, and
-            // both mean "fall back" to the caller.
-            let first = await group.next() ?? nil
-            group.cancelAll()
-            return first
-        }
+        // Audit B-50: the timeout must actually BOUND this call.
+        // A task group can't do that — `withTaskGroup` implicitly
+        // awaits ALL children before returning, and `cancelAll()`
+        // only *requests* cancellation, so a framework call that
+        // ignores cancellation kept `classify()` blocked for its
+        // full duration despite the timer "winning". The race below
+        // runs the classification in a DETACHED task and returns
+        // when the timer wins, without awaiting the loser.
+        //
+        // Cancellation uncertainty, noted honestly: whether
+        // `LanguageModelSession.respond` aborts promptly when its
+        // task is cancelled is framework behaviour this code can't
+        // control — which is exactly why the loser is not awaited.
+        // The abandoned call runs on a throwaway session and
+        // touches no shared state, so letting it finish (or fail)
+        // in the background is harmless; its verdict is discarded.
+        return await TimeoutRace.run(timeoutSeconds: timeoutSeconds) {
+            await runClassification(prompt: prompt)
+        } ?? nil
     }
 
     /// One classification attempt on a fresh session: the session is
@@ -91,6 +95,66 @@ enum IntentClassifier {
             return PromptIntent(rawValue: raw)
         } catch {
             return nil
+        }
+    }
+}
+
+/// Audit B-50: a timeout race whose deadline is a HARD bound.
+///
+/// The operation runs in a detached unstructured task; a timer task
+/// races it to resume the continuation. Whichever resumes first
+/// wins, and the loser is NOT awaited — that is the whole point
+/// (a task group's implicit await-all was the B-50 bug). Pure
+/// Swift concurrency with no framework dependency, so the race
+/// semantics themselves are unit-testable with async sleeps.
+enum TimeoutRace {
+
+    /// Runs `operation`, returning its value — or nil when
+    /// `timeoutSeconds` elapse first. A nil result from the
+    /// operation itself is indistinguishable from a timeout,
+    /// which is precisely the fallback semantics the classifier
+    /// wants ("no verdict in time" and "no verdict" both fall
+    /// back the same way).
+    static func run<T: Sendable>(
+        timeoutSeconds: TimeInterval,
+        operation: @escaping @Sendable () async -> T?
+    ) async -> T? {
+        let gate = ResumeGate<T>()
+        return await withCheckedContinuation { continuation in
+            gate.attach(continuation)
+            Task.detached {
+                let value = await operation()
+                gate.resume(with: value)
+            }
+            Task.detached {
+                try? await Task.sleep(for: .seconds(timeoutSeconds))
+                gate.resume(with: nil)
+            }
+        }
+    }
+
+    /// Exactly-once resumption across the two racing tasks.
+    private final class ResumeGate<T>: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<T?, Never>?
+        private var resumed = false
+
+        func attach(_ continuation: CheckedContinuation<T?, Never>) {
+            lock.lock()
+            self.continuation = continuation
+            lock.unlock()
+        }
+
+        func resume(with value: T?) {
+            lock.lock()
+            guard !resumed, let continuation else {
+                lock.unlock()
+                return
+            }
+            resumed = true
+            self.continuation = nil
+            lock.unlock()
+            continuation.resume(returning: value)
         }
     }
 }

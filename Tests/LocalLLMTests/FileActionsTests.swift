@@ -253,6 +253,64 @@ final class FileActionsTests: XCTestCase {
         }
     }
 
+    // MARK: - Case-insensitive path comparisons (audit B-09)
+
+    func testRenameCaseOnlyIsProposable() {
+        // On the default volume the destination "exists" — it is
+        // the same file with new capitalization. The probe reports
+        // it as existing (as FileManager would), and the rename
+        // must still be proposable and pass its pre-check.
+        var probe = standardProbe()
+        probe.existing.insert("\(root)/Photo.JPG")
+        let outcome = propose(.rename, ActionInputs(
+            sourcePath: "\(root)/photo.jpg", newName: "Photo.JPG"),
+            probe: probe)
+        guard case .proposed(let action) = outcome else {
+            return XCTFail("a case-only rename should be proposable, got \(outcome)")
+        }
+        XCTAssertEqual(action.destinationPath, "\(root)/Photo.JPG")
+        XCTAssertNil(ActionExecution.preCheck(
+            action, roots: [root], probe: probe))
+    }
+
+    func testMoveToACaseVariantOfTheSamePlaceIsRefused() {
+        let outcome = propose(.move, ActionInputs(
+            sourcePath: "\(root)/photo.jpg",
+            destinationPath: "\(root)/PHOTO.jpg"), probe: standardProbe())
+        guard case .refused(let reason) = outcome else {
+            return XCTFail("expected refusal, got \(outcome)")
+        }
+        XCTAssertTrue(reason.contains("already is"))
+    }
+
+    func testFolderIntoItselfWithDifferentCaseIsRefused() {
+        // "/Shared/SUB/Inner" is inside "/Shared/Sub" on a
+        // case-insensitive volume, whatever the spelling says.
+        let outcome = propose(.move, ActionInputs(
+            sourcePath: "\(root)/Sub",
+            destinationPath: "\(root)/SUB/Inner"), probe: standardProbe())
+        guard case .refused(let reason) = outcome else {
+            return XCTFail("expected refusal, got \(outcome)")
+        }
+        XCTAssertTrue(reason.contains("into itself"))
+    }
+
+    func testPreCheckTrashRefusesWhenTheItemBecameASharedRoot() {
+        // Audit B-10: proposed as an ordinary item; if the shared
+        // set changes so the item becomes a shared folder itself
+        // before approval, the pre-check must refuse — scope alone
+        // admits a root by design.
+        guard case .proposed(let action) = propose(.trash, ActionInputs(
+            sourcePath: "\(root)/taken.txt"), probe: standardProbe())
+        else { return XCTFail("setup") }
+        XCTAssertNil(ActionExecution.preCheck(
+            action, roots: [root], probe: standardProbe()))
+        let refusal = ActionExecution.preCheck(
+            action, roots: ["\(root)/taken.txt"], probe: standardProbe())
+        XCTAssertNotNil(refusal)
+        XCTAssertTrue(refusal?.contains("shared folders itself") ?? false)
+    }
+
     func testTrashRefusesTheSharedFolderItself() {
         let outcome = propose(.trash, ActionInputs(sourcePath: root),
                               probe: standardProbe())
@@ -570,6 +628,24 @@ final class FileActionsTests: XCTestCase {
             probe: standardProbe()) else { return XCTFail("setup") }
         XCTAssertFalse(ActionPlanRules.isDuplicate(editB, in: [editA]))
         XCTAssertTrue(ActionPlanRules.isDuplicate(editA, in: [editA]))
+    }
+
+    func testResizeDedupeComparesTheCaps() {
+        // Audit B-16: for a resize, the caps are the payload — a
+        // re-proposal with different limits is a new action, and
+        // one with the same limits is a duplicate.
+        guard case .proposed(let first) = propose(.resizePhoto, ActionInputs(
+                sourcePath: "\(root)/photo.jpg", maxWidthPx: 800,
+                byteCeiling: 200_000), probe: standardProbe()),
+              case .proposed(let recapped) = propose(.resizePhoto, ActionInputs(
+                sourcePath: "\(root)/photo.jpg", maxWidthPx: 1200,
+                byteCeiling: 512_000), probe: standardProbe()),
+              case .proposed(let same) = propose(.resizePhoto, ActionInputs(
+                sourcePath: "\(root)/photo.jpg", maxWidthPx: 800,
+                byteCeiling: 200_000), probe: standardProbe())
+        else { return XCTFail("setup") }
+        XCTAssertFalse(ActionPlanRules.isDuplicate(recapped, in: [first]))
+        XCTAssertTrue(ActionPlanRules.isDuplicate(same, in: [first]))
     }
 
     // MARK: - Undo plan construction

@@ -63,6 +63,22 @@ enum ShellCommandService {
 /// The mutable state of one running command, guarded by a lock: the
 /// output arrives on the pipe's queue, the timeout on a task, and
 /// the exit on the process's own queue — three writers, one finish.
+///
+/// Audit B-49: the finish condition is process exit AND pipe EOF,
+/// not exit alone. Output arrives asynchronously through the pipe's
+/// readability callbacks; finishing on the termination handler
+/// alone could snapshot the output before a final burst was read,
+/// silently discarding the tail — exactly the part that matters.
+/// The two events are therefore tracked separately and whichever
+/// arrives second completes the run. A short drain grace after
+/// exit (scheduled by the runner) still finishes the run if EOF
+/// never arrives, so a grandchild holding the pipe open can't hang
+/// the waiter forever.
+///
+/// Audit B-54: the waiter is cancellation-aware — cancelling the
+/// awaiting task terminates the process and resumes the waiter
+/// with a cancelled outcome instead of leaving both suspended
+/// until exit or the 30-second timeout.
 private final class ShellRunState: @unchecked Sendable {
 
     struct Outcome {
@@ -70,6 +86,11 @@ private final class ShellRunState: @unchecked Sendable {
         let timedOut: Bool
         let output: String
         let seconds: Double
+        /// The awaiting task was cancelled (audit B-54). The
+        /// wording path treats this like any other no-exit-code
+        /// ending; the flag exists so the outcome is honest in
+        /// code, not only in prose.
+        var cancelled: Bool = false
     }
 
     private let lock = NSLock()
@@ -78,7 +99,14 @@ private final class ShellRunState: @unchecked Sendable {
     private var continuation: CheckedContinuation<Outcome, Never>?
     private var finalOutcome: Outcome?
     private var timedOut = false
+    private var cancelled = false
+    private var processExitCode: Int32?
+    private var processHasExited = false
+    private var pipeReachedEOF = false
     private let started = Date()
+    /// Set by the runner before the waiter starts: how to stop the
+    /// process when the waiter is cancelled (audit B-54).
+    var cancellationHandler: (@Sendable () -> Void)?
 
     func appendOutput(_ text: String) {
         lock.lock()
@@ -86,7 +114,12 @@ private final class ShellRunState: @unchecked Sendable {
         guard finalOutcome == nil else { return }
         output += text
         if output.count > ShellOutput.retainedCharacterCap {
-            output = ShellOutput.retainedPrefix(output)
+            // Audit B-49: retain a true TAIL. The old code kept the
+            // prefix and dropped everything after the cap, then
+            // told the user "the middle was dropped" — in fact the
+            // END was dropped, and the model-facing tail was the
+            // end of the beginning.
+            output = ShellOutput.retainedTail(output)
             outputWasCapped = true
         }
     }
@@ -103,7 +136,55 @@ private final class ShellRunState: @unchecked Sendable {
         return timedOut
     }
 
-    func finish(exitCode: Int32?) {
+    /// The process exited. Finishes the run only once the pipe has
+    /// also reached EOF (audit B-49).
+    func noteProcessExit(exitCode: Int32?) {
+        lock.lock()
+        processExitCode = exitCode
+        processHasExited = true
+        lock.unlock()
+        finishIfComplete()
+    }
+
+    /// The pipe reached EOF (the readability handler's empty-data
+    /// callback). Finishes the run only once the process has also
+    /// exited (audit B-49).
+    func notePipeEOF() {
+        lock.lock()
+        pipeReachedEOF = true
+        lock.unlock()
+        finishIfComplete()
+    }
+
+    /// The drain-grace fallback (audit B-49): the process exited
+    /// but EOF never arrived within the grace period — finish with
+    /// whatever output was captured rather than hanging.
+    func finishAfterDrainGrace() {
+        lock.lock()
+        let exited = processHasExited
+        lock.unlock()
+        guard exited else { return }
+        complete()
+    }
+
+    /// The awaiting task was cancelled (audit B-54): resume the
+    /// waiter with a cancelled outcome (the runner's cancellation
+    /// handler, invoked alongside, terminates the process).
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+        complete()
+    }
+
+    private func finishIfComplete() {
+        lock.lock()
+        let ready = processHasExited && pipeReachedEOF
+        lock.unlock()
+        if ready { complete() }
+    }
+
+    private func complete() {
         lock.lock()
         guard finalOutcome == nil else {
             lock.unlock()
@@ -111,13 +192,14 @@ private final class ShellRunState: @unchecked Sendable {
         }
         var finalOutput = output
         if outputWasCapped {
-            finalOutput += "\n… (the command printed more than the app keeps — the middle was dropped)"
+            finalOutput += "\n… (the command printed more than the app keeps — the beginning was dropped)"
         }
         let outcome = Outcome(
-            exitCode: timedOut ? nil : exitCode,
+            exitCode: timedOut ? nil : processExitCode,
             timedOut: timedOut,
             output: finalOutput,
-            seconds: Date().timeIntervalSince(started))
+            seconds: Date().timeIntervalSince(started),
+            cancelled: cancelled)
         finalOutcome = outcome
         let continuation = self.continuation
         self.continuation = nil
@@ -128,16 +210,27 @@ private final class ShellRunState: @unchecked Sendable {
     /// Waits for the outcome — immediately returned when the
     /// command already finished (a fast command can beat the
     /// waiter to it; the outcome is stored, not lost).
+    ///
+    /// Audit B-54: `withTaskCancellationHandler` — when the
+    /// awaiting task is cancelled, the process is terminated (via
+    /// the runner's handler) and the waiter resumes at once with
+    /// the cancelled outcome, instead of `withCheckedContinuation`
+    /// leaving it suspended until exit or timeout.
     func awaitOutcome() async -> Outcome {
-        await withCheckedContinuation { continuation in
-            lock.lock()
-            if let finalOutcome {
-                lock.unlock()
-                continuation.resume(returning: finalOutcome)
-            } else {
-                self.continuation = continuation
-                lock.unlock()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                lock.lock()
+                if let finalOutcome {
+                    lock.unlock()
+                    continuation.resume(returning: finalOutcome)
+                } else {
+                    self.continuation = continuation
+                    lock.unlock()
+                }
             }
+        } onCancel: {
+            cancellationHandler?()
+            cancel()
         }
     }
 }
@@ -166,7 +259,10 @@ private enum ShellRunner {
         pipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             if data.isEmpty {
+                // EOF: the pipe is fully drained. One half of the
+                // finish condition (audit B-49).
                 handle.readabilityHandler = nil
+                state.notePipeEOF()
                 return
             }
             if let text = String(data: data, encoding: .utf8) {
@@ -177,7 +273,24 @@ private enum ShellRunner {
             }
         }
         process.terminationHandler = { process in
-            state.finish(exitCode: process.terminationStatus)
+            // The other half of the finish condition (audit B-49):
+            // the run completes when the pipe also reaches EOF. If
+            // EOF never comes (a spawned grandchild can hold the
+            // pipe open), a short drain grace finishes the run with
+            // what was captured rather than hanging the waiter.
+            state.noteProcessExit(exitCode: process.terminationStatus)
+            DispatchQueue.global(qos: .utility).asyncAfter(
+                deadline: .now() + 0.5) {
+                    state.finishAfterDrainGrace()
+                }
+        }
+        // Audit B-54: if the awaiting task is cancelled, the state
+        // calls this to stop the process (the waiter itself is
+        // resumed by the state's cancellation path).
+        state.cancellationHandler = {
+            if process.isRunning {
+                process.terminate()
+            }
         }
 
         // The timeout: terminate first (SIGTERM — well-behaved

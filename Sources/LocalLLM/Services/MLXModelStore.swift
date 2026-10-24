@@ -1,5 +1,34 @@
 import Foundation
 
+/// Audit B-41: a per-key generation counter for download attempts.
+///
+/// Cancelling a download is fire-and-forget — the cancelled task
+/// unwinds asynchronously, and the user may immediately start a NEW
+/// download of the same model into the SAME staging folder. Every
+/// attempt therefore takes the next generation for its repo id, and
+/// an unwinding task may only touch shared state (the state map,
+/// the task table, the staging folder) while its generation is
+/// still the current one. Pure value logic, so the guard decisions
+/// are unit-testable without any download running.
+struct DownloadGenerationTracker: Equatable {
+    private(set) var current: [String: Int] = [:]
+
+    /// Advances and returns the generation for `key` — called when
+    /// an attempt starts AND when one is invalidated (cancel /
+    /// delete), so a still-unwinding older attempt goes stale at
+    /// the moment of invalidation, not whenever it happens to wake.
+    @discardableResult
+    mutating func advance(for key: String) -> Int {
+        let next = (current[key] ?? 0) + 1
+        current[key] = next
+        return next
+    }
+
+    func isCurrent(_ generation: Int, for key: String) -> Bool {
+        current[key] == generation
+    }
+}
+
 /// Downloads, tracks, and deletes local MLX models.
 ///
 /// Files live under Application Support/LocalLLM/Models/<repo folder> —
@@ -34,6 +63,9 @@ final class MLXModelStore {
     private(set) var diskSizes: [String: Int64] = [:]
 
     private var downloadTasks: [String: Task<Void, Never>] = [:]
+    /// Audit B-41: the generation stamps behind `downloadTasks` —
+    /// see `DownloadGenerationTracker`.
+    private var downloadGenerations = DownloadGenerationTracker()
 
     /// The folder model files live under. Internal (not private) so
     /// tests and future phases can find it.
@@ -99,13 +131,22 @@ final class MLXModelStore {
     func startDownload(_ info: MLXModelInfo) {
         guard downloadTasks[info.repoID] == nil,
               !isDownloaded(info.repoID) else { return }
+        // Audit B-41: this attempt's generation stamp. Everything
+        // the attempt later does to shared state is gated on it.
+        let generation = downloadGenerations.advance(for: info.repoID)
         states[info.repoID] = .downloading(fraction: nil)
         downloadTasks[info.repoID] = Task { [weak self] in
-            await self?.performDownload(info)
+            await self?.performDownload(info, generation: generation)
         }
     }
 
     func cancelDownload(_ info: MLXModelInfo) {
+        // Audit B-41: invalidate the in-flight attempt FIRST, so
+        // when it unwinds it can see it no longer owns the state,
+        // the staging folder, or the task-table entry — a download
+        // restarted a moment later is a different generation, and
+        // the old task must not delete its files or clear its entry.
+        downloadGenerations.advance(for: info.repoID)
         downloadTasks[info.repoID]?.cancel()
         downloadTasks[info.repoID] = nil
         // The staging folder is cleaned up by the download task as it
@@ -120,9 +161,22 @@ final class MLXModelStore {
         refresh()
     }
 
-    private func performDownload(_ info: MLXModelInfo) async {
+    private func performDownload(_ info: MLXModelInfo,
+                                 generation: Int) async {
         let repoID = info.repoID
-        defer { downloadTasks[repoID] = nil }
+        // Audit B-41: every touch of shared state below — the task
+        // table here, progress and completion further down, and the
+        // staging folder in the unwind paths — is gated on this
+        // attempt still being the current generation. A superseded
+        // attempt (cancelled, then restarted or deleted) just stops:
+        // the staging folder and the state now belong to the newer
+        // attempt (or to nobody, after a delete).
+        func isCurrent() -> Bool {
+            downloadGenerations.isCurrent(generation, for: repoID)
+        }
+        defer {
+            if isCurrent() { downloadTasks[repoID] = nil }
+        }
         do {
             // 1. Ask Hugging Face what files this repo has.
             guard let listURL = MLXDownloadPlanner.fileListURL(repoID: repoID)
@@ -146,6 +200,7 @@ final class MLXModelStore {
             var received: Int64 = 0
             for file in files {
                 try Task.checkCancellation()
+                guard isCurrent() else { return }
                 guard let url = MLXDownloadPlanner.downloadURL(
                         repoID: repoID, path: file.path)
                 else { throw StoreFailure.unreachable }
@@ -162,23 +217,34 @@ final class MLXModelStore {
                 try FileManager.default.moveItem(at: tempURL, to: destination)
                 received += file.size > 0 ? file.size
                     : Self.sizeOfFile(destination)
-                if total > 0 {
+                if total > 0, isCurrent() {
                     states[repoID] = .downloading(
                         fraction: min(1, Double(received) / Double(total)))
                 }
             }
 
-            // 3. Complete: staging becomes the model's folder.
+            // 3. Complete: staging becomes the model's folder. The
+            // generation is re-checked at the last moment (audit
+            // B-41): a download cancelled — or a model deleted —
+            // while the last file landed must not move staging into
+            // place over the newer attempt, or resurrect the model
+            // after `deleteModel` removed it.
+            guard isCurrent() else { return }
             let destination = Self.directory(for: info)
             try? FileManager.default.removeItem(at: destination)
             try FileManager.default.moveItem(at: staging, to: destination)
             refresh()
         } catch is CancellationError {
+            // Only the current generation cleans up: the staging
+            // folder a stale attempt would delete may already be a
+            // restarted download's (audit B-41).
+            guard isCurrent() else { return }
             try? FileManager.default.removeItem(at: Self.stagingDirectory(for: info))
             if states[repoID] != .notDownloaded {
                 states[repoID] = .notDownloaded
             }
         } catch let failure as StoreFailure {
+            guard isCurrent() else { return }
             try? FileManager.default.removeItem(at: Self.stagingDirectory(for: info))
             // If the task entry is already gone, the user cancelled and
             // set the state themselves — don't overwrite it with a
@@ -187,6 +253,7 @@ final class MLXModelStore {
                 states[repoID] = .failed(message: failure.message)
             }
         } catch {
+            guard isCurrent() else { return }
             try? FileManager.default.removeItem(at: Self.stagingDirectory(for: info))
             if downloadTasks[repoID] != nil {
                 states[repoID] = .failed(

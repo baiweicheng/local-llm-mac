@@ -24,6 +24,12 @@ final class FileScopeStore {
     private(set) var folders: [DesignatedFolder] = []
     /// Live, access-started URLs by folder id.
     private var accessedURLs: [UUID: URL] = [:]
+    /// Audit B-57: the most recent sharing problem, in plain
+    /// English — a folder that couldn't be saved, re-opened, or
+    /// accessed. Settings shows it under the folder list; the old
+    /// code failed silently at every one of these points (a picked
+    /// folder simply never appeared, with no error anywhere).
+    private(set) var lastError: String?
 
     private let defaultsKey = "LocalLLM.fileScope.v1"
     private let defaults: UserDefaults
@@ -39,16 +45,32 @@ final class FileScopeStore {
         }
     }
 
-    /// The scope roots for the tool layer: resolved + symlink-
-    /// standardized where resolution worked (so a symlinked root is
-    /// checked in its real form), the picked path otherwise.
+    /// The scope roots for the tool layer: only folders that
+    /// resolved AND granted access, in their resolved + symlink-
+    /// standardized form (so a symlinked root is checked in its
+    /// real form).
+    ///
+    /// Audit B-57: there is deliberately NO fallback to the picked
+    /// path. The old code returned the original path for a folder
+    /// whose bookmark no longer resolved — if anything later
+    /// recreated that path, it was in tool scope without ever
+    /// having been shared. An unresolvable folder is simply out of
+    /// scope (and flagged unavailable in Settings) until the user
+    /// removes and re-adds it.
     var rootPaths: [String] {
-        folders.map { folder in
-            if let url = accessedURLs[folder.id] {
-                return url.resolvingSymlinksInPath().standardizedFileURL.path
+        folders.compactMap { folder in
+            accessedURLs[folder.id].map {
+                $0.resolvingSymlinksInPath().standardizedFileURL.path
             }
-            return (folder.path as NSString).standardizingPath
         }
+    }
+
+    /// Whether a folder currently resolves and grants access —
+    /// Settings marks the ones that don't, so a moved or deleted
+    /// folder reads as unavailable instead of silently scoping
+    /// nothing (or, before B-57, scoping its stale path).
+    func isAvailable(_ folder: DesignatedFolder) -> Bool {
+        accessedURLs[folder.id] != nil
     }
 
     func addFolder(url: URL) {
@@ -60,7 +82,14 @@ final class FileScopeStore {
             options: [.withSecurityScope],
             includingResourceValuesForKeys: nil,
             relativeTo: nil)
-        else { return }
+        else {
+            // Audit B-57: say so out loud — the user picked a
+            // folder and nothing happened, with no error anywhere.
+            lastError = "That folder couldn't be saved for sharing. "
+                + "Try adding it again."
+            return
+        }
+        lastError = nil
         let folder = DesignatedFolder(id: UUID(), path: standardized, bookmark: bookmark)
         folders.append(folder)
         resolve(folder)
@@ -78,8 +107,9 @@ final class FileScopeStore {
 
     /// Resolve a bookmark and hold the access open for the app's
     /// lifetime (released on remove). A folder that was moved or
-    /// deleted simply fails to resolve — its picked path still shows
-    /// in Settings so the user can remove and re-add it.
+    /// deleted fails to resolve — its picked path still shows in
+    /// Settings (marked unavailable) so the user can remove and
+    /// re-add it, but it contributes NO scope root (audit B-57).
     private func resolve(_ folder: DesignatedFolder) {
         var isStale = false
         guard let url = try? URL(
@@ -87,9 +117,37 @@ final class FileScopeStore {
             options: [.withSecurityScope],
             relativeTo: nil,
             bookmarkDataIsStale: &isStale)
-        else { return }
-        _ = url.startAccessingSecurityScopedResource()
+        else {
+            lastError = "One of your shared folders couldn't be "
+                + "re-opened — it may have been moved or deleted. "
+                + "It isn't being shared until you remove it below "
+                + "and add it again."
+            return
+        }
+        // Audit B-57: honor the access result. A `false` means the
+        // grant didn't take — registering the URL anyway presented
+        // the path as a live scope root while real reads failed
+        // elsewhere with unrelated errors.
+        guard url.startAccessingSecurityScopedResource() else {
+            lastError = "macOS didn't grant access to one of your "
+                + "shared folders, so it isn't being shared. Remove "
+                + "it below and add it again to grant access."
+            return
+        }
         accessedURLs[folder.id] = url
+        // Audit B-57: refresh a stale bookmark (the folder was
+        // moved or renamed) and persist the fresh data, instead of
+        // letting resolution degrade until it fails outright.
+        if isStale,
+           let fresh = try? url.bookmarkData(
+            options: [.withSecurityScope],
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil),
+           let index = folders.firstIndex(where: { $0.id == folder.id }) {
+            folders[index] = DesignatedFolder(
+                id: folder.id, path: folder.path, bookmark: fresh)
+            persist()
+        }
     }
 
     private func persist() {

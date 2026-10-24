@@ -78,6 +78,12 @@ enum BackendError: LocalizedError {
     case openRouterRateLimited
     /// Phase 8: any other OpenRouter HTTP error.
     case openRouterHTTPError(status: Int)
+    /// The server accepted the request but reported an error
+    /// inside the reply stream itself (audit B-08).
+    case endpointStreamError(name: String, message: String)
+    /// OpenRouter reported an error inside the reply stream
+    /// itself (audit B-08).
+    case openRouterStreamError(message: String)
 
     /// Maps an OpenRouter HTTP status to the error whose wording
     /// fits it — a rejected key and an empty balance need different
@@ -124,6 +130,12 @@ enum BackendError: LocalizedError {
             return "OpenRouter answered with an error (HTTP \(status)). "
                 + "If it keeps happening, the model may be unavailable "
                 + "on OpenRouter right now — try a different one."
+        case .endpointStreamError(let name, let message):
+            return "\(name) reported an error while answering: "
+                + "\(message)"
+        case .openRouterStreamError(let message):
+            return "OpenRouter reported an error while answering: "
+                + "\(message)"
         }
     }
 }
@@ -210,6 +222,49 @@ struct OnDeviceBackend: ModelBackend {
     }
 }
 
+/// Audit B-47: a fingerprint of a resolved backend's CONFIGURATION,
+/// folded into the engine's live-session signature. A session is
+/// keyed by selection alone (`.endpoint(id:)`,
+/// `.openRouter(modelID:)`), but the session object captures the
+/// full endpoint config (base URL, model name) or the OpenRouter
+/// API key at creation — so editing a server, or rotating a revoked
+/// key, changed nothing for live chats until this digest joined
+/// the reuse check.
+///
+/// Pure composition, so the rules are unit-testable:
+/// - Endpoints: the base URL + model name, verbatim apart from
+///   trimming — any edit produces a different digest.
+/// - OpenRouter: a one-way FNV-1a digest of the key. The key VALUE
+///   is never stored in the digest, never printed, and digests live
+///   only in memory (`LiveSession` is an in-memory engine value,
+///   never persisted) — the digest exists solely so "the key
+///   changed" is visible to the reuse check.
+enum SessionConfigDigest {
+
+    static func endpoint(baseURL: String, modelName: String) -> String {
+        "endpoint|"
+            + baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            + "|" + modelName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func openRouter(apiKey: String) -> String {
+        "openrouter|key:" + oneWayDigest(of: apiKey)
+    }
+
+    /// FNV-1a (64-bit) over the value's UTF-8, as hex — the same
+    /// deliberate non-`Hasher` choice as `RedactionTermsHash`: a
+    /// stable value the tests can pin. One-way for signature
+    /// purposes: the input cannot be read back out of it.
+    static func oneWayDigest(of value: String) -> String {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in value.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 0x100000001b3
+        }
+        return String(hash, radix: 16)
+    }
+}
+
 /// The outcome of resolving a chat's stored selection against what
 /// actually exists right now: the backend to talk to, and the selection
 /// it effectively is (a chat whose model was deleted resolves to the
@@ -217,6 +272,12 @@ struct OnDeviceBackend: ModelBackend {
 struct ResolvedBackend {
     let backend: ModelBackend
     let effectiveSelection: ModelSelection
+    /// Audit B-47: the resolved backend's configuration fingerprint
+    /// (`SessionConfigDigest`). Empty for backends whose identity is
+    /// fully carried by the selection itself (on-device, MLX, PCC);
+    /// set for endpoints and OpenRouter, whose sessions capture
+    /// configuration beyond the selection. In-memory only.
+    var configDigest: String = ""
 }
 
 /// Turns stored selections into live backends. Pure lookups against
@@ -272,8 +333,11 @@ enum BackendFactory {
                                        effectiveSelection: .onDevice)
             }
             if let config = endpoints.first(where: { $0.id == id }) {
-                return ResolvedBackend(backend: EndpointBackend(config: config),
-                                       effectiveSelection: selection)
+                return ResolvedBackend(
+                    backend: EndpointBackend(config: config),
+                    effectiveSelection: selection,
+                    configDigest: SessionConfigDigest.endpoint(
+                        baseURL: config.baseURL, modelName: config.modelName))
             }
             return ResolvedBackend(backend: OnDeviceBackend(),
                                    effectiveSelection: .onDevice)
@@ -304,7 +368,11 @@ enum BackendFactory {
             }
             return ResolvedBackend(
                 backend: OpenRouterBackend(modelID: modelID, apiKey: key),
-                effectiveSelection: selection)
+                effectiveSelection: selection,
+                // Audit B-47: a one-way digest of the key — never
+                // the key itself — so rotating the key retires live
+                // sessions exactly like editing a server does.
+                configDigest: SessionConfigDigest.openRouter(apiKey: key))
         }
     }
 }

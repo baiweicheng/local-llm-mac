@@ -150,7 +150,11 @@ final class MLXChatSession: ChatSession {
     /// container load, shared so two first sends in a row can't load
     /// or create twice.
     private var librarySession: MLXLMCommon.ChatSession?
-    private var containerTask: Task<ModelContainer, Error>?
+    /// The shared container load, tagged with an identity so a
+    /// FAILED load can be cleared by its own waiters — and only by
+    /// them (audit B-42): a waiter resuming late must not clear a
+    /// newer retry's task.
+    private var containerLoad: (id: UUID, task: Task<ModelContainer, Error>)?
 
     init(model: MLXLanguageModel,
          instructions: String,
@@ -230,11 +234,33 @@ final class MLXChatSession: ChatSession {
     }
 
     private func loadContainer() async throws -> ModelContainer {
-        if let containerTask { return try await containerTask.value }
-        let model = self.model
-        let task = Task { try await model.loadContainer() }
-        containerTask = task
-        return try await task.value
+        // Audit B-42: a failed load is NOT cached. The old code kept
+        // the completed, failed task forever, so every later send
+        // re-threw the same transient error and the conversation's
+        // MLX route never recovered. On failure the waiter clears
+        // the entry (only if it is still the load it awaited) and
+        // the next send retries from scratch. The success path is
+        // unchanged: one shared task, created once — the
+        // double-checked single creation in `librarySession()` is
+        // preserved.
+        let load: (id: UUID, task: Task<ModelContainer, Error>)
+        if let containerLoad {
+            load = containerLoad
+        } else {
+            let model = self.model
+            let created = (id: UUID(),
+                           task: Task { try await model.loadContainer() })
+            containerLoad = created
+            load = created
+        }
+        do {
+            return try await load.task.value
+        } catch {
+            if containerLoad?.id == load.id {
+                containerLoad = nil
+            }
+            throw error
+        }
     }
 }
 

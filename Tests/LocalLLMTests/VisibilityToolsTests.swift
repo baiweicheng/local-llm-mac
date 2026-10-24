@@ -161,6 +161,22 @@ final class VisibilityToolsTests: XCTestCase {
         XCTAssertEqual(arguments.index, 2)
     }
 
+    func testArgumentConversionRejectsOutOfRangeDoubles() {
+        // Audit B-02: Int(Double) traps on out-of-range, NaN, and
+        // infinite values — all emittable by a model. They must
+        // read as "no value", so the clamped accessors fall back
+        // to their defaults instead of crashing the app.
+        XCTAssertNil(ToolArguments(values: ["limit": .double(1e30)]).limit)
+        XCTAssertNil(ToolArguments(values: ["limit": .double(.infinity)]).limit)
+        XCTAssertNil(ToolArguments(values: ["limit": .double(.nan)]).limit)
+        XCTAssertNil(ToolArguments(values: ["days": .double(-1e30)]).days)
+        XCTAssertEqual(
+            ToolArguments(values: ["limit": .double(1e30)]).limitClamped, 8)
+        // An ordinary fractional double still converts (truncating),
+        // exactly as before.
+        XCTAssertEqual(ToolArguments(values: ["days": .double(3.9)]).days, 3)
+    }
+
     func testArgumentSummariesForTheLog() {
         XCTAssertEqual(
             ToolArguments(query: "roof").summary(for: "search_files"), "“roof”")
@@ -215,6 +231,17 @@ final class VisibilityToolsTests: XCTestCase {
 
     func testSpotlightEscapesQuotesAndBackslashes() {
         XCTAssertEqual(SpotlightQueryBuilder.escape("a\"b\\c"), "a\\\"b\\\\c")
+    }
+
+    func testSpotlightEscapesPercentForThePredicateFormat() {
+        // Audit B-04: the built string is handed to
+        // NSPredicate(format:), where a raw % is a format
+        // specifier — an ordinary phrase like "100%" must reach
+        // the predicate as a literal percent.
+        XCTAssertEqual(SpotlightQueryBuilder.escape("100%"), "100%%")
+        let format = SpotlightQueryBuilder.predicateFormat(
+            forPhrase: "50% off")
+        XCTAssertTrue(try! XCTUnwrap(format).contains("50%%"))
     }
 
     func testSpotlightPredicateShape() {
