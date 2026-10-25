@@ -251,9 +251,10 @@ final class ReviewFixBatch5Tests: XCTestCase {
     /// hanging on either child.
     func testTimeoutRacePropagatesParentCancellation() async {
         let flag = CancellationFlag()
+        let operation = cooperativeOperation(flag: flag)
         let task = Task {
             await TimeoutRace.run(timeoutSeconds: 30,
-                                  operation: cooperativeOperation(flag: flag))
+                                  operation: operation)
         }
         try? await Task.sleep(for: .milliseconds(50))
         task.cancel()

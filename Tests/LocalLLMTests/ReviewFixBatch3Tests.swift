@@ -175,6 +175,7 @@ final class ReviewFixBatch3Tests: XCTestCase {
     /// processes): termination fires exactly when power tools are
     /// NOT available — lock on, or master switch off — and never
     /// while both allow them.
+    @MainActor
     func testStopServersWhenPowerUnavailableFiresOnlyWhenUnavailable() {
         let manager = MCPServerManager()
         XCTAssertEqual(manager.terminateAllCallCount, 0)
@@ -194,6 +195,7 @@ final class ReviewFixBatch3Tests: XCTestCase {
 
     /// `terminateAll` itself is observable through the seam, so a
     /// future wiring change that drops the call is caught.
+    @MainActor
     func testTerminateAllIncrementsCallCount() {
         let manager = MCPServerManager()
         manager.terminateAll()
@@ -257,6 +259,7 @@ final class ReviewFixBatch3Tests: XCTestCase {
     /// the model must appear in the downloaded set — the old code
     /// left it at `.downloading(fraction: 1.0)` after both
     /// refreshes, and `downloadedRepoIDs` never contained it.
+    @MainActor
     func testMergedStatesCompletionRefreshDeferSequence() {
         let model = "mlx-community/test-model"
         // Step 1: completion refresh, task still registered.
@@ -280,6 +283,7 @@ final class ReviewFixBatch3Tests: XCTestCase {
     /// preserved (its folder doesn't exist yet, so the scan can't
     /// know), and a failed attempt survives a refresh while the
     /// model isn't on disk.
+    @MainActor
     func testMergedStatesPreservesActiveDownloadAndFailure() {
         let model = "mlx-community/test-model"
         let active = MLXModelStore.mergedStates(
@@ -299,6 +303,7 @@ final class ReviewFixBatch3Tests: XCTestCase {
     /// old code preserved it unconditionally, so a finished model
     /// could read as downloading forever. Disk truth also beats a
     /// stale failure record.
+    @MainActor
     func testMergedStatesDropsStaleDownloadingWithoutTask() {
         let model = "mlx-community/test-model"
         let stale = MLXModelStore.mergedStates(

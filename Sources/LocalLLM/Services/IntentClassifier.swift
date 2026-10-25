@@ -160,7 +160,7 @@ enum TimeoutRace {
     /// a task that already finished (the winner, or a timer that
     /// already fired) is a harmless no-op — `win` therefore cancels
     /// BOTH handles rather than trying to identify the loser.
-    private final class RaceGate<T>: @unchecked Sendable {
+    private final class RaceGate<T: Sendable>: @unchecked Sendable {
         private let lock = NSLock()
         private var continuation: CheckedContinuation<T?, Never>?
         private var finished = false

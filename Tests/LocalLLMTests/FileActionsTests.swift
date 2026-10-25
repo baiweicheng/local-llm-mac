@@ -823,6 +823,7 @@ final class FileActionsTests: XCTestCase {
 
     // MARK: - Settings persistence
 
+    @MainActor
     func testFileWritingTogglePersistsAndDefaultsOff() {
         let suite = "LocalLLMTests.fileWriting.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
@@ -953,7 +954,7 @@ final class FileActionsTests: XCTestCase {
             action, roots: [root], probe: standardProbe(),
             resolve: { $0 },
             resolveDestination: { $0 },
-            resolveExistingDestination: { _ in "\(root)/real-notes.txt" }))
+            resolveExistingDestination: { _ in "\(self.root)/real-notes.txt" }))
         let create = PlannedAction(
             kind: .editText, destinationPath: "\(root)/brand-new.txt",
             editText: "hello", appendEdit: false,

@@ -1,8 +1,10 @@
 import Foundation
+import HuggingFace
 import MLXFoundationModels
 import MLXLLM
 import MLXLMCommon
 import MLXHuggingFace
+import Tokenizers
 
 // ============================================================
 //  THE ONLY FILE THAT TALKS TO MLX.
@@ -307,64 +309,55 @@ final class MLXChatSession: ChatSession {
 /// streaming strings rather than details", which is exactly this
 /// session's shape.
 ///
-/// `ToolSpec` is Codable in the library (it's what gets rendered into
-/// the chat template), so specs are built by JSON-decoding the
-/// standard function shape rather than depending on a memberwise
-/// initializer. If that decode ever fails, `specs(for:)` returns nil
-/// and the session runs without tools — chatting is never held
-/// hostage to tool plumbing.
+/// `ToolSpec` is the library's `[String: any Sendable]` dictionary,
+/// rendered into the chat template. Build the standard function
+/// schema directly with Sendable values.
 enum MLXToolSupport {
 
     static func specs(for descriptors: [ToolDescriptor]) -> [ToolSpec]? {
         var specs: [ToolSpec] = []
         for descriptor in descriptors {
-            var properties: [String: Any] = [:]
+            var properties: [String: any Sendable] = [:]
             for field in descriptor.argumentFields {
                 properties[field.rawValue] = [
                     "type": field.jsonType,
                     "description": field.fieldDescription
                 ]
             }
-            let object: [String: Any] = [
-                "type": "function",
-                "function": [
-                    "name": descriptor.name,
-                    "description": descriptor.modelDescription,
-                    "parameters": [
-                        "type": "object",
-                        "properties": properties,
-                        "required": [String]()
-                    ]
-                ]
+            let parameters: [String: any Sendable] = [
+                "type": "object",
+                "properties": properties,
+                "required": [String]()
             ]
-            guard let data = try? JSONSerialization.data(withJSONObject: object),
-                  let spec = try? JSONDecoder().decode(ToolSpec.self, from: data)
-            else { return nil }
-            specs.append(spec)
+            let function: [String: any Sendable] = [
+                "name": descriptor.name,
+                "description": descriptor.modelDescription,
+                "parameters": parameters
+            ]
+            specs.append(["type": "function", "function": function])
         }
         return specs.isEmpty ? nil : specs
     }
 
-    /// The library's call arguments (`[String: AnyCodable]`) in the
+    /// The library's typed JSON call arguments in the
     /// app's one argument shape.
     static func arguments(from call: ToolCall) -> ToolArguments {
         var values: [String: ToolArgumentValue] = [:]
-        for (key, wrapped) in call.function.arguments {
-            if let value = argumentValue(wrapped.value) {
+        for (key, argument) in call.function.arguments {
+            if let value = argumentValue(argument) {
                 values[key] = value
             }
         }
         return ToolArguments(values: values)
     }
 
-    private static func argumentValue(_ any: Any) -> ToolArgumentValue? {
-        switch any {
-        case let string as String: return .string(string)
-        case let bool as Bool: return .bool(bool)
-        case let int as Int: return .int(int)
-        case let double as Double: return .double(double)
-        case let number as NSNumber: return .double(number.doubleValue)
-        default: return nil
+    private static func argumentValue(_ value: MLXLMCommon.JSONValue) -> ToolArgumentValue? {
+        switch value {
+        case .string(let string): return .string(string)
+        case .bool(let bool): return .bool(bool)
+        case .int(let int): return .int(int)
+        case .double(let double): return .double(double)
+        case .null, .array, .object: return nil
         }
     }
 }

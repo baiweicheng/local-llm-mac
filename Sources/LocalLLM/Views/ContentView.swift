@@ -62,7 +62,7 @@ struct ContentView: View {
     /// open. Drives the visible banner below and gates the
     /// backup sweep in `onAppear` — the sweep must never run
     /// against an empty in-memory store.
-    let persistentStoreFailed: Bool = false
+    let persistentStoreFailed: Bool
     @Environment(\.modelContext) private var modelContext
     @Environment(\.openWindow) private var openWindow
 

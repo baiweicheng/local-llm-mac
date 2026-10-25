@@ -1,6 +1,6 @@
 import AppKit
 import Foundation
-import IOKit
+import IOKit.ps
 
 /// Phase 5: the system_info tool — basic facts about this Mac from
 /// public APIs (ProcessInfo, sysctl, the home volume's resource

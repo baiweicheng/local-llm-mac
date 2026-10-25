@@ -170,7 +170,7 @@ enum PhotosService {
         return await withCheckedContinuation { continuation in
             PHImageManager.default().requestImageDataAndOrientation(
                 for: asset, options: options
-            ) { data, _, _ in
+            ) { data, _, _, _ in
                 continuation.resume(returning: data)
             }
         }

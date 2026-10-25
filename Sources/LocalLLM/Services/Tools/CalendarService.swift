@@ -40,7 +40,7 @@ enum CalendarService {
             return "No unfinished reminders."
         }
         let sorted = reminders.sorted { lhs, rhs in
-            switch (lhs.dueDateComponents?.date, rhs.dueDateComponents?.date) {
+            switch (lhs.dueDate, rhs.dueDate) {
             case let (left?, right?): return left < right
             case (_?, nil): return true
             case (nil, _?): return false
@@ -50,10 +50,10 @@ enum CalendarService {
         var lines = ["Unfinished reminders:"]
         for reminder in sorted.prefix(limit) {
             var line = "• \(reminder.title ?? "Untitled reminder")"
-            if let due = reminder.dueDateComponents?.date {
+            if let due = reminder.dueDate {
                 line += " — due \(DateDisplay.dayAndTime(due))"
             }
-            if let listName = reminder.calendar?.title {
+            if let listName = reminder.calendarTitle {
                 line += " (\(listName))"
             }
             lines.append(line)
@@ -83,10 +83,20 @@ enum CalendarService {
         return line
     }
 
-    private static func fetchReminders(store: EKEventStore, predicate: NSPredicate) async -> [EKReminder] {
+    private struct ReminderSnapshot: Sendable {
+        let title: String?
+        let dueDate: Date?
+        let calendarTitle: String?
+    }
+
+    private static func fetchReminders(store: EKEventStore, predicate: NSPredicate) async -> [ReminderSnapshot] {
         await withCheckedContinuation { continuation in
             store.fetchReminders(matching: predicate) { reminders in
-                continuation.resume(returning: reminders ?? [])
+                let snapshots = (reminders ?? []).map {
+                    ReminderSnapshot(title: $0.title, dueDate: $0.dueDateComponents?.date,
+                                     calendarTitle: $0.calendar?.title)
+                }
+                continuation.resume(returning: snapshots)
             }
         }
     }

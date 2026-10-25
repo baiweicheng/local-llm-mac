@@ -667,6 +667,7 @@ final class PowerToolsTests: XCTestCase {
         XCTAssertNotEqual(on.signature, withTools.signature)
     }
 
+    @MainActor
     func testPowerTogglePersistsAndDefaultsOff() {
         let suite = "LocalLLMTests.powerTools.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
@@ -677,6 +678,7 @@ final class PowerToolsTests: XCTestCase {
         XCTAssertTrue(AppSettings(defaults: defaults).powerToolsEnabled)
     }
 
+    @MainActor
     func testServerStorePersists() {
         let suite = "LocalLLMTests.mcpStore.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
@@ -805,7 +807,7 @@ final class PowerToolsTests: XCTestCase {
         let result = await runtime.execute(
             toolName: "run_command",
             arguments: ToolArguments(
-                command: "touch \(marker.path)", path: resolvedRoot))
+                path: resolvedRoot, command: "touch \(marker.path)"))
         XCTAssertTrue(result.contains("NOTHING has been run yet"),
                       "unexpected result: \(result)")
         let proposed = await box.actions

@@ -291,10 +291,10 @@ final class ChatEngine {
     /// in through here, so plan approval can reach it without the
     /// engine knowing what an MCP server is. A nil return (no
     /// provider configured) becomes a plain failure item.
-    private var mcpExecutorProvider: (PlannedAction) async -> ExecutedActionItem? = { _ in nil }
+    private var mcpExecutorProvider: @MainActor (PlannedAction) async -> ExecutedActionItem? = { _ in nil }
 
     func configureMCPExecutorProvider(
-        _ provider: @escaping (PlannedAction) async -> ExecutedActionItem?
+        _ provider: @escaping @MainActor (PlannedAction) async -> ExecutedActionItem?
     ) {
         mcpExecutorProvider = provider
     }
@@ -495,7 +495,8 @@ final class ChatEngine {
                     // switch turned off mid-approval must reach the
                     // remaining items through the gate, not through
                     // a snapshot taken when Approve was pressed.
-                    let currentAvailability = toolAvailabilityProvider()
+                    guard let currentAvailability = self?.toolAvailabilityProvider()
+                    else { break }
                     // Audit E-90: `executePlanItem` is `nonisolated`
                     // (see its declaration), so this await runs the
                     // item's blocking disk/image work OFF the main
@@ -673,7 +674,7 @@ final class ChatEngine {
         localOnly: Bool = false,
         powerToolsEnabled: Bool = true,
         fileWritingEnabled: Bool = true,
-        mcpExecutor: (PlannedAction) async -> ExecutedActionItem?
+        mcpExecutor: @MainActor (PlannedAction) async -> ExecutedActionItem?
     ) async -> ExecutedActionItem {
         // Review finding 7: the execution-time grant gate runs
         // FIRST — before the pre-check and before any executor.

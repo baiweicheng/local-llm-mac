@@ -159,6 +159,7 @@ final class ServicesFixTests: XCTestCase {
 
     // MARK: - B-57: FileScopeStore resolution decisions
 
+    @MainActor
     func testUnresolvableFolderContributesNoScopeRoot() throws {
         let suite = "LocalLLMTests.fileScope.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
@@ -180,6 +181,7 @@ final class ServicesFixTests: XCTestCase {
         XCTAssertNotNil(store.lastError)
     }
 
+    @MainActor
     func testAddedFolderResolvesIntoScope() throws {
         let suite = "LocalLLMTests.fileScope.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!

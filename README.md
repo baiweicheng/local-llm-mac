@@ -581,6 +581,9 @@ you haven't, and ask the model to run `git status` in it.
 
 - A Mac with **Apple Silicon** running **macOS 27**
 - **Xcode 27** (to build it — there's no prebuilt download)
+- **Xcode's Metal Toolchain component**, needed to compile MLX.
+  Install it once with `xcodebuild -downloadComponent MetalToolchain`
+  if the build reports that the `metal` compiler is missing.
 - **Apple Intelligence turned on** (System Settings → Apple
   Intelligence & Siri) for the built-in model. The app checks for
   this and explains, in plain English, if something isn't ready —
