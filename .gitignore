@@ -3,6 +3,7 @@
 
 # Swift Package Manager
 .build/
+.build-app/
 .swiftpm/
 Package.resolved
 
