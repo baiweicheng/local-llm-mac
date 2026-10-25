@@ -59,15 +59,19 @@ extension ToolCallArguments {
 
 struct FrameworkTool: Tool {
     typealias Arguments = ToolCallArguments
-    typealias Output = ToolOutput
+    // `String`, not `ToolOutput`: the macOS 27 SDK does not expose
+    // an unqualified `ToolOutput` type for this conformance, while
+    // `String` is a documented `Tool` output (the runtime already
+    // produces the result as a plain string).
+    typealias Output = String
 
     let name: String
     let description: String
     let runtime: ToolRuntime
 
-    func call(arguments: ToolCallArguments) async throws -> ToolOutput {
-        ToolOutput(await runtime.execute(
-            toolName: name, arguments: arguments.coreArguments))
+    func call(arguments: ToolCallArguments) async throws -> String {
+        await runtime.execute(
+            toolName: name, arguments: arguments.coreArguments)
     }
 }
 

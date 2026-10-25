@@ -386,14 +386,18 @@ struct ToolDescriptor: Sendable, Equatable, Identifiable {
     /// list (see `FileActions.swift`) — and they exist only while the
     /// separate file-writing Settings toggle is on. Declared last with
     /// a default so every read-tool literal above stays unchanged.
-    let isWriteAction: Bool = false
+    // `var`, not `let`: a `let` property with a default value is
+    // omitted from the synthesized memberwise initializer, so
+    // callers passing these flags were rejected as extra arguments.
+    // `var` keeps the defaults AND the arguments.
+    var isWriteAction: Bool = false
     /// Phase 9: a power tool — the shell command, and every MCP
     /// server tool. Same propose-only contract as the file actions
     /// (a call proposes; nothing runs before the user's Approve),
     /// behind the master Power tools switch instead of the writing
     /// one. MCP descriptors are built per server in `PowerTools.swift`,
     /// not in the static catalog below; only `run_command` is static.
-    let isPowerAction: Bool = false
+    var isPowerAction: Bool = false
 
     var id: String { name }
 }

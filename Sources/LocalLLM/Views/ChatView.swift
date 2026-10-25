@@ -746,7 +746,7 @@ struct ChatView: View {
                                 in: RoundedRectangle(cornerRadius: 10))
                     .overlay(RoundedRectangle(cornerRadius: 10)
                         .strokeBorder(Color.secondary.opacity(0.3)))
-                    .onKeyPress(.return) { press in
+                    .onKeyPress(.return, phases: .down) { press in
                         if press.modifiers.contains(.shift) {
                             return .ignored // Shift+Return: newline, as usual.
                         }

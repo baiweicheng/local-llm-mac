@@ -119,6 +119,16 @@ enum JSONValue: Codable, Sendable, Equatable {
     }
 }
 
+/// The same lookup for an already-unpacked object dictionary: the
+/// protocol decoders below hold `[String: JSONValue]`, not a
+/// `JSONValue`, so they cannot call the method above on it.
+extension [String: JSONValue] {
+    func string(forKey key: String) -> String? {
+        guard case .string(let value)? = self[key] else { return nil }
+        return value
+    }
+}
+
 // MARK: - MCP arguments from the model
 
 /// The model's half of an MCP call: it hands the app the tool's

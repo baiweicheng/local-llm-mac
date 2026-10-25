@@ -1,12 +1,14 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.4
 import PackageDescription
 
 // LocalLLM — a native macOS chat app powered by Apple's on-device model.
 //
 // This is a Swift Package, not an .xcodeproj: open this folder in Xcode 27
 // and press Run. The executable target builds as a regular macOS app.
-// swift-tools-version 6.0 means the package compiles in Swift 6 language
-// mode by default (strict concurrency checking on).
+// swift-tools-version 6.4 means the package compiles in Swift 6 language
+// mode by default (strict concurrency checking on). 6.4 is required:
+// the manifest uses `.macOS(.v27)`, which PackageDescription only
+// exposes from 6.4 on.
 let package = Package(
     name: "LocalLLM",
     platforms: [

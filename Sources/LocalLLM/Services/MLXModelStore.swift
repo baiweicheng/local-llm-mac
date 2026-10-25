@@ -39,11 +39,11 @@ struct DownloadGenerationTracker: Equatable {
 /// into place only when complete, so a cancelled or failed download
 /// never looks like a finished model.
 ///
-/// Note: the MLX bridge loads models by repo id through its own
-/// Hugging Face cache, so the first time a downloaded model is picked
-/// it may still spend a little while loading — the copy kept here is
-/// what the Models panel accounts for (sizes, delete) and the
-/// guarantee that the model is on this Mac.
+/// Note: the MLX bridge no longer loads by repo id from its own
+/// Hugging Face cache — `MLXBackend` now constructs it against
+/// this store's directory (see that file), so the copy kept here
+/// is the one that gets loaded, not a second download. The panel
+/// still reports the HF cache total below for transparency.
 @MainActor
 @Observable
 final class MLXModelStore {

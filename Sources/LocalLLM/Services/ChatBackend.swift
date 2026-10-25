@@ -8,7 +8,11 @@ import FoundationModels
 /// Phase 3 (see `EndpointBackend`).
 struct ChatReplyRequest: Sendable {
     let promptText: String
-    let imageURLs: [URL] = []
+    // `var`, not `let`: a `let` property with a default value is
+    // omitted from the synthesized memberwise initializer, so the
+    // engine's `imageURLs:` argument at the call site was rejected
+    // as an extra argument. `var` keeps the default AND the argument.
+    var imageURLs: [URL] = []
 }
 
 /// A live conversation session against one backend. Implementations

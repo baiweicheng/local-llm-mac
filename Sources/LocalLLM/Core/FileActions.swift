@@ -697,7 +697,14 @@ enum ActionExecution {
             resolve(path) ?? path
         }
         func resolvedDestination(_ path: String) -> String {
-            (resolveDestination ?? resolve)(path) ?? path
+            // No `??` merge of the two closures here: `resolve` is
+            // nonescaping, and folding it into the optional with
+            // `??` would force it to escape. Calling each directly
+            // keeps both nonescaping.
+            if let resolveDestination {
+                return resolveDestination(path) ?? path
+            }
+            return resolve(path) ?? path
         }
         func scoped(_ path: String) -> Bool {
             FileScope.isPath(resolved(path), insideAnyRoot: roots)

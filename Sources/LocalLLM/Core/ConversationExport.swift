@@ -121,8 +121,12 @@ enum ConversationExport {
     /// creation is expensive enough that a 2,000-message export
     /// used to build ~2,003 of them. Formatters here are only ever
     /// used on the caller's thread during a single export pass;
-    /// the cache itself is lock-guarded.
-    private static var formattersByTimeZone: [String: DateFormatter] = [:]
+    /// the cache itself is lock-guarded. `nonisolated(unsafe)` is
+    /// the Swift 6 declaration for exactly that shape: a mutable
+    /// static whose safety comes from the lock below, not from the
+    /// compiler — every access goes through `formatter(for:)`,
+    /// which holds `formatterLock`.
+    nonisolated(unsafe) private static var formattersByTimeZone: [String: DateFormatter] = [:]
     private static let formatterLock = NSLock()
 
     /// "Oct 23, 2026 at 2:15 PM" — an explicit format (not a

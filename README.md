@@ -643,7 +643,7 @@ and come back to.
   build takes a few minutes.
   *You'll see:* the main window opens — a sidebar on the left, an
   empty chat area on the right.
-- [ ] **Run the tests** (Product → Test, or ⌘U). There are 351 of
+- [ ] **Run the tests** (Product → Test, or ⌘U). There are 352 of
   them, covering the behind-the-scenes logic; they never call a real
   model. If any fail on a fresh pull, that's worth reporting before
   going further.
@@ -893,7 +893,7 @@ This is a Swift Package (Swift 6 language mode, macOS 27) with no
 `.xcodeproj`: the app target is `Sources/LocalLLM` (pure logic in
 `Core/`, platform wrappers in `Services/`, SwiftUI in `Views/`),
 tests in `Tests/LocalLLMTests`. Run the tests in Xcode with **Product
-→ Test** (⌘U): 351 tests covering the behind-the-scenes logic —
+→ Test** (⌘U): 352 tests covering the behind-the-scenes logic —
 instructions and token estimates, markdown splitting, context budgets
 and compaction planning, summary merging, attachment storage,
 model-picker persistence, download planning, server-request building

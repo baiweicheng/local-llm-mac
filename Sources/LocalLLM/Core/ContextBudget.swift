@@ -44,12 +44,17 @@ struct ContextBudget: Equatable, Sendable {
     /// prompt, keeping the reply reserve untouched.
     var promptAllowanceTokens: Int { windowTokens - replyReserveTokens }
 
-    init(backend: Backend, windowTokens: Int) {
+    init(backend: Backend, windowTokens: Int,
+         replyReserveTokens: Int? = nil) {
         self.backend = backend
         self.windowTokens = windowTokens
         // Bigger windows can afford to reserve more for long replies and
         // longer summaries; the small on-device window stays tight.
-        self.replyReserveTokens = min(4_096, max(512, windowTokens / 8))
+        // An explicit reserve overrides the formula — the MLX row
+        // below uses it so the reserve matches the MLX session's
+        // actual 4,096-token reply cap (see `MLXBackend`).
+        self.replyReserveTokens = replyReserveTokens
+            ?? min(4_096, max(512, windowTokens / 8))
         self.summaryTargetTokens = min(2_000, max(150, windowTokens / 8))
     }
 
@@ -65,8 +70,15 @@ struct ContextBudget: Equatable, Sendable {
 
     /// Local MLX models (Phase 3): windows vary by model (8K–128K), so
     /// this is a conservative default the model layer can override per
-    /// downloaded model.
-    static let mlxLocal = ContextBudget(backend: .mlxLocal, windowTokens: 8_192)
+    /// downloaded model. The reply reserve is the full 4,096 tokens
+    /// the MLX session actually allows per reply
+    /// (`MLXBackend.generateParameters`), not the formula's 1,024 —
+    /// planning against a smaller reserve than the session permits
+    /// could let a prompt + full reply overflow the window. (Local
+    /// server backends share this row, so they inherit the same
+    /// conservative reserve.)
+    static let mlxLocal = ContextBudget(backend: .mlxLocal, windowTokens: 8_192,
+                                        replyReserveTokens: 4_096)
 
     /// OpenRouter cloud models (Phase 8): windows vary widely by model;
     /// conservative default, overridable per model.

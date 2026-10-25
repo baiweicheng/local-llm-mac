@@ -1,6 +1,8 @@
 import Foundation
 import MLXFoundationModels
+import MLXLLM
 import MLXLMCommon
+import MLXHuggingFace
 
 // ============================================================
 //  THE ONLY FILE THAT TALKS TO MLX.
@@ -25,22 +27,30 @@ import MLXLMCommon
 //  (MLXLMCommon), created with `GenerateParameters` that carry the
 //  cache configuration from the start. The model *loading* still
 //  goes through the bridge value: `MLXLanguageModel.loadContainer()`
-//  is public, shares the bridge's process-wide model cache, and
-//  resolves LLM/VLM factories exactly as the framework path did —
-//  downloads, disk checks, and load behavior are unchanged from
-//  Phase 3. Only the conversation object changed hands.
+//  is public and shares the bridge's process-wide model cache —
+//  but the bridge value itself is now constructed with the
+//  dependency's real 3.32.3 initializer (see `MLXBackend.makeSession`),
+//  pointed at the app's own downloaded model directory
+//  (`MLXModelStore.directory(for:)`), NOT at a second Hugging Face
+//  cache: `weightsLocation` returns that directory, and the load
+//  closure resolves a `.directory` configuration, which the
+//  library's resolver loads from local files without downloading.
+//  The `loadModelContainer(from:using:configuration:)` shape and
+//  the `#hubDownloader()` / `#huggingFaceTokenizerLoader()` macros
+//  are the bridge's own documented construction path (see
+//  `MLXLanguageModel.swift` in mlx-swift-lm 3.32.3).
 //
-//  If `MLXLanguageModel(modelID:)` doesn't resolve in the shipped
-//  bridge version, the documented alternative construction is:
-//
-//      import MLXLMCommon // for ModelConfiguration
-//      let model = #huggingFaceLanguageModel(
-//          configuration: ModelConfiguration(id: info.repoID),
-//          capabilities: [.guidedGeneration])
-//
-//  (a macro from the same package). It produces the same
-//  `MLXLanguageModel` value, so `loadContainer()` below is
-//  unaffected by which construction is used.
+//  Factory registration: that load path dispatches through the
+//  library's registered model factory, and the bridge deliberately
+//  does NOT depend on `MLXLLM` itself — consumers must link a
+//  factory provider. This target already depends on the `MLXLLM`
+//  product, so `makeSession` references `LLMModelFactory.shared`
+//  (same file as `TrampolineModelFactory` in 3.32.3) to make sure
+//  the LLM factory survives linking. Open question for the first
+//  runtime test, not this compile pass: the Gemma 4 default is a
+//  multimodal (vision) model, which may need the `MLXVLM` factory
+//  instead — that product is not a target dependency today, and
+//  adding it is a separate, runtime-verified decision.
 // ============================================================
 
 /// A downloaded local MLX model as a backend.
@@ -64,8 +74,30 @@ struct MLXBackend: ModelBackend {
 
     @MainActor
     func makeSession(instructions: String, tools: SessionTools?) -> ChatSession {
-        MLXChatSession(
-            model: MLXLanguageModel(modelID: info.repoID),
+        // 3.32.3 has no `MLXLanguageModel(modelID:)` initializer.
+        // Its real initializer takes a configuration, a weights
+        // location, and a load closure. The configuration points
+        // at the directory this app already downloaded the model
+        // into (`MLXModelStore.directory(for:)` — Application
+        // Support/LocalLLM/Models/<repo folder>), so loading never
+        // re-downloads into a second cache; `weightsLocation`
+        // returns that same directory for the bridge's disk checks.
+        // Referencing the LLM factory here keeps it linked (see
+        // the header note on factory registration).
+        _ = LLMModelFactory.shared
+        let directory = MLXModelStore.directory(for: info)
+        let model = MLXLanguageModel(
+            configuration: ModelConfiguration(directory: directory),
+            weightsLocation: { _ in directory },
+            load: { configuration, progressHandler in
+                try await loadModelContainer(
+                    from: #hubDownloader(),
+                    using: #huggingFaceTokenizerLoader(),
+                    configuration: configuration,
+                    progressHandler: progressHandler)
+            })
+        return MLXChatSession(
+            model: model,
             instructions: instructions,
             generateParameters: Self.generateParameters(for: kvCacheMode),
             tools: tools)

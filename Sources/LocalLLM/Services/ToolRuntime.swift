@@ -274,6 +274,12 @@ actor ToolRuntime {
                     : nil,
                 maxWidthPx: arguments.maxWidthClamped,
                 byteCeiling: arguments.maxBytesClamped)
+        case .runCommand, .mcpCall:
+            // Unreachable here by construction: power tools route
+            // through `proposePower`, not `propose` (see
+            // `execute`). The cases exist because the switch must
+            // be exhaustive over `PlannedActionKind`.
+            return "That tool isn't wired up yet."
         }
 
         let outcome = ActionProposal.make(

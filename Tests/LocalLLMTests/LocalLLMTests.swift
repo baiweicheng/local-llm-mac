@@ -124,6 +124,16 @@ final class LocalLLMTests: XCTestCase {
                              onDevice.windowTokens)
     }
 
+    func testMLXReplyReserveMatchesMLXGenerationCap() {
+        // Reviewfix batch 1 (finding 12, MLX part): the MLX session
+        // allows 4,096-token replies (MLXBackend.generateParameters),
+        // so the planner must reserve 4,096 — not the formula's
+        // 1,024 — or a prompt + full reply could overflow the
+        // 8,192-token window.
+        XCTAssertEqual(ContextBudget.mlxLocal.replyReserveTokens, 4_096)
+        XCTAssertEqual(ContextBudget.mlxLocal.promptAllowanceTokens, 4_096)
+    }
+
     // MARK: - Phase 2: compaction planning
 
     func testPlanNoCompactionWhenConversationFits() {

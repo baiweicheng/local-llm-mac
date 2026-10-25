@@ -174,10 +174,20 @@ final class MCPServerConnection: @unchecked Sendable {
             method: "tools/list", params: nil,
             timeoutSeconds: 15, timeoutWhat: "listing its tools")
         let tools = MCPResultDecoding.tools(from: listResult)
+        setRemoteTools(tools)
+        return tools
+    }
+
+    /// Synchronous lock holder for `start()`: the assignment above
+    /// runs in an `async` body, where direct `NSLock.lock()` /
+    /// `unlock()` calls are unavailable in Swift 6, so the locked
+    /// mutation lives in this non-async helper instead. (The other
+    /// lock uses in this file are already in synchronous functions
+    /// or synchronous continuation closures, so they are untouched.)
+    private func setRemoteTools(_ tools: [MCPRemoteTool]) {
         lock.lock()
         remoteTools = tools
         lock.unlock()
-        return tools
     }
 
     /// One approved tools/call. The 30-second limit matches the

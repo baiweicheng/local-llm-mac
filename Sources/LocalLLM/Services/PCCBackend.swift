@@ -34,8 +34,13 @@ enum PCCAvailabilityReader {
     /// `ModelAvailabilityState` reads the on-device model: the
     /// model value's availability, with anything unrecognized
     /// treated as "not ready" rather than guessed at.
+    ///
+    /// Constructed, not `.default`: unlike `SystemLanguageModel`,
+    /// `PrivateCloudComputeLanguageModel` exposes no static default
+    /// in the macOS 27 SDK — the same file already constructs it
+    /// with `()` in `PCCBackend.makeSession` below.
     static var isReady: Bool {
-        switch PrivateCloudComputeLanguageModel.default.availability {
+        switch PrivateCloudComputeLanguageModel().availability {
         case .available:
             return true
         default:

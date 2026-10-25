@@ -49,15 +49,18 @@ enum ChatSearch {
         // same reason the query is collapsed (UAT-09): irregular
         // spacing on EITHER side shouldn't hide a match.
         let titleMatched = contains(flatten(title), query)
-        var snippet: String? = nil
+        // Named `foundSnippet`, not `snippet`: a local by that name
+        // shadows the `snippet(in:matching:)` function below, so the
+        // call tried to invoke the (optional string) variable.
+        var foundSnippet: String? = nil
         for text in messageTexts {
             if let found = snippet(in: text, matching: query) {
-                snippet = found
+                foundSnippet = found
                 break
             }
         }
-        guard titleMatched || snippet != nil else { return nil }
-        return ChatSearchHit(titleMatched: titleMatched, snippet: snippet)
+        guard titleMatched || foundSnippet != nil else { return nil }
+        return ChatSearchHit(titleMatched: titleMatched, snippet: foundSnippet)
     }
 
     /// Every hit in a list of chats, computed in ONE pass (audit

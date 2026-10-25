@@ -99,7 +99,11 @@ final class VisibilityToolsTests: XCTestCase {
     func testCatalogNamesAreUniqueAndComplete() {
         let names = ToolCatalog.all.map(\.name)
         XCTAssertEqual(Set(names).count, names.count)
-        XCTAssertEqual(names.count, 15)
+        // 23 = 15 original tools + 7 Phase 6 file actions
+        // (rename/move/copy/create_folder/edit_text/trash/resize)
+        // + 1 Phase 9 power tool (run_command). Verified by
+        // counting `ToolDescriptor(` literals in Visibility.swift.
+        XCTAssertEqual(names.count, 23)
         for descriptor in ToolCatalog.all {
             XCTAssertFalse(descriptor.modelDescription.isEmpty, descriptor.name)
             XCTAssertFalse(descriptor.displayName.isEmpty, descriptor.name)

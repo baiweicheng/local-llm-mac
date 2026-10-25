@@ -187,7 +187,10 @@ struct HUDConversationView: View {
     /// order — the same sources ChatView merges, kept simpler here
     /// (the panel is a quick surface; the summarized divider stays a
     /// main-window nicety).
-    private enum Row: Identifiable {
+    // `Row` is internal, not private: `mergedRows` is an internal
+    // static (tests pin the merge through it) and a function may
+    // not return a more-private type than its own visibility.
+    enum Row: Identifiable {
         case message(Message)
         case tool(ToolActivityRecord)
         case plan(ActionPlanRecord)
@@ -344,7 +347,7 @@ struct HUDConversationView: View {
                 .overlay(RoundedRectangle(cornerRadius: 10)
                     .strokeBorder(Color.secondary.opacity(0.3)))
                 .focused($composerFocused)
-                .onKeyPress(.return) { press in
+                .onKeyPress(.return, phases: .down) { press in
                     if press.modifiers.contains(.command) {
                         openInMainWindow()
                         return .handled
