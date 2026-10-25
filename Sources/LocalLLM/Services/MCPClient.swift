@@ -35,6 +35,7 @@ enum MCPClientError: LocalizedError {
     case serverStopped
     case notConfigured
     case disabled
+    case requestTooLarge
 
     var errorDescription: String? {
         switch self {
@@ -52,6 +53,8 @@ enum MCPClientError: LocalizedError {
             return "That MCP server isn't in Settings anymore."
         case .disabled:
             return "That MCP server is turned off in Settings → Power tools."
+        case .requestTooLarge:
+            return "That tool call was too large to send to the server — try smaller arguments."
         }
     }
 }
@@ -73,6 +76,33 @@ final class MCPServerConnection: @unchecked Sendable {
     private let process: Process
     private let stdinHandle: FileHandle
     private let lock = NSLock()
+    /// Review finding 17: writes to the server's stdin are
+    /// serialized under THIS lock, never under `lock`. The old
+    /// code held the request-state lock across a blocking pipe
+    /// write, so a server that stopped reading (with arguments
+    /// larger than pipe capacity) blocked the write — and the
+    /// timeout task, which needs the state lock to resume the
+    /// continuation, could never acquire it. The documented
+    /// bounded request could then hang past its deadline, and
+    /// termination (which also needs the state lock) hung behind
+    /// it too. Now a blocked write stalls only its own writer:
+    /// `expireRequest` and `terminate` take the state lock
+    /// freely, and `terminate` closes stdin without touching
+    /// this lock at all.
+    private let writeLock = NSLock()
+    /// Review finding 17: the largest single request line the
+    /// client will attempt to write — a macOS pipe holds 64 KiB,
+    /// so anything larger can block forever against a server that
+    /// stops reading. Oversize requests fail immediately instead
+    /// of being written (see `sendRequest`).
+    static let maxOutboundRequestBytes = 64 * 1024
+
+    /// Review finding 17: the test seam for the size gate — true
+    /// when this encoded request line must be refused rather
+    /// than written to a pipe that may never drain.
+    static func outboundRequestTooLarge(_ data: Data) -> Bool {
+        data.count > maxOutboundRequestBytes
+    }
     private var parser = MCPStreamParser()
     private var nextID = 1
     private var pending: [Int: CheckedContinuation<JSONValue, Error>] = [:]
@@ -252,6 +282,14 @@ final class MCPServerConnection: @unchecked Sendable {
         }()
         let line = MCPJSONRPC.encodeRequest(id: id, method: method,
                                             params: params) + "\n"
+        // Review finding 17: refuse an oversize request BEFORE
+        // any write — a line larger than pipe capacity is exactly
+        // what can block `writeToStdin` against a non-reading
+        // server. This throw happens before the continuation is
+        // registered, so no pending entry is left behind.
+        if Self.outboundRequestTooLarge(Data(line.utf8)) {
+            throw MCPClientError.requestTooLarge
+        }
         let result: JSONValue = try await withCheckedThrowingContinuation { continuation in
             lock.lock()
             if isDead {
@@ -284,17 +322,27 @@ final class MCPServerConnection: @unchecked Sendable {
     }
 
     /// Audit B-55: EVERY write to the server's stdin goes through
-    /// here, serialized under the class lock. Writes used to happen
-    /// from three threads at once — `sendRequest`'s continuation
-    /// executor, `sendNotification`'s caller, and the pipe-callback
-    /// context answering server requests in `receive` — and two
-    /// concurrent writes could interleave, corrupting both JSON
-    /// lines (the symptom was a spurious 30-second timeout). The
-    /// lock is never held across this call by any caller, so taking
-    /// it here cannot deadlock.
+    /// here, serialized — writes used to happen from three threads
+    /// at once (`sendRequest`'s continuation executor,
+    /// `sendNotification`'s caller, and the pipe-callback context
+    /// answering server requests in `receive`), and two concurrent
+    /// writes could interleave, corrupting both JSON lines (the
+    /// symptom was a spurious 30-second timeout).
+    ///
+    /// Review finding 17: the serializing lock is `writeLock`,
+    /// NOT the request-state lock — and no caller holds the state
+    /// lock across this call. A blocked write therefore cannot
+    /// starve `expireRequest` or `terminate`, which need only the
+    /// state lock; and `terminate` closes stdin (which unblocks
+    /// or fails the write) without needing either writer's lock.
+    /// The write itself can still block its own thread against a
+    /// non-reading server — that is what the size gate above and
+    /// the timeout's now-unblocked expiry bound: the waiting
+    /// request still fails at its deadline even if its writer
+    /// thread stays stuck, and termination still proceeds.
     private func writeToStdin(_ data: Data) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
+        writeLock.lock()
+        defer { writeLock.unlock() }
         do {
             try stdinHandle.write(contentsOf: data)
             return true

@@ -86,6 +86,15 @@ final class Message {
     /// the main store file; nil means no images. Only user messages ever
     /// carry images.
     @Attribute(.externalStorage) var attachmentsData: Data?
+    /// Review finding 19: the attachment count, cached as its own
+    /// stored number — independent of the image blob. Set by the
+    /// engine at send time (`storedCount(for:)`), so the context
+    /// meter and planner read this integer instead of copying and
+    /// scanning the whole JSON/base64 blob for every live message
+    /// on every chat-body update (including streaming). A new
+    /// optional field, so existing stores migrate in place; 0
+    /// means "not cached yet" (see `attachmentCount`).
+    var storedAttachmentCount: Int = 0
     /// Phase 4 telemetry, stored as three optional fields so the store
     /// migrates in place (older messages simply have none): which
     /// backend produced this reply (pill label, e.g. "Apple
@@ -154,10 +163,28 @@ final class Message {
     }
 
     /// How many images this message carries, WITHOUT decoding them
-    /// (audit E-03): the count comes from the codec's header-only
-    /// scan of the blob — no image data is validated or copied.
+    /// (audit E-03) and — for messages written since review
+    /// finding 19 — without scanning the blob at all: the count
+    /// cached in `storedAttachmentCount` is the answer. Messages
+    /// written before that field existed backfill it on first
+    /// use (one header-only scan, cached for every later render),
+    /// so the existing cheap-count test still passes and old
+    /// messages keep working. A blob that counts 0 stays
+    /// uncached (0 is the "not cached" sentinel) — only a
+    /// damaged/empty blob can re-scan, and such blobs carry no
+    /// images to count. Image decoding itself (`attachments`,
+    /// used when a bubble actually renders its pictures) is
+    /// unchanged and still happens only where pictures display,
+    /// never on the counting path.
     var attachmentCount: Int {
-        ImageAttachmentCodec.count(in: attachmentsData)
+        if storedAttachmentCount > 0 {
+            return min(storedAttachmentCount,
+                       ImageAttachmentCodec.maxAttachmentsPerMessage)
+        }
+        guard attachmentsData != nil else { return 0 }
+        let counted = ImageAttachmentCodec.count(in: attachmentsData)
+        storedAttachmentCount = counted
+        return counted
     }
 
     /// This message as a detached turn for the context logic.

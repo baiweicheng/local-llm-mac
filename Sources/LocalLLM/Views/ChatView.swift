@@ -416,8 +416,15 @@ struct ChatView: View {
         let all = sortedMessages
         let prefix = min(conversation.summarizedMessageCount, all.count)
         let turns = all.dropFirst(prefix).map { $0.chatTurn }
+        // Review finding 12: the meter counts the seed's transcript
+        // framing too, not just instructions and turns. (Tool schemas
+        // are budgeted in the engine's send plan, where the bound
+        // tool set is known; this view does not know it.)
+        // Review finding 19: `chatTurn` now reads the stored
+        // attachment count — no blob scan per message per render.
         var used = PromptHistory.estimatedContextTokens(
-            instructions: instructions, turns: turns)
+            instructions: instructions, turns: turns,
+            overheadTokens: ContextManager.transcriptFramingTokens)
         if let summary = conversation.contextSummary {
             used += PromptHistory.approximateTokenCount(for: summary)
         }

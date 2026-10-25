@@ -42,6 +42,54 @@ enum ContextManager {
 
     // MARK: - Planning
 
+    /// Review finding 12: tokens for the fixed wording wrapped
+    /// around a rebuilt session's seed ("Summary of the earlier
+    /// part…", "Most recent messages:", speaker labels). Small,
+    /// but the old planner counted none of it — one more part of
+    /// the actual prompt the meter said fit.
+    static let transcriptFramingTokens = 64
+
+    /// Review finding 12: estimated tokens for ONE tool's argument
+    /// schema in the serialized prompt. Framework tools expose the
+    /// full shared 14-field `ToolCallArguments` schema for every
+    /// tool (field names plus their guide descriptions run to
+    /// roughly 880 characters, ~220 tokens at the app's 4-chars-per
+    /// token estimate); MCP tools carry their own JSON schema of
+    /// comparable size. An estimate, like all the app's token math
+    /// — but counting zero schemas per tool, as the old planner
+    /// did, understated a 23-tool session by thousands of tokens.
+    static let toolSchemaTokensPerTool = 220
+
+    /// Review finding 12: allowance for what stored messages cannot
+    /// show — a tool-capable session's retained tool calls and
+    /// results, plus session framing. Only applied when tools are
+    /// actually bound; the engine cannot measure the session's
+    /// native tool history from stored state, so this is a
+    /// reserve, not a measurement, and it is named as one.
+    static let toolSessionAllowanceTokens = 256
+
+    /// Review finding 12: the complete overhead for one planned
+    /// send — everything the actual prompt carries beyond
+    /// instructions, summary, live turns, and the new prompt:
+    /// transcript framing, every bound tool's schema, the
+    /// tool-session allowance, the approval-outcome note, and the
+    /// quick-panel (HUD) prompt prefix, when each is present.
+    /// The engine passes this into `plan(overheadTokens:)`; a
+    /// caller that passes nothing still gets the old
+    /// instructions+summary+turns+prompt math (the default keeps
+    /// existing tests' exact projections intact).
+    static func planningOverheadTokens(toolCount: Int,
+                                       outcomeNote: String?,
+                                       promptPrefix: String?,
+                                       hasTools: Bool) -> Int {
+        var total = transcriptFramingTokens
+        total += toolCount * toolSchemaTokensPerTool
+        if hasTools { total += toolSessionAllowanceTokens }
+        if let outcomeNote { total += PromptHistory.approximateTokenCount(for: outcomeNote) }
+        if let promptPrefix { total += PromptHistory.approximateTokenCount(for: promptPrefix) }
+        return total
+    }
+
     /// Decides whether the live turns still fit, and what to compact if
     /// they don't.
     ///
@@ -54,11 +102,18 @@ enum ContextManager {
     ///   - liveTurns: stored turns NOT yet folded into the summary,
     ///     oldest first, EXCLUDING the message about to be sent.
     ///   - newPrompt: the message about to be sent.
+    ///   - overheadTokens: review finding 12 — the rest of the
+    ///     actual prompt (see `planningOverheadTokens`): tool
+    ///     schemas, retained tool traffic, approval outcome notes,
+    ///     HUD context, transcript framing. Counted in BOTH the
+    ///     fits check and the projection, so a prompt that only
+    ///     fits by ignoring its schemas no longer plans as fitting.
     static func plan(budget: ContextBudget,
                      instructions: String,
                      existingSummary: String?,
                      liveTurns: [ChatTurn],
-                     newPrompt: ChatTurn) -> CompactionPlan {
+                     newPrompt: ChatTurn,
+                     overheadTokens: Int = 0) -> CompactionPlan {
         let instructionsTokens = PromptHistory.approximateTokenCount(for: instructions)
         let summaryTokens = existingSummary.map {
             PromptHistory.approximateTokenCount(for: $0)
@@ -66,7 +121,7 @@ enum ContextManager {
         let promptTokens = tokens(for: newPrompt)
         let turnTokens = liveTurns.map { tokens(for: $0) }
         let totalTokens = instructionsTokens + summaryTokens
-            + turnTokens.reduce(0, +) + promptTokens
+            + turnTokens.reduce(0, +) + promptTokens + overheadTokens
 
         guard totalTokens > budget.promptAllowanceTokens else {
             return CompactionPlan(needsCompaction: false,
@@ -80,6 +135,7 @@ enum ContextManager {
         // least the budget's target (a fresh summary needs space to land).
         let summaryAllowance = max(summaryTokens, budget.summaryTargetTokens)
         let fixedTokens = instructionsTokens + summaryAllowance + promptTokens
+            + overheadTokens
         let recentAllowance = budget.promptAllowanceTokens - fixedTokens
 
         // Pick the longest suffix of whole exchanges that fits alongside
@@ -147,7 +203,7 @@ enum ContextManager {
         let recentTokens = turnTokens.dropFirst(toSummarize.count)
             .reduce(0, +)
         let projected = instructionsTokens + summaryAllowance
-            + recentTokens + promptTokens
+            + recentTokens + promptTokens + overheadTokens
         return CompactionPlan(
             needsCompaction: !toSummarize.isEmpty,
             turnsToSummarize: toSummarize,
@@ -223,8 +279,21 @@ enum ContextManager {
     /// turns are still folded away, but the "summary" only notes the
     /// topics they covered. Lossy, honest about it, and it keeps the
     /// conversation going instead of failing the send.
+    ///
+    /// Review finding 13: the result is BOUNDED by `maxTokens`.
+    /// The old form appended each new note to the ENTIRE previous
+    /// summary with no limit, so a summary that kept failing grew
+    /// until it consumed the summarizer's own allowance and made
+    /// every later summarization fail too. Now, when the merged
+    /// text would exceed the cap, the older part of the existing
+    /// summary is trimmed (from the front — the note about the
+    /// just-folded turns is always kept whole) and the trim is
+    /// marked, so the summary can never grow past the cap through
+    /// this path. The default matches the largest summary target
+    /// any budget allows; the engine passes its backend's target.
     static func mechanicalFallbackSummary(existing: String?,
-                                          droppedTurns: [ChatTurn]) -> String {
+                                          droppedTurns: [ChatTurn],
+                                          maxTokens: Int = 2_000) -> String {
         let topics = droppedTurns
             .filter { $0.role == .user }
             .prefix(5)
@@ -236,7 +305,45 @@ enum ContextManager {
             note = "Some earlier messages were trimmed to make room; "
                 + "they covered: " + topics.joined(separator: ", ") + "."
         }
-        return mergedSummary(existing: existing, new: note)
+        let merged = mergedSummary(existing: existing, new: note)
+        guard PromptHistory.approximateTokenCount(for: merged) > maxTokens,
+              let existing, !existing.isEmpty else { return merged }
+        // Room for the existing part, in characters, after the note,
+        // the separator, and the trim marker: the note is never cut.
+        let marker = "[earlier summary trimmed to fit] "
+        let allowedChars = max(0, maxTokens * 4 - note.count - 1 - marker.count)
+        guard allowedChars > 0 else { return note }
+        var kept = String(existing.suffix(allowedChars))
+        // Don't start mid-word: drop the partial first word, unless
+        // that would leave nothing.
+        if kept.count < existing.count,
+           let firstSpace = kept.firstIndex(of: " ") {
+            let trimmed = String(kept[kept.index(after: firstSpace)...])
+            if !trimmed.isEmpty { kept = trimmed }
+        }
+        return marker + kept + "\n" + note
+    }
+
+    /// Review finding 13: a HARD cap on a summary's size, applied
+    /// to what the summarizer actually returned — not just the
+    /// "at most about N words" instruction in `summarizerInput`,
+    /// which a model may exceed. The engine caps every summary
+    /// (model-produced or fallback) to its backend's target before
+    /// storing it, so a too-long summary cannot eat the next pass's
+    /// allowance. The cut is at a word boundary and marked, so the
+    /// truncation is visible in the stored summary rather than
+    /// silently mid-sentence.
+    static func cappedSummary(_ text: String, maxTokens: Int) -> String {
+        guard PromptHistory.approximateTokenCount(for: text) > maxTokens else {
+            return text
+        }
+        let marker = "… [summary trimmed to fit]"
+        let allowedChars = max(0, maxTokens * 4 - marker.count)
+        var kept = String(text.prefix(allowedChars))
+        if let lastSpace = kept.lastIndex(of: " ") {
+            kept = String(kept[..<lastSpace])
+        }
+        return kept + marker
     }
 
     // MARK: - Seeding a rebuilt session

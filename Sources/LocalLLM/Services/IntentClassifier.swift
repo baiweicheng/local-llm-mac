@@ -72,9 +72,12 @@ enum IntentClassifier {
         // `LanguageModelSession.respond` aborts promptly when its
         // task is cancelled is framework behaviour this code can't
         // control — which is exactly why the loser is not awaited.
-        // The abandoned call runs on a throwaway session and
-        // touches no shared state, so letting it finish (or fail)
-        // in the background is harmless; its verdict is discarded.
+        // Review finding 20: the loser IS cancelled now (and a
+        // cancelled parent send cancels the classification too),
+        // so cooperative model work stops instead of running on
+        // after the chat starts; only a framework call that ignores
+        // cancellation can outlive the race, on a throwaway session
+        // that touches no shared state, and its verdict is discarded.
         return await TimeoutRace.run(timeoutSeconds: timeoutSeconds) {
             await runClassification(prompt: prompt)
         } ?? nil
@@ -107,54 +110,135 @@ enum IntentClassifier {
 /// (a task group's implicit await-all was the B-50 bug). Pure
 /// Swift concurrency with no framework dependency, so the race
 /// semantics themselves are unit-testable with async sleeps.
+///
+/// Review finding 20: the B-50 shape kept NO handles and cancelled
+/// NEITHER task, so a slow classification kept using the on-device
+/// model after the chat had already started (and a stopped send
+/// did not stop it). This shape retains both tasks and cancels
+/// the loser on every exit path: timer wins → the operation is
+/// cancelled; operation wins → the timer is cancelled; the
+/// parent is cancelled → both are cancelled and the race returns
+/// nil. The loser is still NOT awaited — cancelling cooperative
+/// work stops it promptly, but waiting for an uncooperative loser
+/// (a framework call that ignores cancellation) would reintroduce
+/// exactly the unbounded wait B-50 removed, so the race returns
+/// at its deadline regardless and the loser's verdict is discarded.
 enum TimeoutRace {
 
     /// Runs `operation`, returning its value — or nil when
-    /// `timeoutSeconds` elapse first. A nil result from the
-    /// operation itself is indistinguishable from a timeout,
-    /// which is precisely the fallback semantics the classifier
-    /// wants ("no verdict in time" and "no verdict" both fall
-    /// back the same way).
+    /// `timeoutSeconds` elapse first, or when the awaiting task is
+    /// cancelled. A nil result from the operation itself is
+    /// indistinguishable from a timeout, which is precisely the
+    /// fallback semantics the classifier wants ("no verdict in
+    /// time" and "no verdict" both fall back the same way).
     static func run<T: Sendable>(
         timeoutSeconds: TimeInterval,
         operation: @escaping @Sendable () async -> T?
     ) async -> T? {
-        let gate = ResumeGate<T>()
-        return await withCheckedContinuation { continuation in
-            gate.attach(continuation)
-            Task.detached {
-                let value = await operation()
-                gate.resume(with: value)
+        let gate = RaceGate<T>()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                gate.attach(continuation)
+                gate.operationTask = Task.detached {
+                    let value = await operation()
+                    gate.win(with: value)
+                }
+                gate.timerTask = Task.detached {
+                    try? await Task.sleep(for: .seconds(timeoutSeconds))
+                    gate.win(with: nil)
+                }
+                gate.cancelIfParentCancelled()
             }
-            Task.detached {
-                try? await Task.sleep(for: .seconds(timeoutSeconds))
-                gate.resume(with: nil)
-            }
+        } onCancel: {
+            gate.cancelAll()
         }
     }
 
-    /// Exactly-once resumption across the two racing tasks.
-    private final class ResumeGate<T>: @unchecked Sendable {
+    /// Exactly-once resumption across the two racing tasks, plus
+    /// the retained task handles finding 20 requires. Cancellation
+    /// is cooperative and never kills a task outright, so cancelling
+    /// a task that already finished (the winner, or a timer that
+    /// already fired) is a harmless no-op — `win` therefore cancels
+    /// BOTH handles rather than trying to identify the loser.
+    private final class RaceGate<T>: @unchecked Sendable {
         private let lock = NSLock()
         private var continuation: CheckedContinuation<T?, Never>?
-        private var resumed = false
+        private var finished = false
+        /// Set before `attach` returns; `cancelAll` from the parent
+        /// may run before either task is stored, so it must not
+        /// depend on the handles already existing.
+        private var parentCancelled = false
+        var operationTask: Task<Void, Never>?
+        var timerTask: Task<Void, Never>?
 
         func attach(_ continuation: CheckedContinuation<T?, Never>) {
             lock.lock()
+            // The parent was already cancelled while this race was
+            // being set up: resume immediately instead of parking a
+            // continuation nothing will ever resume, and mark the
+            // race finished so a later `win` cannot resume it again
+            // (a double resume traps a checked continuation).
+            // The tasks themselves are cancelled by
+            // `cancelIfParentCancelled`, called once they exist.
+            if parentCancelled {
+                finished = true
+                lock.unlock()
+                continuation.resume(returning: nil)
+                return
+            }
             self.continuation = continuation
             lock.unlock()
         }
 
-        func resume(with value: T?) {
+        /// Called once both task handles exist: if the parent was
+        /// already cancelled (so `attach` resumed immediately),
+        /// cancel the just-created tasks too — otherwise they
+        /// would run uncancelled behind an already-returned race.
+        func cancelIfParentCancelled() {
             lock.lock()
-            guard !resumed, let continuation else {
+            guard parentCancelled else {
                 lock.unlock()
                 return
             }
-            resumed = true
-            self.continuation = nil
+            let operationTask = self.operationTask
+            let timerTask = self.timerTask
             lock.unlock()
+            operationTask?.cancel()
+            timerTask?.cancel()
+        }
+
+        func win(with value: T?) {
+            lock.lock()
+            guard !finished, let continuation else {
+                lock.unlock()
+                return
+            }
+            finished = true
+            self.continuation = nil
+            let operationTask = self.operationTask
+            let timerTask = self.timerTask
+            lock.unlock()
+            operationTask?.cancel()
+            timerTask?.cancel()
             continuation.resume(returning: value)
+        }
+
+        func cancelAll() {
+            lock.lock()
+            guard !finished else {
+                lock.unlock()
+                return
+            }
+            finished = true
+            parentCancelled = true
+            let continuation = self.continuation
+            self.continuation = nil
+            let operationTask = self.operationTask
+            let timerTask = self.timerTask
+            lock.unlock()
+            operationTask?.cancel()
+            timerTask?.cancel()
+            continuation?.resume(returning: nil)
         }
     }
 }

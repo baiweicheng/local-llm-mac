@@ -48,8 +48,13 @@ enum PromptHistory {
 
     /// Estimated tokens for a whole conversation: instructions plus
     /// turns, counting a flat allowance for each attached image.
-    static func estimatedContextTokens(instructions: String, turns: [ChatTurn]) -> Int {
-        var total = approximateTokenCount(for: instructions)
+    /// Review finding 12: `overheadTokens` is the rest of the actual
+    /// prompt (see `ContextManager.planningOverheadTokens`) — the
+    /// context meter passes transcript framing, so the meter no
+    /// longer reports a number that ignores part of the prompt.
+    static func estimatedContextTokens(instructions: String, turns: [ChatTurn],
+                                       overheadTokens: Int = 0) -> Int {
+        var total = approximateTokenCount(for: instructions) + overheadTokens
         for turn in turns {
             total += approximateTokenCount(for: turn.text)
             total += turn.attachmentCount * ImageAttachmentCodec.estimatedTokensPerImage

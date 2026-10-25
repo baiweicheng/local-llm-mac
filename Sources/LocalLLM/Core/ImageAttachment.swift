@@ -50,6 +50,16 @@ enum ImageAttachmentCodec {
         !data.isEmpty && data.count <= maxStoredBytesPerImage
     }
 
+    /// Review finding 19: how many images an attachment list will
+    /// actually store — the same validity filter and cap `encode`
+    /// applies, without encoding anything. The engine stores this
+    /// number on the message at send time, so counting a message
+    /// later never needs to touch the blob at all.
+    static func storedCount(for attachments: [ImageAttachment]) -> Int {
+        min(maxAttachmentsPerMessage,
+            attachments.filter { isValid(data: $0.data) }.count)
+    }
+
     /// Encodes a message's images into the single stored blob. Invalid
     /// images are dropped and the count is capped — encoding never fails.
     static func encode(_ attachments: [ImageAttachment]) -> Data? {

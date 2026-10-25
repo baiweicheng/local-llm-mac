@@ -1019,6 +1019,12 @@ final class ChatEngine {
                                   conversation: conversation)
         if !attachments.isEmpty {
             userMessage.attachmentsData = ImageAttachmentCodec.encode(attachments)
+            // Review finding 19: cache the count alongside the blob
+            // at the one moment the attachments are known — the
+            // context meter and planner then read this number
+            // instead of scanning the blob on every render/send.
+            userMessage.storedAttachmentCount =
+                ImageAttachmentCodec.storedCount(for: attachments)
         }
         context.insert(userMessage)
         if conversation.title == "New Chat" {
@@ -1165,6 +1171,39 @@ final class ChatEngine {
             return Array(all.dropFirst(prefix)).map { $0.chatTurn }
         }()
 
+        // Review finding 12: budget the COMPLETE serialized prompt,
+        // not just instructions + summary + turns + new message.
+        // The tool count is the static catalog for this snapshot's
+        // enabled sources plus the MCP tools from the last discovery
+        // (their "slug:tool;…" signature lists one entry per tool);
+        // the outcome note and HUD prefix are the exact strings
+        // that will ride at the head of this prompt. This is an
+        // ESTIMATE snapshot for planning only — session identity
+        // still comes from the post-discovery snapshot below.
+        // The MLX reply cap itself was already fixed in batch 1
+        // (the MLX budget reserves the full 4,096-token reply cap),
+        // so `promptAllowanceTokens` here already budgets the
+        // actual generation limit.
+        let planningAvailability = toolAvailabilityProvider()
+        let planningToolCount: Int = {
+            guard backend.supportsTools, planningAvailability.hasTools else { return 0 }
+            let catalog = ToolCatalog.descriptors(
+                enabledSources: planningAvailability.enabledSources,
+                fileWritingEnabled: planningAvailability.fileWritingEnabled,
+                powerToolsEnabled: planningAvailability.effectivePowerToolsEnabled,
+                localOnly: planningAvailability.localOnly).count
+            let mcp = planningAvailability.effectivePowerToolsEnabled
+                ? planningAvailability.mcpToolsSignature
+                    .split(separator: ";").filter { !$0.isEmpty }.count
+                : 0
+            return catalog + mcp
+        }()
+        let planningOverhead = ContextManager.planningOverheadTokens(
+            toolCount: planningToolCount,
+            outcomeNote: pendingOutcomeNotes[conversationID],
+            promptPrefix: pendingPromptPrefixes[conversationID],
+            hasTools: backend.supportsTools && planningAvailability.hasTools)
+
         // Compaction passes — always before streaming, never mid-stream.
         // One pass summarizes a bounded chunk; a very long history can
         // need several, so loop (with a sane cap) until the plan fits.
@@ -1172,7 +1211,8 @@ final class ChatEngine {
                                        instructions: instructions,
                                        existingSummary: conversation.contextSummary,
                                        liveTurns: liveTurns,
-                                       newPrompt: newPromptTurn)
+                                       newPrompt: newPromptTurn,
+                                       overheadTokens: planningOverhead)
         var passes = 0
         while plan.needsCompaction, passes < 4 {
             passes += 1
@@ -1201,7 +1241,30 @@ final class ChatEngine {
                                        instructions: instructions,
                                        existingSummary: conversation.contextSummary,
                                        liveTurns: liveTurns,
-                                       newPrompt: newPromptTurn)
+                                       newPrompt: newPromptTurn,
+                                       overheadTokens: planningOverhead)
+        }
+
+        // Review finding 13: the loop above stops after four passes
+        // and the old code then proceeded WITHOUT acting on
+        // `overflowWarning` — a long chat could keep failing rather
+        // than self-managing, while nothing told the user. An
+        // unresolved overflow is now explicit: a visible banner
+        // says the conversation still doesn't fit even after
+        // summarizing, and that the send goes ahead best-effort
+        // (the model may not see the oldest context, or may report
+        // its own overflow error). This is a notice, not a block:
+        // refusing the send would strand a chat that can still
+        // answer from its recent turns.
+        if plan.needsCompaction || plan.overflowWarning {
+            let overflowNote = "This conversation is still too long "
+                + "for the model's memory even after summarizing, "
+                + "so this reply goes ahead as a best effort — the "
+                + "model may not see the oldest context."
+            infoMessages[conversationID] =
+                [infoMessages[conversationID], overflowNote]
+                    .compactMap { $0 }
+                    .joined(separator: " ")
         }
 
         // Session selection and seeding. A live session is reused only
@@ -1443,10 +1506,18 @@ final class ChatEngine {
                 customTerms: routingInputs.customRedactionTerms)
             promptText = scrubbed.text
             redactions += scrubbed.replacementCount
-            infoMessages[conversationID] = RemoteDestination.noticeText(
-                redactions: redactions,
-                backendDisplayName: backend.displayName,
-                selection: selection)
+            // Review finding 13: APPEND, don't overwrite — the
+            // post-compaction overflow note (set above) must survive
+            // a remote send's privacy notice, exactly as the image
+            // notice below appends to it.
+            infoMessages[conversationID] =
+                [infoMessages[conversationID],
+                 RemoteDestination.noticeText(
+                    redactions: redactions,
+                    backendDisplayName: backend.displayName,
+                    selection: selection)]
+                    .compactMap { $0 }
+                    .joined(separator: " ")
         }
 
         // Streaming. Images ride along as temporary files (framework
@@ -1606,12 +1677,19 @@ final class ChatEngine {
             let response = try await session.respond(to: input)
             let text = response.content
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            if !text.isEmpty { return text }
+            // Review finding 13: enforce an ACHIEVABLE summary
+            // output limit — the "at most about N words" instruction
+            // alone is a request, not a guarantee, and an over-long
+            // summary eats the next pass's allowance.
+            if !text.isEmpty {
+                return ContextManager.cappedSummary(text, maxTokens: targetTokens)
+            }
         } catch {
             // Fall through to the mechanical summary.
         }
         return ContextManager.mechanicalFallbackSummary(
-            existing: existingSummary, droppedTurns: turns)
+            existing: existingSummary, droppedTurns: turns,
+            maxTokens: targetTokens)
     }
 
     private func retireSession(_ conversationID: UUID) {
