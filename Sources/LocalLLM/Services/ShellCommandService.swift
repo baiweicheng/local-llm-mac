@@ -16,9 +16,11 @@ import Foundation
 ///    approved command does the same thing every time and a shell
 ///    profile can't add side effects the user never saw.
 ///  - A hard 30-second limit (see `ShellCommandPolicy`). Past it
-///    the process is terminated (and force-killed if it ignores
-///    that), and the item is recorded as timed out — not as a
-///    success.
+///    the process tree is terminated (descendants first, then the
+///    shell — and force-killed if anything ignores that), and the
+///    item is recorded as timed out — not as a success. Cancelling
+///    a run stops the same tree, with the same escalation; the run
+///    only completes once the tree is dead.
 ///  - stdout and stderr share one pipe, so the output reads in the
 ///    order it was printed. Retention is capped; the model sees
 ///    the tail (see `ShellOutput`).
@@ -57,6 +59,115 @@ enum ShellCommandService {
                                   outcome: .failed(note),
                                   resultNote: note,
                                   modelDetail: detail.isEmpty ? nil : detail)
+    }
+}
+
+/// Review finding 9: the process-tree boundary for one running
+/// command, as a pure/testable layer over `ps` output. Foundation's
+/// `Process` offers no setpgid hook, so a shell cannot be made a
+/// process-group leader from here — the equivalent boundary is
+/// enumeration by parent PID: snapshot the shell's descendants
+/// WHILE the shell is still alive (timeout/cancellation), signal
+/// them deepest-first, then the shell, then SIGKILL the survivors.
+/// (A shell that exits normally reparents its children to PID 1
+/// before any post-exit snapshot can attribute them, so a
+/// normally-exited shell's detached children are NOT contained by
+/// this change — full containment for that case needs a real
+/// process group, e.g. a posix_spawn-based launcher, which is
+/// beyond this fix. The contained paths are timeout and
+/// cancellation, where the shell is still alive to enumerate from.)
+enum ShellProcessTree {
+
+    /// Parses `ps -ax -o pid=,ppid=` output (one "pid ppid" pair
+    /// per line, headers suppressed) into a child → parent map.
+    /// Malformed lines are skipped, never fatal.
+    static func parentMap(from psOutput: String) -> [Int32: Int32] {
+        var map: [Int32: Int32] = [:]
+        for line in psOutput.split(separator: "\n") {
+            let fields = line.split(whereSeparator: \.isWhitespace)
+            guard fields.count >= 2,
+                  let pid = Int32(fields[0]),
+                  let ppid = Int32(fields[1]) else { continue }
+            map[pid] = ppid
+        }
+        return map
+    }
+
+    /// Every descendant of `root` (excluding `root` itself),
+    /// parents before children, cycle-safe: a PID already visited
+    /// is never enqueued again, so a corrupt map can't loop.
+    static func descendantPIDs(of root: Int32,
+                               parentByPID: [Int32: Int32]) -> [Int32] {
+        var children: [Int32: [Int32]] = [:]
+        for (pid, ppid) in parentByPID {
+            children[ppid, default: []].append(pid)
+        }
+        var result: [Int32] = []
+        var visited: Set<Int32> = [root]
+        var queue: [Int32] = [root]
+        while let current = queue.first {
+            queue.removeFirst()
+            for child in children[current] ?? [] where !visited.contains(child) {
+                visited.insert(child)
+                result.append(child)
+                queue.append(child)
+            }
+        }
+        return result
+    }
+
+    /// The live parent map, via `/bin/ps`. Empty on any failure —
+    /// callers then still signal the root itself, just without a
+    /// known descendant list.
+    static func liveParentMap() -> [Int32: Int32] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-ax", "-o", "pid=,ppid="]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            return [:]
+        }
+        process.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let output = String(data: data, encoding: .utf8) else {
+            return [:]
+        }
+        return parentMap(from: output)
+    }
+
+    /// Terminates a tree: SIGTERM to descendants (deepest first,
+    /// so no child is orphaned before its own signal) then to the
+    /// root, a grace period, then SIGKILL to anything still alive.
+    /// Always returns; a dead root or an unreadable `ps` output
+    /// just narrows the signal set, never throws.
+    static func terminateTree(rootPID: Int32,
+                              graceSeconds: Double = 1) async {
+        let descendants = descendantPIDs(of: rootPID,
+                                         parentByPID: liveParentMap())
+        for pid in descendants.reversed() where isAlive(pid) {
+            kill(pid, SIGTERM)
+        }
+        if isAlive(rootPID) {
+            kill(rootPID, SIGTERM)
+        }
+        if graceSeconds > 0 {
+            try? await Task.sleep(
+                for: .seconds(graceSeconds))
+        }
+        for pid in descendants.reversed() where isAlive(pid) {
+            kill(pid, SIGKILL)
+        }
+        if isAlive(rootPID) {
+            kill(rootPID, SIGKILL)
+        }
+    }
+
+    private static func isAlive(_ pid: Int32) -> Bool {
+        kill(pid, 0) == 0
     }
 }
 
@@ -122,6 +233,13 @@ private final class ShellRunState: @unchecked Sendable {
     private var finalOutcome: Outcome?
     private var timedOut = false
     private var cancelled = false
+    /// Review finding 9: the tree cleanup (timeout/cancellation)
+    /// has finished. A terminated run completes only once the
+    /// process has exited AND its tree is cleaned up — completing
+    /// on exit alone would report "stopped" while descendants were
+    /// still alive. Normal runs ignore this flag (see
+    /// `finishIfComplete`).
+    private var cleanupDone = false
     private var processExitCode: Int32?
     private var processHasExited = false
     private var pipeReachedEOF = false
@@ -178,30 +296,56 @@ private final class ShellRunState: @unchecked Sendable {
         finishIfComplete()
     }
 
+    /// Review finding 9: the tree cleanup finished (timeout or
+    /// cancellation path). Completes a terminated run whose
+    /// process has already exited; otherwise the exit handler
+    /// completes it when the process dies.
+    func noteCleanupDone() {
+        lock.lock()
+        cleanupDone = true
+        lock.unlock()
+        finishIfComplete()
+    }
+
     /// The drain-grace fallback (audit B-49): the process exited
     /// but EOF never arrived within the grace period — finish with
-    /// whatever output was captured rather than hanging.
+    /// whatever output was captured rather than hanging. For a
+    /// terminated run the grace does NOT bypass cleanup: finishing
+    /// here before the tree is killed would report "stopped" while
+    /// descendants were still alive (the cleanup task completes
+    /// the run when it lands, so this is a delay, not a hang).
     func finishAfterDrainGrace() {
         lock.lock()
         let exited = processHasExited
+        let terminated = timedOut || cancelled
+        let cleaned = cleanupDone
         lock.unlock()
-        guard exited else { return }
+        guard exited, !terminated || cleaned else { return }
         complete()
     }
 
-    /// The awaiting task was cancelled (audit B-54): resume the
-    /// waiter with a cancelled outcome (the runner's cancellation
-    /// handler, invoked alongside, terminates the process).
+    /// The awaiting task was cancelled (audit B-54): mark it and
+    /// let the finish condition do the rest — the runner's
+    /// cancellation handler, invoked alongside, kills the process
+    /// tree and then calls `noteCleanupDone`, which is what
+    /// actually resumes the waiter. Completing here, before the
+    /// tree is dead, was the old gap (cancellation, unlike the
+    /// timeout path, had no SIGKILL escalation at all).
     func cancel() {
         lock.lock()
         cancelled = true
         lock.unlock()
-        complete()
+        finishIfComplete()
     }
 
     private func finishIfComplete() {
         lock.lock()
-        let ready = processHasExited && pipeReachedEOF
+        // Normal runs: exit AND pipe EOF (audit B-49). Terminated
+        // runs: exit AND tree cleanup — EOF is not required, since
+        // a killed descendant was the thing holding the pipe open
+        // and its death is what cleanup guarantees.
+        let ready = processHasExited
+            && ((timedOut || cancelled) ? cleanupDone : pipeReachedEOF)
         lock.unlock()
         if ready { complete() }
     }
@@ -306,28 +450,35 @@ private enum ShellRunner {
                     state.finishAfterDrainGrace()
                 }
         }
-        // Audit B-54: if the awaiting task is cancelled, the state
-        // calls this to stop the process (the waiter itself is
-        // resumed by the state's cancellation path).
+        // Audit B-54, review finding 9: if the awaiting task is
+        // cancelled, the state calls this to stop the process
+        // TREE — descendants first, then the shell, with SIGKILL
+        // escalation for anything that ignores SIGTERM (the old
+        // handler only SIGTERMed the shell PID, so a stubborn
+        // process — and every background child — survived a
+        // cancellation). The waiter resumes only when the cleanup
+        // task reports back via `noteCleanupDone`.
         state.cancellationHandler = {
-            if process.isRunning {
-                process.terminate()
+            Task {
+                await ShellProcessTree.terminateTree(
+                    rootPID: process.processIdentifier)
+                state.noteCleanupDone()
             }
         }
 
-        // The timeout: terminate first (SIGTERM — well-behaved
-        // commands exit), then force-kill a second later if the
-        // process is still alive.
+        // The timeout: terminate the whole tree first (SIGTERM —
+        // well-behaved commands exit), then force-kill survivors a
+        // second later. The waiter completes only after the tree
+        // cleanup reports back, so "timed out" never means
+        // "descendants still running".
         let timeoutTask = Task {
             try? await Task.sleep(
                 for: .seconds(ShellCommandPolicy.timeoutSeconds))
             guard !Task.isCancelled, process.isRunning else { return }
             state.markTimedOut()
-            process.terminate()
-            try? await Task.sleep(for: .seconds(1))
-            if process.isRunning {
-                kill(process.processIdentifier, SIGKILL)
-            }
+            await ShellProcessTree.terminateTree(
+                rootPID: process.processIdentifier)
+            state.noteCleanupDone()
         }
         defer { timeoutTask.cancel() }
 

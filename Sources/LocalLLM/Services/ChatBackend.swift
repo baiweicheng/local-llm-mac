@@ -13,6 +13,21 @@ struct ChatReplyRequest: Sendable {
     // engine's `imageURLs:` argument at the call site was rejected
     // as an extra argument. `var` keeps the default AND the argument.
     var imageURLs: [URL] = []
+    /// Review finding 6: the CURRENT custom redaction terms for
+    /// this send, plus whether the destination is remote. HTTP
+    /// sessions use them to scrub their COMPLETE outgoing payload
+    /// (instructions + saved history + new message) immediately
+    /// before transport — the engine's prompt scrub alone can't
+    /// reach a reused session's cached assistant turns, and terms
+    /// added after the session was created must still apply. Local
+    /// destinations leave both at their defaults (no scrub), so a
+    /// localhost server keeps receiving text exactly as written.
+    /// Framework sessions ignore both fields: their prompt text
+    /// arrives already scrubbed by the engine, and their history
+    /// never leaves this Mac (on-device) or is outside this app's
+    /// transport to intercept (PCC).
+    var redactionTerms: [String] = []
+    var scrubOutgoingPayload: Bool = false
 }
 
 /// A live conversation session against one backend. Implementations

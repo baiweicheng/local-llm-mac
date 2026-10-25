@@ -3,6 +3,44 @@ import FoundationModels
 import Observation
 import SwiftData
 
+/// Review finding 7: the execution-time grant gate for an approved
+/// plan item, pure so it is unit-testable. The engine re-reads the
+/// CURRENT tool availability before EVERY item (not once per
+/// approval — a settings change mid-approval must not bless the
+/// remaining items), and this gate turns that snapshot into a
+/// refusal before anything runs: power items under the Local Only
+/// lock or with the master switch off, and file-change items with
+/// file writing off. Nil means the item may proceed to the usual
+/// pre-check and executor. (Model tool calls revalidate the same
+/// way inside `ToolRuntime.execute`, against the runtime's — now
+/// post-discovery — snapshot; a later settings change retires the
+/// session through its signature.)
+enum PlanExecutionGate {
+    static func refusal(for action: PlannedAction,
+                        localOnly: Bool,
+                        powerToolsEnabled: Bool,
+                        fileWritingEnabled: Bool) -> String? {
+        switch action.kind {
+        case .runCommand, .mcpCall:
+            if localOnly {
+                return "Not run — Local Only is on, so commands "
+                    + "and server calls are paused while the lock is on."
+            }
+            if !powerToolsEnabled {
+                return "Not run — power tools are turned off, so "
+                    + "commands and server calls are paused."
+            }
+            return nil
+        default:
+            if !fileWritingEnabled {
+                return "Not run — file changes are turned off, so "
+                    + "this change is paused."
+            }
+            return nil
+        }
+    }
+}
+
 /// Runs conversations against the model backend each chat has picked.
 ///
 /// Phase 3 shape: the engine no longer talks to the on-device model
@@ -419,9 +457,6 @@ final class ChatEngine {
         let excluded = excludedPlanItems[conversationID] ?? []
         excludedPlanItems[conversationID] = nil
         planBusyIDs.insert(conversationID)
-        let availability = toolAvailabilityProvider()
-        let roots = availability.folderRootPaths
-        let localOnly = availability.localOnly
         let mcpExecutor = mcpExecutorProvider
         let planKey = UUID()
         // Audit B-52: the execution task is STORED per conversation
@@ -441,6 +476,14 @@ final class ChatEngine {
                         action: action, outcome: .declined,
                         resultNote: "Not run — it was left unchecked when the list was approved."))
                 } else {
+                    // Review finding 7: re-read the CURRENT
+                    // availability before EVERY item, not once per
+                    // approval — the loop awaits each item, so a
+                    // folder unshared, the lock flipped, or a
+                    // switch turned off mid-approval must reach the
+                    // remaining items through the gate, not through
+                    // a snapshot taken when Approve was pressed.
+                    let currentAvailability = toolAvailabilityProvider()
                     // Audit E-90: `executePlanItem` is `nonisolated`
                     // (see its declaration), so this await runs the
                     // item's blocking disk/image work OFF the main
@@ -448,9 +491,11 @@ final class ChatEngine {
                     // to freeze the UI for its duration. Only the
                     // record-keeping below is on the main actor.
                     executed.append(await Self.executePlanItem(
-                        action, roots: roots,
+                        action, roots: currentAvailability.folderRootPaths,
                         backupDirectory: backupDirectory,
-                        localOnly: localOnly,
+                        localOnly: currentAvailability.localOnly,
+                        powerToolsEnabled: currentAvailability.effectivePowerToolsEnabled,
+                        fileWritingEnabled: currentAvailability.fileWritingEnabled,
                         mcpExecutor: mcpExecutor))
                 }
             }
@@ -614,16 +659,19 @@ final class ChatEngine {
     nonisolated private static func executePlanItem(
         _ action: PlannedAction, roots: [String], backupDirectory: URL,
         localOnly: Bool = false,
+        powerToolsEnabled: Bool = true,
+        fileWritingEnabled: Bool = true,
         mcpExecutor: (PlannedAction) async -> ExecutedActionItem?
     ) async -> ExecutedActionItem {
-        // Audit S-06: under the Local Only lock, power items never
-        // run — a command or server call can itself reach the
-        // network, whatever model proposed it and whenever the lock
-        // was turned on.
-        if localOnly,
-           action.kind == .runCommand || action.kind == .mcpCall {
-            let refusal = "Not run — Local Only is on, so commands "
-                + "and server calls are paused while the lock is on."
+        // Review finding 7: the execution-time grant gate runs
+        // FIRST — before the pre-check and before any executor.
+        // Audit S-06's Local Only refusal for power items is one
+        // of its cases; the gate adds the master-switch-off and
+        // file-writing-off refusals alongside it.
+        if let refusal = PlanExecutionGate.refusal(
+            for: action, localOnly: localOnly,
+            powerToolsEnabled: powerToolsEnabled,
+            fileWritingEnabled: fileWritingEnabled) {
             return ExecutedActionItem(action: action,
                                       outcome: .failed(refusal),
                                       resultNote: refusal)
@@ -1140,14 +1188,32 @@ final class ChatEngine {
         let toolAvailability = toolAvailabilityProvider()
         // Audit E-08: this value is only the PRE-discovery
         // signature, used for the reuse check. When a session is
-        // actually BUILT below, the stored signature is recomputed
-        // after MCP discovery returns (see the build branch) — the
-        // first discovery used to poison the stored signature, so
-        // the following send always paid a spurious full rebuild +
-        // reseed even though nothing had changed.
+        // actually BUILT below, the runtime AND the stored
+        // signature both come from the SAME post-discovery
+        // snapshot (review finding 7) — the old code built the
+        // runtime from this pre-discovery snapshot and then
+        // recorded a freshly recomputed signature, so a source or
+        // folder disabled during discovery stayed granted in the
+        // runtime while the stored signature described the new
+        // restricted settings, and the next send re-blessed the
+        // stale runtime. (The first discovery used to poison the
+        // stored signature the other way, so the following send
+        // always paid a spurious full rebuild + reseed even though
+        // nothing had changed; the single-snapshot rule fixes both
+        // directions.)
+        // Review finding 6, defense in depth: a tool-less backend's
+        // signature is no longer a constant "none" — for a remote
+        // destination it carries the redaction-terms hash, so
+        // adding a term retires the session like any other
+        // settings change. (The transport scrub itself no longer
+        // depends on retirement: sessions scrub each send's
+        // payload with the current terms.)
         var toolsSignature = backend.supportsTools
             ? toolAvailability.signature
-            : "none"
+            : (isRemoteDestination
+                ? "none|terms:" + RedactionTermsHash.value(
+                    for: routingInputs.customRedactionTerms)
+                : "none")
 
         let summaryKey = conversation.contextSummary ?? ""
         let existing = liveSessions[conversationID]
@@ -1188,22 +1254,31 @@ final class ChatEngine {
                 let mcpTools = toolAvailability.effectivePowerToolsEnabled
                     ? await mcpToolsProvider()
                     : []
+                // Review finding 7: MCP discovery is a suspension
+                // window — settings may have changed while it ran.
+                // The runtime is therefore built from the
+                // POST-discovery snapshot captured HERE, once, and
+                // the stored signature below is that same
+                // snapshot's signature — never the pre-discovery
+                // snapshot above, and never a second provider call
+                // that could observe yet another settings state.
+                // (If every grant vanished during discovery, the
+                // runtime is built empty and the backend treats it
+                // as no tools; the signature still matches it, so
+                // the next send rebuilds cleanly instead of
+                // reusing a stale grant.)
+                let postDiscoveryAvailability = toolAvailabilityProvider()
                 let runtime = ToolRuntime(
-                    configuration: ToolRuntime.Configuration(
+                    configuration: ToolRuntime.Configuration.fromPostDiscovery(
+                        availability: postDiscoveryAvailability,
                         conversationID: conversationID,
-                        enabledSources: toolAvailability.enabledSources,
-                        folderRootPaths: toolAvailability.folderRootPaths,
+                        mcpTools: mcpTools,
                         // Phase 8: a tool host in the cloud (today
                         // that means PCC) gets its results scrubbed
                         // by the runtime's choke point; a local host
                         // keeps them raw. Tool-capable + remote is
                         // exactly that one case.
                         redactResults: isRemoteDestination,
-                        redactionTerms: routingInputs.customRedactionTerms,
-                        fileWritingEnabled: toolAvailability.fileWritingEnabled,
-                        powerToolsEnabled: toolAvailability.effectivePowerToolsEnabled,
-                        localOnly: toolAvailability.localOnly,
-                        mcpTools: mcpTools,
                         proposalSink: Self.proposalSink),
                     // Audit B-43: the sink carries THIS send's
                     // container, so its events are written through
@@ -1215,18 +1290,16 @@ final class ChatEngine {
                     })
                 sessionTools = SessionTools(
                     runtime: runtime, descriptors: await runtime.descriptors)
+                // The signature of the tool set ACTUALLY built: the
+                // post-discovery snapshot's, captured above — the
+                // same snapshot the runtime was built from. (When
+                // no tool set is built at all, the signature stays
+                // the pre-discovery value, which is exact there
+                // because no discovery suspension happened on that
+                // path.)
+                toolsSignature = postDiscoveryAvailability.signature
             } else {
                 sessionTools = nil
-            }
-            // Audit E-08: store the signature of the tool set
-            // ACTUALLY built — recomputed now that MCP discovery
-            // has returned and the provider's signature reflects
-            // the discovered tools. The terms hash and the rest of
-            // the availability composition are unchanged by
-            // discovery; only the MCP component moved. (For a
-            // tool-less build the signature stays "none".)
-            if backend.supportsTools {
-                toolsSignature = toolAvailabilityProvider().signature
             }
             session = backend.makeSession(instructions: effectiveInstructions,
                                           tools: sessionTools)
@@ -1254,6 +1327,39 @@ final class ChatEngine {
         if isForgotten() {
             finish(conversationID: conversationID)
             return
+        }
+
+        // Review finding 7: recheck cancellation AND the Local Only
+        // lock after that same suspension window, before anything
+        // is dispatched. A send stopped mid-preparation must not
+        // proceed, and a lock flipped on during discovery must not
+        // let a resolved server/cloud send leave the Mac — the
+        // backend was resolved before the flip, so only this fresh
+        // check catches it. (A lock flipped OFF mid-preparation is
+        // harmless here: the send proceeds against the already
+        // resolved local fallback, never against a destination it
+        // wasn't cleared for.)
+        if Task.isCancelled {
+            finish(conversationID: conversationID)
+            return
+        }
+        if routingContextProvider().localOnly {
+            let leavesMac: Bool = {
+                switch selection {
+                case .endpoint, .privateCloudCompute, .openRouter:
+                    return true
+                case .auto, .onDevice, .mlx:
+                    return false
+                }
+            }()
+            if leavesMac {
+                errorMessages[conversationID] =
+                    "Local Only is on, so this chat can't use a "
+                    + "server or cloud model right now — it switched "
+                    + "to a model that runs entirely on this Mac."
+                finish(conversationID: conversationID)
+                return
+            }
         }
 
         // Phase 6: if the user decided a proposed file-change list
@@ -1337,7 +1443,16 @@ final class ChatEngine {
         do {
             let request = ChatReplyRequest(
                 promptText: promptText,
-                imageURLs: stripImages ? [] : imageFiles.urls)
+                imageURLs: stripImages ? [] : imageFiles.urls,
+                // Review finding 6: the CURRENT terms and the
+                // remote flag, per send — HTTP sessions scrub
+                // their complete payload (including cached
+                // history) with these at transport time. The terms
+                // are re-read here, at dispatch, not taken from the
+                // start-of-send snapshot: a term added during the
+                // discovery window must still scrub this send.
+                redactionTerms: routingContextProvider().customRedactionTerms,
+                scrubOutgoingPayload: isRemoteDestination)
             for try await text in session.streamReply(to: request) {
                 received = text
                 streamingText[conversationID] = received

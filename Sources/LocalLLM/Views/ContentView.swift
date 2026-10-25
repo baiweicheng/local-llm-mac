@@ -124,6 +124,25 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 760, minHeight: 480)
+        // Review finding 8: observe the two switches CENTRALLY,
+        // here in the shell that owns the manager — every toggle
+        // in Settings writes the same shared `settings` object, so
+        // these fire whichever control flipped. Turning Local Only
+        // on, or the power-tools master switch off, TERMINATES
+        // servers already running; the launch gates (discovery
+        // refuses under the lock, sessions retire on the switch)
+        // only ever stopped NEW servers, leaving live ones able to
+        // continue their own network activity.
+        .onChange(of: settings.localOnly) {
+            mcpManager.stopServersWhenPowerUnavailable(
+                localOnly: settings.localOnly,
+                powerToolsEnabled: settings.powerToolsEnabled)
+        }
+        .onChange(of: settings.powerToolsEnabled) {
+            mcpManager.stopServersWhenPowerUnavailable(
+                localOnly: settings.localOnly,
+                powerToolsEnabled: settings.powerToolsEnabled)
+        }
         .onAppear {
             // Audit E-05: prune backup folders whose plan records
             // are gone (or no longer undoable) — once per launch.

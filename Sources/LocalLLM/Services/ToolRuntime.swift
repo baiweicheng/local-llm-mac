@@ -78,6 +78,39 @@ actor ToolRuntime {
         /// when the identical change is already on the list (and for
         /// the default sink, which accepts nothing).
         var proposalSink: @Sendable (UUID, PlannedAction) async -> Bool = { _, _ in false }
+
+        /// Review finding 7: builds a runtime configuration from
+        /// ONE snapshot — the POST-discovery availability the
+        /// engine captures after MCP discovery returns — instead
+        /// of the pre-discovery snapshot the old engine code fed
+        /// the runtime while storing a freshly recomputed
+        /// signature. A source or folder disabled during the
+        /// discovery window must therefore reach the runtime AND
+        /// the signature together: the next send's reuse check
+        /// compares the stored signature against the same
+        /// restricted snapshot the runtime was built from, so a
+        /// stale grant can never be re-blessed by a signature
+        /// describing the new settings. The redaction terms ride
+        /// from the same snapshot, for the same reason.
+        static func fromPostDiscovery(
+            availability: ToolAvailability,
+            conversationID: UUID,
+            mcpTools: [MCPToolInfo],
+            redactResults: Bool,
+            proposalSink: @escaping @Sendable (UUID, PlannedAction) async -> Bool
+        ) -> Configuration {
+            Configuration(
+                conversationID: conversationID,
+                enabledSources: availability.enabledSources,
+                folderRootPaths: availability.folderRootPaths,
+                redactResults: redactResults,
+                redactionTerms: availability.customRedactionTerms,
+                fileWritingEnabled: availability.fileWritingEnabled,
+                powerToolsEnabled: availability.effectivePowerToolsEnabled,
+                localOnly: availability.localOnly,
+                mcpTools: mcpTools,
+                proposalSink: proposalSink)
+        }
     }
 
     private let configuration: Configuration

@@ -143,21 +143,47 @@ final class MLXModelStore {
     /// is detached; only the state assignment hops back. Folder
     /// EXISTENCE (cheap) is still checked synchronously, so states
     /// never flicker while sizes are being measured.
-    func refresh() {
-        var newStates = Self.scanModelFolders()
-        // Preserve in-flight and failed states the scan can't know
-        // (unchanged from the old synchronous refresh).
-        for (repoID, state) in states {
-            if downloadTasks[repoID] != nil {
-                newStates[repoID] = state
+    /// Review finding 11: the pure merge behind `refresh()` — the
+    /// scan (disk truth) plus the previous states, so the rules are
+    /// unit-testable without touching the real models folder:
+    /// - A scanned `.downloaded` ALWAYS wins. The old code let a
+    ///   previous `.downloading` overwrite it, which is exactly how
+    ///   a completed download read as still downloading.
+    /// - Otherwise, an in-flight state (its task still registered)
+    ///   is preserved — the scan can't know about a download in
+    ///   progress, whose folder doesn't exist yet.
+    /// - A `.downloading` state with NO task is stale and is
+    ///   dropped in favor of the scan. The old code preserved it
+    ///   unconditionally, so once a download's task was gone
+    ///   (the completion defer) every later refresh still
+    ///   reported downloading forever.
+    /// - A `.failed` state survives only when the scan says the
+    ///   model isn't on disk (a failed attempt's staging is kept,
+    ///   but the model itself isn't downloaded).
+    static func mergedStates(
+        scanned: [String: DownloadState],
+        previous: [String: DownloadState],
+        inFlightRepoIDs: Set<String>
+    ) -> [String: DownloadState] {
+        var merged = scanned
+        for (repoID, state) in previous {
+            if merged[repoID] == .downloaded { continue }
+            if inFlightRepoIDs.contains(repoID) {
+                merged[repoID] = state
                 continue
             }
-            if case .downloading = state { newStates[repoID] = state }
-            if case .failed = state, newStates[repoID] == .notDownloaded {
-                newStates[repoID] = state
+            if case .failed = state, merged[repoID] == .notDownloaded {
+                merged[repoID] = state
             }
         }
-        states = newStates
+        return merged
+    }
+
+    func refresh() {
+        states = Self.mergedStates(
+            scanned: Self.scanModelFolders(),
+            previous: states,
+            inFlightRepoIDs: Set(downloadTasks.keys))
         Task.detached { [weak self] in
             let sizes = Self.measureSizes()
             await MainActor.run { [weak self] in
@@ -344,6 +370,18 @@ final class MLXModelStore {
             let destination = Self.directory(for: info)
             try? FileManager.default.removeItem(at: destination)
             try FileManager.default.moveItem(at: staging, to: destination)
+            // Review finding 11: set the successful state
+            // EXPLICITLY — and drop the in-flight marker — BEFORE
+            // refreshing. The old code called `refresh()` while
+            // the task was still registered, so refresh overwrote
+            // the scanned `.downloaded` with the old `.downloading`
+            // state, and the defer only removed the task afterwards.
+            // (The merge in `refresh()` now also lets disk truth
+            // win over a stale downloading state, so either half
+            // alone would fix the completion; both are kept so the
+            // state is right even before the scan runs.)
+            downloadTasks[repoID] = nil
+            states[repoID] = .downloaded
             refresh()
         } catch is CancellationError {
             // Audit E-11: staging is KEPT (see step 2) — the files

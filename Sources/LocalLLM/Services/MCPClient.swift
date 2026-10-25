@@ -696,7 +696,30 @@ final class MCPServerManager {
         discoveredTools.removeAll { $0.serverID == id }
     }
 
+    /// Review finding 8: how many times `terminateAll()` has run.
+    /// The test seam for the Local Only / power-switch shutdown:
+    /// unit tests can't spawn real server processes, but they can
+    /// prove the toggle path reaches termination (and that it does
+    /// NOT fire while power tools are actually available).
+    private(set) var terminateAllCallCount = 0
+
+    /// Review finding 8: the central shutdown rule for the privacy
+    /// lock and the power-tools master switch. Callers (the app
+    /// shell's settings observers) pass the CURRENT values of both
+    /// switches; running servers are terminated whenever power
+    /// tools are not actually available — the lock on, or the
+    /// master switch off — because a launch gate alone leaves
+    /// already-running servers alive to continue their own network
+    /// activity. A no-op while both allow power tools, so toggling
+    /// an unrelated setting never restarts a healthy server set.
+    func stopServersWhenPowerUnavailable(localOnly: Bool,
+                                         powerToolsEnabled: Bool) {
+        guard localOnly || !powerToolsEnabled else { return }
+        terminateAll()
+    }
+
     func terminateAll() {
+        terminateAllCallCount += 1
         for (_, task) in launchTasks {
             task.cancel()
         }

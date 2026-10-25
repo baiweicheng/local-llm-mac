@@ -24,9 +24,12 @@ import Foundation
 /// Like local servers, OpenRouter sessions keep their own history
 /// (the service is stateless per request) and get NO local tools —
 /// the same parity Phase 3/5 set for server backends, and the chat
-/// UI says so. The privacy firewall is the engine's job and runs
-/// before anything reaches this type (see `ChatEngine`): by the
-/// time text arrives here it has already been scrubbed.
+/// UI says so. The privacy firewall runs in the engine first (see
+/// `ChatEngine`) AND, review finding 6, in this session at
+/// transport time: the engine's scrub can't reach a reused
+/// session's cached assistant turns, so the complete outgoing
+/// payload is scrubbed again with the current terms immediately
+/// before it is sent.
 struct OpenRouterBackend: ModelBackend {
 
     let modelID: String
@@ -67,6 +70,11 @@ final class OpenRouterChatSession: ChatSession, UsageReportingChatSession {
     func streamReply(to request: ChatReplyRequest)
         -> AsyncThrowingStream<String, Error> {
         let promptText = request.promptText
+        // Review finding 6: captured per send, not per session —
+        // terms added after this session was created still apply
+        // to its cached history on this send.
+        let redactionTerms = request.redactionTerms
+        let scrubOutgoingPayload = request.scrubOutgoingPayload
         return AsyncThrowingStream { continuation in
             let task = Task { [weak self] in
                 guard let self else {
@@ -85,6 +93,8 @@ final class OpenRouterChatSession: ChatSession, UsageReportingChatSession {
                 do {
                     let reply = try await self.performSend(
                         promptText: promptText,
+                        redactionTerms: redactionTerms,
+                        scrubOutgoingPayload: scrubOutgoingPayload,
                         onText: { text in
                             latestText = text
                             continuation.yield(text)
@@ -111,6 +121,8 @@ final class OpenRouterChatSession: ChatSession, UsageReportingChatSession {
     }
 
     private func performSend(promptText: String,
+                             redactionTerms: [String],
+                             scrubOutgoingPayload: Bool,
                              onText: @escaping (String) -> Void) async throws -> String {
         // Audit B-45: every reply starts with NO usage report. The
         // old code only ever set `lastUsageReport` when a reply
@@ -129,12 +141,24 @@ final class OpenRouterChatSession: ChatSession, UsageReportingChatSession {
         // OpenRouter asks apps to identify themselves; it affects
         // nothing but their public app rankings.
         request.setValue("LocalLLM", forHTTPHeaderField: "X-Title")
-        request.httpBody = OpenAIRequestBuilder.bodyData(
-            model: modelID,
-            instructions: instructions,
-            history: history,
-            newUserMessage: promptText,
-            includeUsage: true)
+        // Review finding 6: OpenRouter is always a remote
+        // destination, so the complete payload is scrubbed at
+        // transport whenever the engine asks for it (it always
+        // does for this backend); the stored history stays raw.
+        request.httpBody = scrubOutgoingPayload
+            ? OpenAIRequestBuilder.scrubbedBodyData(
+                model: modelID,
+                instructions: instructions,
+                history: history,
+                newUserMessage: promptText,
+                customTerms: redactionTerms,
+                includeUsage: true)
+            : OpenAIRequestBuilder.bodyData(
+                model: modelID,
+                instructions: instructions,
+                history: history,
+                newUserMessage: promptText,
+                includeUsage: true)
 
         let bytes: URLSession.AsyncBytes
         let response: URLResponse

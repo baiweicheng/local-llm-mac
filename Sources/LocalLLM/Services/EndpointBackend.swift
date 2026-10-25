@@ -52,6 +52,11 @@ final class EndpointChatSession: ChatSession {
     func streamReply(to request: ChatReplyRequest)
         -> AsyncThrowingStream<String, Error> {
         let promptText = request.promptText
+        // Review finding 6: captured per send, not per session —
+        // terms added after this session was created still apply
+        // to its cached history on this send.
+        let redactionTerms = request.redactionTerms
+        let scrubOutgoingPayload = request.scrubOutgoingPayload
         return AsyncThrowingStream { continuation in
             let task = Task { [weak self] in
                 guard let self else {
@@ -74,6 +79,8 @@ final class EndpointChatSession: ChatSession {
                 do {
                     let reply = try await self.performSend(
                         promptText: promptText,
+                        redactionTerms: redactionTerms,
+                        scrubOutgoingPayload: scrubOutgoingPayload,
                         onText: { text in
                             latestText = text
                             continuation.yield(text)
@@ -103,6 +110,8 @@ final class EndpointChatSession: ChatSession {
     /// streams the SSE lines through the pure accumulator, and returns
     /// the full reply text.
     private func performSend(promptText: String,
+                             redactionTerms: [String],
+                             scrubOutgoingPayload: Bool,
                              onText: @escaping (String) -> Void) async throws -> String {
         guard let url = config.chatCompletionsURL else {
             throw BackendError.endpointUnreachable(
@@ -111,11 +120,22 @@ final class EndpointChatSession: ChatSession {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = OpenAIRequestBuilder.bodyData(
-            model: config.modelName,
-            instructions: instructions,
-            history: history,
-            newUserMessage: promptText)
+        // Review finding 6: the last step before transport scrubs
+        // the complete payload (instructions + cached history + new
+        // message) for remote destinations; the stored history
+        // itself stays raw, so a later local send is unaffected.
+        request.httpBody = scrubOutgoingPayload
+            ? OpenAIRequestBuilder.scrubbedBodyData(
+                model: config.modelName,
+                instructions: instructions,
+                history: history,
+                newUserMessage: promptText,
+                customTerms: redactionTerms)
+            : OpenAIRequestBuilder.bodyData(
+                model: config.modelName,
+                instructions: instructions,
+                history: history,
+                newUserMessage: promptText)
 
         let bytes: URLSession.AsyncBytes
         let response: URLResponse

@@ -180,7 +180,10 @@ below guard the few paths that can leave the machine.
   with a note explaining why, and a small **Local Only** badge shows
   in the chat header while the lock is on. Under the lock, MCP
   servers don't even launch, and any pending power-tool item refuses
-  at approval time with a lock note.
+  at approval time with a lock note. Turning the lock on also stops
+  MCP servers that are already running — as does turning the Power
+  tools master switch off — so flipping either switch leaves no live
+  server behind to keep reaching the network on its own.
 - **Your OpenRouter key lives only in the macOS Keychain** — nowhere
   else, never in a settings file. Routing only ever learns *that* a
   key exists, never the key itself.

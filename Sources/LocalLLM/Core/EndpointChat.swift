@@ -164,12 +164,70 @@ enum OpenAIRequestBuilder {
                          history: [ChatMessagePayload],
                          newUserMessage: String,
                          includeUsage: Bool = false) -> Data {
+        payloadData(model: model,
+                    messages: messages(instructions: instructions,
+                                       history: history,
+                                       newUserMessage: newUserMessage),
+                    includeUsage: includeUsage)
+    }
+
+    /// Review finding 6: the COMPLETE outgoing payload, scrubbed
+    /// immediately before transport — system instructions, every
+    /// cached history turn (user AND assistant), and the new user
+    /// message, each through `Redactor` with the CURRENT custom
+    /// terms. The engine scrubs the current prompt, but a reused
+    /// HTTP session resends its saved history verbatim, and an
+    /// assistant reply stored earlier can carry a term the user
+    /// only added to Settings afterwards (or a sensitive-shaped
+    /// string the model itself produced). Scrubbing here, at the
+    /// last step before serialization, closes both holes no matter
+    /// when the session was created or the term was added. The
+    /// session's stored history is left untouched — only the sent
+    /// copy is edited, exactly like the engine's firewall. The
+    /// sessions call this only for remote destinations (the
+    /// engine's `scrubOutgoingPayload` flag); a localhost server
+    /// keeps receiving text exactly as written.
+    static func scrubbedMessages(instructions: String,
+                                 history: [ChatMessagePayload],
+                                 newUserMessage: String,
+                                 customTerms: [String]) -> [ChatMessagePayload] {
+        messages(instructions: instructions,
+                 history: history,
+                 newUserMessage: newUserMessage)
+            .map { message in
+                ChatMessagePayload(
+                    role: message.role,
+                    content: Redactor.redact(
+                        message.content,
+                        customTerms: customTerms).text)
+            }
+    }
+
+    /// The scrubbed request body: `scrubbedMessages` serialized
+    /// exactly like `bodyData` (same model, stream flag, and
+    /// optional usage report).
+    static func scrubbedBodyData(model: String,
+                                 instructions: String,
+                                 history: [ChatMessagePayload],
+                                 newUserMessage: String,
+                                 customTerms: [String],
+                                 includeUsage: Bool = false) -> Data {
+        payloadData(model: model,
+                    messages: scrubbedMessages(
+                        instructions: instructions,
+                        history: history,
+                        newUserMessage: newUserMessage,
+                        customTerms: customTerms),
+                    includeUsage: includeUsage)
+    }
+
+    private static func payloadData(model: String,
+                                    messages: [ChatMessagePayload],
+                                    includeUsage: Bool) -> Data {
         var payload: [String: Any] = [
             "model": model,
             "stream": true,
-            "messages": messages(instructions: instructions,
-                                 history: history,
-                                 newUserMessage: newUserMessage)
+            "messages": messages
                 .map { ["role": $0.role, "content": $0.content] },
         ]
         if includeUsage {
