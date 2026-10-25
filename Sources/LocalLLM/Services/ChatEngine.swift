@@ -550,20 +550,46 @@ final class ChatEngine {
     /// retained, executed, not-yet-undone record's folder is NEVER
     /// touched, because its Undo still restores from it.
     /// `ActionBackupRetention` makes the call, purely.
+    ///
+    /// Review finding 10, FAIL CLOSED: the sweep runs ONLY when
+    /// the persistent store actually opened AND the reference
+    /// fetch succeeded. Two guards enforce that, in order, before
+    /// anything is deleted:
+    ///  - an in-memory store (the launch fallback when the
+    ///    persistent store fails to open) holds no retained
+    ///    records to protect, so sweeping against it would delete
+    ///    every real backup folder — the sweep skips it entirely,
+    ///    and the app shell additionally skips the call and shows
+    ///    a banner (see ContentView);
+    ///  - a failed reference fetch is unknown, never "no records":
+    ///    `deletableFoldersIfReferencesKnown` returns nil for an
+    ///    unavailable reference set, and the sweep deletes nothing.
+    ///    A successful fetch that genuinely returns no records is
+    ///    `[]`, and only that case deletes orphans.
     func pruneOrphanedActionBackups(context: ModelContext) {
         guard !didSweepActionBackups else { return }
         didSweepActionBackups = true
+        guard !context.container.configurations.contains(
+            where: { $0.isStoredInMemoryOnly }) else { return }
         let root = Self.actionBackupsRoot
-        let folderNames = (try? FileManager.default
-            .contentsOfDirectory(atPath: root.path)) ?? []
-        guard !folderNames.isEmpty else { return }
-        let records = (try? context.fetch(
-            FetchDescriptor<ActionPlanRecord>())) ?? []
-        let retained = records.map {
-            (id: $0.id, status: $0.status, isUndone: $0.isUndone)
+        guard let folderNames = try? FileManager.default
+            .contentsOfDirectory(atPath: root.path),
+              !folderNames.isEmpty else { return }
+        let retained: [(id: UUID, status: ActionPlanRecord.Status,
+                        isUndone: Bool)]
+        do {
+            let records = try context.fetch(
+                FetchDescriptor<ActionPlanRecord>())
+            retained = records.map {
+                (id: $0.id, status: $0.status, isUndone: $0.isUndone)
+            }
+        } catch {
+            return
         }
-        for name in ActionBackupRetention.deletableFolders(
-            folderNames: folderNames, retained: retained) {
+        guard let deletable = ActionBackupRetention
+            .deletableFoldersIfReferencesKnown(
+                folderNames: folderNames, retained: retained) else { return }
+        for name in deletable {
             try? FileManager.default.removeItem(
                 at: root.appendingPathComponent(name, isDirectory: true))
         }
@@ -609,6 +635,9 @@ final class ChatEngine {
             resolve: { FileAccessService.resolvedPath($0) ?? $0 },
             resolveDestination: {
                 FileAccessService.resolvedDestinationPath($0) ?? $0
+            },
+            resolveExistingDestination: {
+                FileAccessService.resolvedPath($0) ?? $0
             }) {
             return ExecutedActionItem(action: action,
                                       outcome: .failed(refusal),

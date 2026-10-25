@@ -73,9 +73,48 @@ final class VisibilityToolsTests: XCTestCase {
     }
 
     func testScopeHandlesSlashesDotsAndCase() {
+        // Review finding 5: this test previously asserted a
+        // differently-cased path is inside the root UNCONDITIONALLY
+        // — true only on a case-insensitive volume. The behavior
+        // is now pinned per volume semantics via the injected
+        // provider (restored afterwards, so other tests keep the
+        // default volume answer): case-insensitive volumes keep
+        // the old admission, case-sensitive volumes treat the
+        // differently-cased sibling directory as a different folder.
+        let previous = FileScope.caseSensitivityProvider
+        defer { FileScope.caseSensitivityProvider = previous }
         XCTAssertTrue(FileScope.isPath(root + "/f.txt", insideAnyRoot: [root + "/"]))
         XCTAssertTrue(FileScope.isPath(root + "/./sub/../f.txt", insideAnyRoot: [root]))
+        FileScope.caseSensitivityProvider = { _ in false }
         XCTAssertTrue(FileScope.isPath("/users/TEST/documents/F.TXT", insideAnyRoot: [root]))
+        FileScope.caseSensitivityProvider = { _ in true }
+        XCTAssertFalse(FileScope.isPath("/users/TEST/documents/F.TXT", insideAnyRoot: [root]))
+        XCTAssertTrue(FileScope.isPath(root + "/F.TXT", insideAnyRoot: [root]))
+    }
+
+    func testScopeCaseSensitiveVolumeTreatsDifferentlyCasedFoldersAsDifferent() {
+        // Review finding 5, reproduced case: on a case-sensitive
+        // volume, sharing `Shared` must not grant `shared`.
+        let previous = FileScope.caseSensitivityProvider
+        defer { FileScope.caseSensitivityProvider = previous }
+        FileScope.caseSensitivityProvider = { _ in true }
+        XCTAssertFalse(FileScope.isPath(
+            "/Volumes/CaseSensitive/shared/private.txt",
+            insideAnyRoot: ["/Volumes/CaseSensitive/Shared"]))
+        XCTAssertTrue(FileScope.isPath(
+            "/Volumes/CaseSensitive/Shared/private.txt",
+            insideAnyRoot: ["/Volumes/CaseSensitive/Shared"]))
+    }
+
+    func testScopeCaseInsensitiveVolumePreservesOldBehavior() {
+        // The default macOS volume: differently-cased spellings
+        // are the same folder, as before.
+        let previous = FileScope.caseSensitivityProvider
+        defer { FileScope.caseSensitivityProvider = previous }
+        FileScope.caseSensitivityProvider = { _ in false }
+        XCTAssertTrue(FileScope.isPath(
+            "/Volumes/CaseSensitive/shared/private.txt",
+            insideAnyRoot: ["/Volumes/CaseSensitive/Shared"]))
     }
 
     func testScopeEmptyRootsAndRelativePathsAdmitNothing() {

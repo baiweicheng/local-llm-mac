@@ -1,3 +1,4 @@
+import SwiftData
 import XCTest
 @testable import LocalLLM
 
@@ -256,10 +257,16 @@ final class FileActionsTests: XCTestCase {
     // MARK: - Case-insensitive path comparisons (audit B-09)
 
     func testRenameCaseOnlyIsProposable() {
-        // On the default volume the destination "exists" — it is
-        // the same file with new capitalization. The probe reports
-        // it as existing (as FileManager would), and the rename
-        // must still be proposable and pass its pre-check.
+        // On the default (case-insensitive) volume the destination
+        // "exists" — it is the same file with new capitalization.
+        // The probe reports it as existing (as FileManager would),
+        // and the rename must still be proposable and pass its
+        // pre-check. Pinned to case-insensitive semantics explicitly
+        // (review finding 5); the case-sensitive counterpart is
+        // testCaseSensitiveRenameIsADifferentFile, below.
+        let previous = FileScope.caseSensitivityProvider
+        defer { FileScope.caseSensitivityProvider = previous }
+        FileScope.caseSensitivityProvider = { _ in false }
         var probe = standardProbe()
         probe.existing.insert("\(root)/Photo.JPG")
         let outcome = propose(.rename, ActionInputs(
@@ -274,6 +281,11 @@ final class FileActionsTests: XCTestCase {
     }
 
     func testMoveToACaseVariantOfTheSamePlaceIsRefused() {
+        // Case-insensitive volume semantics, pinned explicitly
+        // (review finding 5).
+        let previous = FileScope.caseSensitivityProvider
+        defer { FileScope.caseSensitivityProvider = previous }
+        FileScope.caseSensitivityProvider = { _ in false }
         let outcome = propose(.move, ActionInputs(
             sourcePath: "\(root)/photo.jpg",
             destinationPath: "\(root)/PHOTO.jpg"), probe: standardProbe())
@@ -286,6 +298,10 @@ final class FileActionsTests: XCTestCase {
     func testFolderIntoItselfWithDifferentCaseIsRefused() {
         // "/Shared/SUB/Inner" is inside "/Shared/Sub" on a
         // case-insensitive volume, whatever the spelling says.
+        // Pinned to that semantics explicitly (finding 5).
+        let previous = FileScope.caseSensitivityProvider
+        defer { FileScope.caseSensitivityProvider = previous }
+        FileScope.caseSensitivityProvider = { _ in false }
         let outcome = propose(.move, ActionInputs(
             sourcePath: "\(root)/Sub",
             destinationPath: "\(root)/SUB/Inner"), probe: standardProbe())
@@ -898,5 +914,180 @@ final class FileActionsTests: XCTestCase {
             arguments: ToolArguments(path: "/tmp/whatever/a.txt", newName: "b.txt"))
         XCTAssertTrue(result.contains("File changes are turned off"),
                       "got: \(result)")
+    }
+
+    // MARK: - Reviewfix batch 2, finding 4: symlink-safe append
+
+    func testPreCheckRefusesEditWhenTheLeafResolvesOutsideScope() {
+        // The review's scenario, at the pre-check level: shared
+        // notes.txt was swapped for a symlink to an outside file
+        // while the proposal awaited approval. The destination
+        // resolver still resolves only the parent (so the stored
+        // name looks in-scope), but the leaf resolver reports the
+        // outside target — the pre-check must refuse before any
+        // read or backup.
+        let action = PlannedAction(
+            kind: .editText, destinationPath: "\(root)/notes.txt",
+            editText: " appended", appendEdit: true,
+            summary: "Append text to notes.txt")
+        let refusal = ActionExecution.preCheck(
+            action, roots: [root], probe: standardProbe(),
+            resolve: { $0 },
+            resolveDestination: { $0 },
+            resolveExistingDestination: { _ in "/Users/tester/Private/outside.txt" })
+        XCTAssertNotNil(refusal)
+        XCTAssertTrue(refusal?.contains("shared folder") ?? false)
+    }
+
+    func testPreCheckAllowsEditWhenTheLeafResolvesInsideScope() {
+        // The mirror case: a leaf swapped for a symlink to another
+        // file still inside the shared folder passes — the fix
+        // refuses only inappropriate (outside) symlinks, and a
+        // genuinely new destination (not existing) has no leaf to
+        // check, so it stays creatable.
+        let action = PlannedAction(
+            kind: .editText, destinationPath: "\(root)/notes.txt",
+            editText: " appended", appendEdit: true,
+            summary: "Append text to notes.txt")
+        XCTAssertNil(ActionExecution.preCheck(
+            action, roots: [root], probe: standardProbe(),
+            resolve: { $0 },
+            resolveDestination: { $0 },
+            resolveExistingDestination: { _ in "\(root)/real-notes.txt" }))
+        let create = PlannedAction(
+            kind: .editText, destinationPath: "\(root)/brand-new.txt",
+            editText: "hello", appendEdit: false,
+            summary: "Create brand-new.txt")
+        XCTAssertNil(ActionExecution.preCheck(
+            create, roots: [root], probe: standardProbe(),
+            resolve: { $0 },
+            resolveDestination: { $0 },
+            resolveExistingDestination: { _ in "/Users/tester/Private/outside.txt" }))
+    }
+
+    func testEditExecutionDoesNotLeakThroughASwappedSymlink() async throws {
+        // End to end against a real temporary folder, the review's
+        // scenario: shared notes.txt is a symlink to an outside
+        // file holding private content. Executing an append must
+        // fail, leave the outside file untouched, leave the link
+        // in place (not replaced by a file holding the outside
+        // content), and take no backup of the outside file.
+        let fileManager = FileManager.default
+        let base = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("LocalLLMTests-symlink-\(UUID().uuidString)")
+        let shared = base.appendingPathComponent("Shared")
+        let outside = base.appendingPathComponent("Outside")
+        let backups = base.appendingPathComponent("Backups")
+        try fileManager.createDirectory(at: shared, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: outside, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: base) }
+        let secret = outside.appendingPathComponent("secret.txt")
+        try Data("outside-private-content".utf8).write(to: secret)
+        try fileManager.createSymbolicLink(
+            at: shared.appendingPathComponent("notes.txt"),
+            withDestinationURL: secret)
+        // Production roots are pre-resolved (FileScopeStore), and
+        // the stored proposal path is the pre-swap resolved form
+        // (parent-resolved, leaf name untouched) — mirror both, so
+        // the refusal here is the symlink's, not a /var vs
+        // /private/var spelling mismatch on macOS.
+        let resolvedShared = FileAccessService.resolvedPath(shared.path)!
+        let action = PlannedAction(
+            kind: .editText,
+            destinationPath: (resolvedShared as NSString)
+                .appendingPathComponent("notes.txt"),
+            editText: " appended", appendEdit: true,
+            summary: "Append text to notes.txt")
+        let item = await FileActionService.execute(
+            action, roots: [resolvedShared], backupDirectory: backups)
+        guard case .failed(let note) = item.outcome else {
+            return XCTFail("a swapped-outside symlink must fail, got \(item.outcome)")
+        }
+        XCTAssertTrue(note.contains("shared folder"))
+        XCTAssertEqual(try Data(contentsOf: secret),
+                       Data("outside-private-content".utf8))
+        XCTAssertEqual(
+            try fileManager.destinationOfSymbolicLink(
+                atPath: shared.appendingPathComponent("notes.txt").path),
+            secret.path)
+        XCTAssertFalse(fileManager.fileExists(atPath: backups.path))
+    }
+
+    // MARK: - Reviewfix batch 2, finding 5: volume case sensitivity
+
+    func testCaseSensitiveRenameIsADifferentFile() {
+        // On a case-sensitive volume, Photo.JPG is not photo.jpg:
+        // a rename to a spelling that doesn't exist as a separate
+        // file is proposable, and one that does exist as a separate
+        // file is refused as never-overwrite.
+        let previous = FileScope.caseSensitivityProvider
+        defer { FileScope.caseSensitivityProvider = previous }
+        FileScope.caseSensitivityProvider = { _ in true }
+        let ok = propose(.rename, ActionInputs(
+            sourcePath: "\(root)/photo.jpg", newName: "Photo.JPG"),
+            probe: standardProbe())
+        guard case .proposed = ok else {
+            return XCTFail("on a case-sensitive volume this is a different file, got \(ok)")
+        }
+        var probe = standardProbe()
+        probe.existing.insert("\(root)/Photo.JPG")
+        let refused = propose(.rename, ActionInputs(
+            sourcePath: "\(root)/photo.jpg", newName: "Photo.JPG"),
+            probe: probe)
+        guard case .refused = refused else {
+            return XCTFail("a separate existing file must refuse, got \(refused)")
+        }
+    }
+
+    func testCaseSensitiveMoveToACaseVariantIsNotTheSamePlace() {
+        // On a case-sensitive volume, PHOTO.jpg is a different
+        // destination, not "where it already is".
+        let previous = FileScope.caseSensitivityProvider
+        defer { FileScope.caseSensitivityProvider = previous }
+        FileScope.caseSensitivityProvider = { _ in true }
+        let outcome = propose(.move, ActionInputs(
+            sourcePath: "\(root)/photo.jpg",
+            destinationPath: "\(root)/PHOTO.jpg"), probe: standardProbe())
+        guard case .proposed = outcome else {
+            return XCTFail("on a case-sensitive volume this is a different place, got \(outcome)")
+        }
+    }
+
+    // MARK: - Reviewfix batch 2, finding 10: fail-closed backup sweep
+
+    func testBackupSweepDeletesNothingWhenReferencesAreUnknown() {
+        // A failed reference fetch (nil) must never be read as
+        // "no records retained": it deletes nothing. A successful
+        // fetch that genuinely returns no records ([]) keeps the
+        // old behavior and deletes orphans, and a retained,
+        // executed, not-yet-undone record still protects its folder.
+        XCTAssertNil(ActionBackupRetention.deletableFoldersIfReferencesKnown(
+            folderNames: ["aaa", "bbb"], retained: nil))
+        XCTAssertEqual(ActionBackupRetention.deletableFoldersIfReferencesKnown(
+            folderNames: ["aaa", "bbb"], retained: []) ?? [],
+            ["aaa", "bbb"])
+        let kept = UUID()
+        XCTAssertEqual(ActionBackupRetention.deletableFoldersIfReferencesKnown(
+            folderNames: [kept.uuidString, "orphan"],
+            retained: [(id: kept, status: .executed, isUndone: false)]) ?? [],
+            ["orphan"])
+    }
+
+    @MainActor
+    func testPruneSkipsSweepForAnInMemoryStore() throws {
+        // The engine-level fail-closed gate: a sweep against an
+        // in-memory store (the launch fallback) must return before
+        // it could read the real backup folders — so calling it
+        // here is safe by construction and simply completes.
+        // The banner + shell gate in ContentView is the visible
+        // half; this is the half that holds even if a caller
+        // forgets the gate.
+        let container = try ModelContainer(
+            for: Conversation.self, Message.self,
+            ToolActivityRecord.self, ActionPlanRecord.self,
+            configurations: ModelConfiguration(isStoredInMemoryOnly: true))
+        let engine = ChatEngine()
+        engine.pruneOrphanedActionBackups(context: ModelContext(container))
+        engine.pruneOrphanedActionBackups(context: ModelContext(container))
     }
 }

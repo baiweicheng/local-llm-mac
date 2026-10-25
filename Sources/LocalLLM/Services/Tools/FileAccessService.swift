@@ -105,9 +105,23 @@ enum FileAccessService {
     /// name is re-attached untouched, so a parent swapped for an
     /// outward symlink since the proposal is seen for what it now
     /// points at.
+    ///
+    /// Review finding 4: that parent-only rule is NOT enough for
+    /// an EXISTING destination. If the leaf itself was swapped for
+    /// a symlink to an outside file while the proposal awaited
+    /// approval, parent-only resolution still looks in-scope and
+    /// the edit would read the outside file. So when the
+    /// destination already exists, the FULL leaf is resolved
+    /// instead — a leaf pointing outside then fails the scope
+    /// check in the pre-check, before any read or backup. A
+    /// not-yet-existing destination keeps the parent-only rule
+    /// and stays creatable.
     static func resolvedDestinationPath(_ rawPath: String) -> String? {
         let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
+        if FileManager.default.fileExists(atPath: trimmed) {
+            return resolvedPath(trimmed)
+        }
         let parent = (trimmed as NSString).deletingLastPathComponent
         let name = (trimmed as NSString).lastPathComponent
         guard !name.isEmpty,

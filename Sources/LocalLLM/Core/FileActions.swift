@@ -375,14 +375,17 @@ enum ActionProposal {
         guard destination != source else {
             return .refused("“\(newName)” is the name it already has.")
         }
-        // Audit B-09: these comparisons fold case, like FileScope
-        // (and like the default case-insensitive macOS volume). A
-        // destination differing from the source only by case IS the
-        // source — a case-only rename (Photo.jpg → photo.jpg) — so
-        // the existence check must not refuse it by pointing at the
-        // very file being renamed. A genuinely different existing
-        // destination still refuses: never overwrite.
-        if destination.lowercased() != source.lowercased() {
+        // Audit B-09, review finding 5: case folding follows the
+        // volume's actual case sensitivity (FileScope), not a
+        // blanket lowercase. On the default case-insensitive
+        // volume a destination differing from the source only by
+        // case IS the source — a case-only rename (Photo.jpg →
+        // photo.jpg) — so the existence check must not refuse it
+        // by pointing at the very file being renamed. On a
+        // case-sensitive volume the two spellings are different
+        // files, and a genuinely different existing destination
+        // still refuses: never overwrite.
+        if !FileScope.pathsEqual(destination, source) {
             guard !probe.exists(atPath: destination) else {
                 return .refused(alreadyExistsMessage(name: newName, folder: folder, home: home))
             }
@@ -405,17 +408,19 @@ enum ActionProposal {
         guard let destination = inputs.destinationPath, !destination.isEmpty else {
             return .refused("That change needs the full destination path (destination) — where the \(kind == .move ? "moved" : "copied") item should end up.")
         }
-        // Case-folded, like FileScope (audit B-09): on the default
-        // volume, spellings that differ only by case are one place.
-        let destinationFolded = destination.lowercased()
-        let sourceFolded = source.lowercased()
+        // Case-folded per the source volume's actual sensitivity
+        // (FileScope, review finding 5): on the default volume,
+        // spellings that differ only by case are one place; on a
+        // case-sensitive volume they are different places.
+        let sensitive = FileScope.isCaseSensitive(atPath: source)
+        let destinationFolded = FileScope.folded(destination, caseSensitive: sensitive)
+        let sourceFolded = FileScope.folded(source, caseSensitive: sensitive)
         guard destinationFolded != sourceFolded else {
             return .refused("That's where it already is.")
         }
         // A folder can never land inside itself.
         if probe.isDirectory(atPath: source),
-           destinationFolded == sourceFolded
-            || destinationFolded.hasPrefix(sourceFolded + "/") {
+           FileScope.isSameOrInside(destination, folder: source) {
             return .refused("A folder can't be \(kind == .move ? "moved" : "copied") into itself.")
         }
         if let refusal = checkedDestination(destination, roots: roots, probe: probe, home: home) {
@@ -499,10 +504,7 @@ enum ActionProposal {
         // would sweep away the whole tree the user designated, not
         // an item in it. (The scope check admits the root by design —
         // it has to, for listing — so the write side refuses it.)
-        if roots.contains(where: {
-            FileScope.normalizedPath($0).lowercased()
-                == FileScope.normalizedPath(source).lowercased()
-        }) {
+        if roots.contains(where: { FileScope.pathsEqual($0, source) }) {
             return .refused("That's one of the shared folders itself — it can't be moved to the Trash from here. Items inside it can be.")
         }
         let summary = "Move “\(PathDisplay.fileName(source))” (in \(PathDisplay.shortened(PathDisplay.parentPath(source), home: home))) to the Trash"
@@ -691,7 +693,8 @@ enum ActionExecution {
                          roots: [String],
                          probe: FileSystemProbe,
                          resolve: (String) -> String? = { $0 },
-                         resolveDestination: ((String) -> String?)? = nil
+                         resolveDestination: ((String) -> String?)? = nil,
+                         resolveExistingDestination: ((String) -> String?)? = nil
     ) -> String? {
         func resolved(_ path: String) -> String {
             resolve(path) ?? path
@@ -705,6 +708,20 @@ enum ActionExecution {
                 return resolveDestination(path) ?? path
             }
             return resolve(path) ?? path
+        }
+        /// Review finding 4: the RESOLVED LEAF of an existing
+        /// destination — the file itself, not just its parent.
+        /// A destination resolver that only resolves the parent
+        /// leaves a leaf symlink unexamined: the stored name still
+        /// looks in-scope while the file it names points outside.
+        /// Callers pass a full leaf resolver (production:
+        /// `FileAccessService.resolvedPath`); without one the
+        /// parent-resolved form is the best available answer.
+        func resolvedLeafDestination(_ path: String) -> String {
+            if let resolveExistingDestination {
+                return resolveExistingDestination(path) ?? path
+            }
+            return resolvedDestination(path)
         }
         func scoped(_ path: String) -> Bool {
             FileScope.isPath(resolved(path), insideAnyRoot: roots)
@@ -726,18 +743,17 @@ enum ActionExecution {
                 return "The destination is no longer inside a shared folder."
             }
             if probe.isDirectory(atPath: source),
-               resolvedDestination(destination)
-                .lowercased()
-                .hasPrefix(resolved(source).lowercased() + "/") {
+               FileScope.isSameOrInside(resolvedDestination(destination),
+                                        folder: resolved(source)) {
                 return "A folder can't be moved into itself."
             }
             // Audit B-09: a case-only rename's destination IS its
-            // source (case-folded) — the existence check must not
-            // refuse the very item being renamed. Every other kind,
-            // and every genuinely different destination, keeps the
-            // never-overwrite rule.
+            // source (case-folded per the volume, finding 5) — the
+            // existence check must not refuse the very item being
+            // renamed. Every other kind, and every genuinely
+            // different destination, keeps the never-overwrite rule.
             let caseOnlyRename = action.kind == .rename
-                && destination.lowercased() == source.lowercased()
+                && FileScope.pathsEqual(destination, source)
             if !caseOnlyRename {
                 guard !probe.exists(atPath: destination) else {
                     return "Something is already at the destination, and a change never overwrites it."
@@ -758,6 +774,19 @@ enum ActionExecution {
                   scopedDestination(path) else {
                 return "The file is no longer inside a shared folder."
             }
+            // Review finding 4: an existing destination's RESOLVED
+            // LEAF must also be in scope, before any read or
+            // backup. A leaf swapped for a symlink to an outside
+            // file passes the parent-resolved check above, but its
+            // leaf resolves outside — refusing here is what stops
+            // the append from reading outside content into the
+            // shared folder. A not-yet-existing destination has no
+            // leaf to check and stays creatable.
+            if probe.exists(atPath: path),
+               !FileScope.isPath(resolvedLeafDestination(path),
+                                 insideAnyRoot: roots) {
+                return "The file is no longer inside a shared folder."
+            }
             if probe.exists(atPath: path), probe.isDirectory(atPath: path) {
                 return "That path is a folder now."
             }
@@ -776,8 +805,7 @@ enum ActionExecution {
             // and scope admits a root by design — so without this
             // check the executor would trash the designated tree.
             if roots.contains(where: {
-                FileScope.normalizedPath($0).lowercased()
-                    == FileScope.normalizedPath(resolved(source)).lowercased()
+                FileScope.pathsEqual($0, resolved(source))
             }) {
                 return "That's one of the shared folders itself now, so it can't be moved to the Trash."
             }
@@ -1147,5 +1175,22 @@ enum ActionBackupRetention {
             protected.insert(folderName(recordID: record.id))
         }
         return folderNames.filter { !protected.contains($0) }
+    }
+
+    /// Review finding 10, fail-closed: the same decision, but
+    /// with the reference set itself allowed to be unavailable.
+    /// A failed record fetch must NEVER be represented as "no
+    /// records retained" — that reading deletes every backup
+    /// folder. `nil` references mean "unknown", and unknown
+    /// deletes nothing: the caller returns without sweeping.
+    /// A successful fetch that genuinely returns no records is
+    /// `[]`, not `nil`, and keeps the old behavior.
+    static func deletableFoldersIfReferencesKnown(
+        folderNames: [String],
+        retained: [(id: UUID, status: ActionPlanRecord.Status,
+                    isUndone: Bool)]?
+    ) -> [String]? {
+        guard let retained else { return nil }
+        return deletableFolders(folderNames: folderNames, retained: retained)
     }
 }

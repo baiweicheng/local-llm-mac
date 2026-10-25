@@ -57,6 +57,12 @@ struct ContentView: View {
     @State private var mcpManager = MCPServerManager()
     @State private var selection: Conversation?
     let hudCoordinator: HUDCoordinator
+    /// Review finding 10: true when the app fell back to an
+    /// in-memory store because the persistent store failed to
+    /// open. Drives the visible banner below and gates the
+    /// backup sweep in `onAppear` — the sweep must never run
+    /// against an empty in-memory store.
+    let persistentStoreFailed: Bool = false
     @Environment(\.modelContext) private var modelContext
     @Environment(\.openWindow) private var openWindow
 
@@ -74,10 +80,25 @@ struct ContentView: View {
     }
 
     var body: some View {
-        NavigationSplitView {
-            SidebarView(selection: $selection, engine: engine,
-                        settings: settings)
-                .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 340)
+        VStack(spacing: 0) {
+            // Review finding 10: the store failure is visible,
+            // not silent — the user must know this session's
+            // chats won't survive a quit, and that nothing old
+            // was deleted to make room.
+            if persistentStoreFailed {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                    Text("Your saved chats couldn't be opened, so chats in this session won't be saved when you quit. Your earlier chats and undo backups have been left untouched — nothing was deleted.")
+                        .font(.callout)
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.yellow.opacity(0.25))
+            }
+            NavigationSplitView {
+                SidebarView(selection: $selection, engine: engine,
+                            settings: settings)
+                    .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 340)
         } detail: {
             if let conversation = selection {
                 ChatView(conversation: conversation, engine: engine,
@@ -100,12 +121,20 @@ struct ContentView: View {
                     description: Text("Pick a chat on the left, or press ⌘N to start a new one.")
                 )
             }
+            }
         }
         .frame(minWidth: 760, minHeight: 480)
         .onAppear {
             // Audit E-05: prune backup folders whose plan records
             // are gone (or no longer undoable) — once per launch.
-            engine.pruneOrphanedActionBackups(context: modelContext)
+            // Review finding 10: NEVER against a fallback
+            // in-memory store — its empty record set would mark
+            // every real backup folder orphaned. (The engine's
+            // prune re-checks this itself, so even a caller that
+            // forgot the gate can't sweep an in-memory store.)
+            if !persistentStoreFailed {
+                engine.pruneOrphanedActionBackups(context: modelContext)
+            }
             engine.configureBackendProvider { selection in
                 resolveBackend(selection)
             }

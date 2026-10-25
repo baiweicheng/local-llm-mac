@@ -40,12 +40,19 @@ enum FileActionService {
                         backupDirectory: URL) async -> ExecutedActionItem {
         // Audit S-02: the pre-check re-resolves every path NOW —
         // a component swapped for an outward symlink since the
-        // proposal must fail here, not be followed.
+        // proposal must fail here, not be followed. Review
+        // finding 4 adds the leaf resolver: the destination
+        // resolver alone resolves only the parent for a new file,
+        // so an existing destination's leaf is resolved in full
+        // here too, and a leaf pointing outside is refused.
         if let refusal = ActionExecution.preCheck(
             action, roots: roots, probe: FileManagerProbe(),
             resolve: { FileAccessService.resolvedPath($0) ?? $0 },
             resolveDestination: {
                 FileAccessService.resolvedDestinationPath($0) ?? $0
+            },
+            resolveExistingDestination: {
+                FileAccessService.resolvedPath($0) ?? $0
             }) {
             return ExecutedActionItem(action: action,
                                       outcome: .failed(refusal),
@@ -59,7 +66,8 @@ enum FileActionService {
         case .createFolder:
             return createFolder(action)
         case .editText:
-            return editText(action, backupDirectory: backupDirectory)
+            return editText(action, backupDirectory: backupDirectory,
+                            roots: roots)
         case .trash:
             return trashItem(action)
         case .resizePhoto:
@@ -154,12 +162,35 @@ enum FileActionService {
     /// something appeared at that path since the pre-check, the item
     /// fails rather than replacing it.
     private static func editText(_ action: PlannedAction,
-                                 backupDirectory: URL) -> ExecutedActionItem {
+                                 backupDirectory: URL,
+                                 roots: [String]) -> ExecutedActionItem {
         guard let path = action.destinationPath else {
             return failed(action, "The change was missing its path.")
         }
         let fileManager = FileManager.default
         let existed = fileManager.fileExists(atPath: path)
+        // Review finding 4: validate the RESOLVED LEAF before any
+        // backup or read, and operate against that same validated
+        // identity. The pre-check already refused an outside leaf,
+        // but this is the execution's own re-validation against
+        // the disk as it is NOW — a swap between pre-check and
+        // execution must still not leak outside content in, and a
+        // backup must never be taken of an outside file. A
+        // not-yet-existing destination has no leaf and keeps the
+        // stored path. A leaf inside scope (e.g. a symlink to
+        // another shared file) is operated on at its real path, so
+        // the atomic write edits the file itself rather than
+        // replacing the link.
+        var effectivePath = path
+        var effectiveAction = action
+        if existed {
+            guard let leaf = FileAccessService.resolvedPath(path),
+                  FileScope.isPath(leaf, insideAnyRoot: roots) else {
+                return failed(action, "That file is no longer inside a shared folder, so it wasn't changed.")
+            }
+            effectivePath = leaf
+            effectiveAction.destinationPath = leaf
+        }
         var backupPath: String? = nil
         // Audit B-59: the backed-up file's identity, verified again
         // immediately before writing (below).
@@ -170,17 +201,17 @@ enum FileActionService {
             do {
                 try fileManager.createDirectory(
                     at: backupDirectory, withIntermediateDirectories: true)
-                try fileManager.copyItem(atPath: path, toPath: backupURL.path)
+                try fileManager.copyItem(atPath: effectivePath, toPath: backupURL.path)
                 backupPath = backupURL.path
             } catch {
                 return failed(action, "Couldn't back up the file first, so it wasn't changed — \(error.localizedDescription)")
             }
-            backedUpIdentity = fileIdentity(atPath: path)
+            backedUpIdentity = fileIdentity(atPath: effectivePath)
         }
         let newText = Data((action.editText ?? "").utf8)
         let data: Data
         if action.appendEdit, existed {
-            guard let existing = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+            guard let existing = try? Data(contentsOf: URL(fileURLWithPath: effectivePath)) else {
                 return failed(action, "Couldn't read the file to add to it.")
             }
             data = existing + newText
@@ -196,16 +227,16 @@ enum FileActionService {
         // that vanished aborts it too (the create branch's
         // `.withoutOverwriting` guard covers the reverse race).
         if existed {
-            guard let currentIdentity = fileIdentity(atPath: path),
+            guard let currentIdentity = fileIdentity(atPath: effectivePath),
                   currentIdentity == backedUpIdentity else {
                 return failed(action, "The file changed while the change was being made, so it wasn't overwritten. Ask for the change again if you still want it.")
             }
         }
         do {
             if existed {
-                try data.write(to: URL(fileURLWithPath: path), options: [.atomic])
+                try data.write(to: URL(fileURLWithPath: effectivePath), options: [.atomic])
             } else {
-                try data.write(to: URL(fileURLWithPath: path),
+                try data.write(to: URL(fileURLWithPath: effectivePath),
                                options: [.atomic, .withoutOverwriting])
             }
         } catch {
@@ -219,9 +250,12 @@ enum FileActionService {
                 ? "Contents replaced — a backup of the old version was kept for undo."
                 : "File created."
         }
+        // The record carries the validated identity, so undo
+        // restores the file that was actually edited, not a link
+        // that may since have been swapped again.
         return ExecutedActionItem(
-            action: action, outcome: .done, resultNote: note,
-            artifactPath: existed ? nil : path,
+            action: effectiveAction, outcome: .done, resultNote: note,
+            artifactPath: existed ? nil : effectivePath,
             artifactBytes: existed ? nil : data.count,
             backupPath: backupPath)
     }
