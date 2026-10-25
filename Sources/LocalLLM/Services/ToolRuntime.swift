@@ -298,13 +298,22 @@ actor ToolRuntime {
             inputs = ActionInputs(sourcePath: resolved(arguments.path))
         case .resizePhoto:
             let filePath = resolved(arguments.path)
+            // Review finding 14: a library resize resolves the
+            // recent-photo index to a stable asset identifier (and
+            // its file name, in the same fetch) RIGHT HERE, at
+            // proposal time — the proposal then carries the
+            // identifier, so photos added/removed/imported while
+            // approval is pending cannot retarget it.
+            let identity = filePath == nil
+                ? PhotosService.recentPhotoIdentity(
+                    index: arguments.indexClamped)
+                : nil
             inputs = ActionInputs(
                 sourcePath: filePath,
                 destinationPath: resolved(arguments.destination),
                 sourcePhotoIndex: filePath == nil ? arguments.indexClamped : nil,
-                libraryPhotoName: filePath == nil
-                    ? PhotosService.recentPhotoFilename(index: arguments.indexClamped)
-                    : nil,
+                libraryPhotoName: identity?.filename,
+                sourcePhotoIdentifier: identity?.identifier,
                 maxWidthPx: arguments.maxWidthClamped,
                 byteCeiling: arguments.maxBytesClamped)
         case .runCommand, .mcpCall:

@@ -301,7 +301,12 @@ final class HUDCoordinator: NSObject, NSApplicationDelegate {
         }
         if filesEnabled {
             finderProbeInFlight = true
-            HUDContextCapture.probeFinderSelection { [weak self] paths in
+            // Review finding 21: the DETAILED probe, so a denied
+            // Automation permission lands as its own chip instead
+            // of an empty selection that looks like "nothing
+            // selected". The generation and toggle guards below
+            // are unchanged (audit B-53).
+            HUDContextCapture.probeFinderSelectionDetailed { [weak self] outcome in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     // Audit B-53: only the CURRENT summon's probe
@@ -323,7 +328,17 @@ final class HUDCoordinator: NSObject, NSApplicationDelegate {
                           self.settings?.isSourceEnabled(.files) == true
                     else { return }
                     var snapshot = self.contextSnapshot
-                    snapshot.finderSelectionPaths = paths
+                    switch outcome {
+                    case .selection(let paths):
+                        snapshot.finderSelectionPaths = paths
+                        snapshot.finderAutomationDenied = false
+                    case .denied:
+                        snapshot.finderSelectionPaths = []
+                        snapshot.finderAutomationDenied = true
+                    case .unavailable:
+                        snapshot.finderSelectionPaths = []
+                        snapshot.finderAutomationDenied = false
+                    }
                     self.contextSnapshot = snapshot
                 }
             }

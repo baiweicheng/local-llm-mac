@@ -166,10 +166,11 @@ enum PlanExecutionGate {
 final class ChatEngine {
 
     init() {
-        // The tool runtime's proposal sink is static (like the
-        // activity-log sink below); it forwards to the one live
-        // engine, which the app shell creates.
-        Self.proposalTarget = self
+        // Review finding 16: nothing static is bound here. Each
+        // window owns its own engine (see LocalLLMApp), and each
+        // engine hands its tool runtimes a sink bound to ITSELF
+        // (`proposalSink()` below) — never a process-global
+        // destination another window's init could overwrite.
     }
 
     // MARK: - Observable state for the UI
@@ -376,16 +377,27 @@ final class ChatEngine {
 
     // MARK: - Action plans (Phase 6)
 
-    /// Where the static proposal sink forwards: the one live engine.
-    private static weak var proposalTarget: ChatEngine?
-
-    /// The runtime's proposal sink — validated file-action proposals
-    /// arrive here and land on the conversation's pending list.
-    /// Returns false for an identical change already on the list.
-    private static let proposalSink: @Sendable (UUID, PlannedAction) async -> Bool = { conversationID, action in
-        await MainActor.run {
-            ChatEngine.proposalTarget?.recordProposedAction(
-                action, conversationID: conversationID) ?? false
+    /// The runtime's proposal sink, bound to THIS engine.
+    /// Validated file-action proposals arrive here and land on the
+    /// conversation's pending list. Returns false for an identical
+    /// change already on the list.
+    ///
+    /// Review finding 16: this used to be a single static sink
+    /// forwarding to a static `proposalTarget` that every engine
+    /// init overwrote — with several windows open, a tool in an
+    /// older window proposed into the NEWEST window's engine,
+    /// leaving its own approval card empty. The sink is now an
+    /// instance closure capturing this engine weakly, built fresh
+    /// for each tool runtime; no process-global mutable destination
+    /// for per-window work remains. (The activity-log sink below
+    /// is still static by design: it carries its container with it
+    /// and writes through that container, not through shared state.)
+    func proposalSink() -> @Sendable (UUID, PlannedAction) async -> Bool {
+        { [weak self] conversationID, action in
+            await MainActor.run {
+                self?.recordProposedAction(
+                    action, conversationID: conversationID) ?? false
+            }
         }
     }
 
@@ -766,6 +778,16 @@ final class ChatEngine {
     /// note on the plan, audit-log the undo, and queue the outcome
     /// note. Items that can't be reversed say so honestly on the
     /// card rather than pretending.
+    ///
+    /// Review finding 18: a plan is stamped fully undone ONLY
+    /// when its reversible work actually succeeded. A failed
+    /// attempt leaves `undoneAt` unset — so the Undo button stays
+    /// (the plan is still retryable once the user fixes the
+    /// condition, e.g. re-shares the folder or clears the
+    /// destination) AND the startup backup sweep keeps the
+    /// still-needed backups (it protects every retained, executed,
+    /// not-yet-undone record). Steps that did succeed are flagged
+    /// on their items, so a retry attempts only outstanding work.
     func undoPlan(record: ActionPlanRecord, context: ModelContext) {
         let conversationID = record.conversationID
         guard record.canUndo, !planBusyIDs.contains(conversationID)
@@ -778,20 +800,24 @@ final class ChatEngine {
             var items = record.items
             let steps = ActionUndo.steps(for: items, home: NSHomeDirectory())
             // Steps are keyed by the action's id, not by position.
-            var results: [(item: ExecutedActionItem, note: String)] = []
+            var results: [(item: ExecutedActionItem, note: String,
+                           outcome: UndoStepOutcome)] = []
             for step in steps {
                 // Stop between steps when cancelled (audit B-52).
                 if Task.isCancelled { break }
                 // Audit E-90: undo's disk work also runs off the
                 // main actor, like approval's (see `approvePlan`).
-                let note = await Task.detached {
-                    FileActionService.executeUndoStep(
+                let result = await Task.detached {
+                    FileActionService.executeUndoStepResult(
                         step, roots: undoRoots)
                 }.value
                 if let index = items.firstIndex(
                     where: { $0.action.id == step.itemID }) {
-                    items[index].undoNote = note
-                    results.append((items[index], note))
+                    items[index].undoNote = result.note
+                    items[index].undoSucceeded =
+                        result.outcome == .succeeded
+                    results.append((items[index], result.note,
+                                    result.outcome))
                 }
             }
             let wasCancelled = Task.isCancelled
@@ -804,7 +830,15 @@ final class ChatEngine {
                 guard !self.forgottenIDs.contains(conversationID),
                       !wasCancelled else { return }
                 record.items = items
-                record.undoneAt = Date()
+                // Review finding 18: stamp ONLY on full success.
+                // Non-reversible steps never block this; any
+                // failed reversible step leaves the plan undoable
+                // and its backups retained.
+                let fullyUndone = UndoCompletion.isFullyUndone(
+                    outcomes: results.map { $0.outcome })
+                if fullyUndone {
+                    record.undoneAt = Date()
+                }
                 try? context.save()
                 for entry in results {
                     Self.recordToolEvent(ToolEvent(
@@ -818,9 +852,18 @@ final class ChatEngine {
                 let lines = results.map {
                     "• \($0.item.action.summary) — \($0.note)"
                 }
-                self.pendingOutcomeNotes[conversationID] =
-                    "The user undid what could be undone from the "
-                    + "approved list. Results:\n" + lines.joined(separator: "\n")
+                if fullyUndone {
+                    self.pendingOutcomeNotes[conversationID] =
+                        "The user undid what could be undone from the "
+                        + "approved list. Results:\n" + lines.joined(separator: "\n")
+                } else {
+                    self.pendingOutcomeNotes[conversationID] =
+                        "The user tried to undo the approved list, "
+                        + "but some items could not be undone — "
+                        + "Undo is still available, so the user can "
+                        + "fix the problem and try again. Results:\n"
+                        + lines.joined(separator: "\n")
+                }
             }
         }
     }
@@ -1279,7 +1322,7 @@ final class ChatEngine {
                         // keeps them raw. Tool-capable + remote is
                         // exactly that one case.
                         redactResults: isRemoteDestination,
-                        proposalSink: Self.proposalSink),
+                        proposalSink: proposalSink()),
                     // Audit B-43: the sink carries THIS send's
                     // container, so its events are written through
                     // this send's context — never a shared static

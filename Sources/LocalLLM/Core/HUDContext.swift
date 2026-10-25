@@ -60,6 +60,13 @@ struct HUDContextSnapshot: Equatable, Sendable {
     /// Finder's selected paths — non-empty ONLY when the Files
     /// source is enabled and Finder had a selection.
     var finderSelectionPaths: [String]
+    /// Review finding 21: true when the Finder probe was DENIED
+    /// Automation permission (as opposed to Finder having nothing
+    /// selected, which leaves this false and the paths empty).
+    /// Renders as its own chip so a denial never looks like an
+    /// empty selection. Not folded into the prompt — it is a
+    /// panel-state fact, not context for the model.
+    var finderAutomationDenied: Bool = false
 
     static let empty = HUDContextSnapshot(frontmostAppName: nil,
                                           clipboardKind: .empty,
@@ -112,6 +119,13 @@ struct HUDContextSnapshot: Equatable, Sendable {
                     ? "1 item selected in Finder"
                     : "\(count) items selected in Finder",
                 helpText: finderSelectionPaths.joined(separator: "\n")))
+        } else if finderAutomationDenied {
+            // Review finding 21: the denial surfaces HERE, as a
+            // chip in its own right — never as a silent absence.
+            result.append(HUDContextChip(
+                symbolName: "exclamationmark.triangle",
+                text: "Finder access denied",
+                helpText: "Blink can't ask Finder what you selected — allow it in System Settings → Privacy & Security → Automation, then summon the panel again."))
         }
         if let chipText = clipboardKind.chipText {
             result.append(HUDContextChip(

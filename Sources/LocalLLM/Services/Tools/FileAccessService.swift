@@ -68,13 +68,84 @@ enum FileAccessService {
         guard let data, !data.isEmpty else {
             return "That file is empty."
         }
-        guard let text = String(data: data, encoding: .utf8) else {
+        // Review finding 22: the read stops mid-file, so the last
+        // bytes may be the head of a multibyte character whose tail
+        // was not read. Requiring the whole 24,000-byte prefix to
+        // decode rejected valid text cut exactly there (23,999
+        // ASCII chars + € + more text read as "not text"). When
+        // more file remains, a trailing INCOMPLETE sequence is
+        // trimmed and the rest decodes; genuinely invalid or binary
+        // content still fails (see `decodeTextPrefix`).
+        guard let text = Self.decodeTextPrefix(
+            data, isTruncated: size > data.count) else {
             return "That file doesn't look like text (it may be a binary file), so it can't be read into a chat."
         }
         if size > data.count {
             return text + "\n… (the file is \(ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)) in total; only the beginning was read)"
         }
         return text
+    }
+
+    // MARK: - Text decoding (review finding 22)
+
+    /// Decodes a read prefix as UTF-8 text, or returns nil for
+    /// genuinely invalid/binary content.
+    ///
+    /// - When the prefix is the whole file (`isTruncated` false),
+    ///   it must decode exactly: a dangling sequence at end of
+    ///   file is invalid content, not a cut.
+    /// - When more file remains, a trailing sequence cut by the
+    ///   read boundary is trimmed: the bytes from the last
+    ///   sequence's lead byte onward form a strict prefix of one
+    ///   valid character (a lead byte expecting more continuations
+    ///   than are present, followed only by continuation bytes).
+    ///   Anything else that fails to decode — a stray continuation
+    ///   byte, an impossible lead byte, a complete-but-invalid
+    ///   sequence — is rejected, not trimmed away.
+    static func decodeTextPrefix(_ data: Data,
+                                 isTruncated: Bool) -> String? {
+        if let text = String(data: data, encoding: .utf8) {
+            return text
+        }
+        guard isTruncated else { return nil }
+        guard let cut = incompleteTrailingSequenceLength(in: data) else {
+            return nil
+        }
+        return String(data: data.dropLast(cut), encoding: .utf8)
+    }
+
+    /// The length of a trailing INCOMPLETE UTF-8 sequence, or nil
+    /// when the tail is not an incomplete sequence (so the decode
+    /// failure lies elsewhere and the content is invalid). Scans
+    /// back over trailing continuation bytes to their lead byte
+    /// and compares the bytes present against the length that
+    /// lead byte promises.
+    private static func incompleteTrailingSequenceLength(
+        in data: Data) -> Int? {
+        guard !data.isEmpty else { return nil }
+        var start = data.count - 1
+        while start > 0 && isContinuationByte(data[data.index(
+            data.startIndex, offsetBy: start)]) {
+            start -= 1
+        }
+        let lead = data[data.index(data.startIndex, offsetBy: start)]
+        let expected: Int
+        switch lead {
+        case 0xC2...0xDF: expected = 2
+        case 0xE0...0xEF: expected = 3
+        case 0xF0...0xF4: expected = 4
+        default: return nil
+        }
+        let present = data.count - start
+        guard present < expected else { return nil }
+        // Every byte after the lead must be a continuation byte;
+        // the scan-back above guarantees this unless the tail is a
+        // lone lead byte (present == 1), which is also incomplete.
+        return present
+    }
+
+    private static func isContinuationByte(_ byte: UInt8) -> Bool {
+        (byte & 0xC0) == 0x80
     }
 
     // MARK: - Scope

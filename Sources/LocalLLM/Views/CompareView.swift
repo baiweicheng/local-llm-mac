@@ -234,10 +234,18 @@ struct CompareView: View {
 
     /// Seeds a normal conversation from the winning column and
     /// hands it to the main window.
+    ///
+    /// Review finding 15: the seed comes from the column's
+    /// SUBMITTED prompt — the question that column actually
+    /// answered — never the text field as it stands now. The field
+    /// stays editable after answers arrive, so seeding from it
+    /// could pair an answer to A with a question edited to B.
     private func continueWith(_ column: CompareColumn) {
-        let seed = CompareSeeding.seed(
-            prompt: prompt, answer: column.text,
-            selection: column.effectiveSelection)
+        guard CompareSeeding.canContinue(answer: column.text) else {
+            return
+        }
+        let seed = column.continuationSeed(
+            currentPrompt: prompt, answer: column.text)
         let conversation = Conversation()
         conversation.title = seed.title
         conversation.modelSelection = seed.selection
@@ -272,6 +280,19 @@ final class CompareColumn {
     /// run (a removed model or a locked cloud falls back to the
     /// built-in model, and the seeded chat must use what answered).
     private(set) var effectiveSelection: ModelSelection
+    /// Review finding 15: the prompt and the model that produced
+    /// the displayed answer, captured when the run STARTED. The
+    /// prompt field stays editable while answers stream and after
+    /// they land, and the picker can move too — neither may
+    /// rewrite what this answer was an answer to. "Continue with
+    /// this one" seeds from these, falling back to the live values
+    /// only when no run has happened (a state the button's
+    /// `canContinue` gate already excludes). Plain internal
+    /// (not private-set) so tests can stage the submitted state
+    /// without a live backend run; production code only writes
+    /// them in `run(prompt:)`.
+    var submittedPrompt: String?
+    var submittedSelection: ModelSelection?
     private(set) var text = ""
     private(set) var errorText: String?
     /// UAT-01: after a run whose pick resolved to a different
@@ -297,6 +318,20 @@ final class CompareColumn {
         task?.cancel()
     }
 
+    /// The seed "Continue with this one" builds for this column's
+    /// displayed answer: the SUBMITTED prompt (not the text field
+    /// as it stands now) and the SUBMITTED model (not the picker's
+    /// current pick). Callers still gate on
+    /// `CompareSeeding.canContinue(answer:)` — this only chooses
+    /// what the seed contains.
+    func continuationSeed(currentPrompt: String,
+                          answer: String) -> CompareSeeding.Seed {
+        CompareSeeding.seed(
+            prompt: submittedPrompt ?? currentPrompt,
+            answer: answer,
+            selection: submittedSelection ?? effectiveSelection)
+    }
+
     func run(prompt: String,
              resolver: (ModelSelection) -> ResolvedBackend,
              endpoints: [EndpointConfig] = [],
@@ -309,8 +344,14 @@ final class CompareColumn {
         privacyNotice = nil
         fallbackNotice = nil
         isRunning = true
+        // Review finding 15: capture the submitted prompt and the
+        // model that will answer it BEFORE streaming starts, so
+        // the displayed result stays associated with both even if
+        // the user edits the field or moves the picker mid-run.
+        submittedPrompt = prompt
         let resolved = resolver(selection)
         effectiveSelection = resolved.effectiveSelection
+        submittedSelection = resolved.effectiveSelection
         let backend = resolved.backend
         // UAT-01: the pick can resolve to a different backend than
         // the header names (Local Only, a missing key, a removed

@@ -376,7 +376,10 @@ when the **Clipboard** source is on (and only the first 1,500
 characters, with a note if it was longer), and the **Finder
 selection** is read only when the **Shared folders** switch is on —
 macOS will ask once for permission to let Blink talk to Finder, and
-declining simply means no chip, never an error. That context is
+declining shows a "Finder access denied" chip (allow it in System
+Settings → Privacy & Security → Automation and summon again)
+instead of silently looking like nothing was selected — never an
+error dialog. That context is
 written into the first message of a panel chat (only the copy sent
 to the model — your typed message is stored exactly as typed, and
 the context passes the privacy check like everything else), so

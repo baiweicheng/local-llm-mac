@@ -158,7 +158,17 @@ struct PlannedAction: Codable, Sendable, Equatable, Identifiable {
     /// destination) and for library-photo resizes.
     var sourcePath: String?
     /// Library-photo resize only: which recent photo (0 = most recent).
+    /// Kept ONLY as the fallback for plans proposed before stable
+    /// identifiers existed; new proposals carry
+    /// `sourcePhotoIdentifier` instead (review finding 14).
     var sourcePhotoIndex: Int?
+    /// Library-photo resize only: the photo's stable
+    /// `PHAsset.localIdentifier`, captured at proposal time. An
+    /// index is a position in a list that shifts when photos are
+    /// added, removed, or imported while a proposal awaits
+    /// approval — the identifier names the exact asset the user
+    /// approved, and execution verifies it still exists.
+    var sourcePhotoIdentifier: String?
     /// Where the action's result lands: rename/move/copy target,
     /// the folder to create, the file to write, the resized output.
     var destinationPath: String?
@@ -195,6 +205,7 @@ struct PlannedAction: Codable, Sendable, Equatable, Identifiable {
          kind: PlannedActionKind,
          sourcePath: String? = nil,
          sourcePhotoIndex: Int? = nil,
+         sourcePhotoIdentifier: String? = nil,
          destinationPath: String? = nil,
          editText: String? = nil,
          appendEdit: Bool = false,
@@ -213,6 +224,7 @@ struct PlannedAction: Codable, Sendable, Equatable, Identifiable {
         self.kind = kind
         self.sourcePath = sourcePath
         self.sourcePhotoIndex = sourcePhotoIndex
+        self.sourcePhotoIdentifier = sourcePhotoIdentifier
         self.destinationPath = destinationPath
         self.editText = editText
         self.appendEdit = appendEdit
@@ -248,6 +260,12 @@ struct ActionInputs: Sendable, Equatable {
     /// index, used to derive the output name. Nil when the index ran
     /// past the end of the library's recent photos.
     var libraryPhotoName: String?
+    /// For a library-photo resize: the asset's stable
+    /// `PHAsset.localIdentifier` at proposal time (review finding
+    /// 14). When present, the proposal carries this — not the
+    /// index — so a library shift between proposal and approval
+    /// cannot retarget the resize.
+    var sourcePhotoIdentifier: String? = nil
     var maxWidthPx: Int = 1200
     var byteCeiling: Int = 512_000
     // Phase 9: shell + MCP raw material.
@@ -520,6 +538,7 @@ enum ActionProposal {
         let sourceName: String
         var sourcePath: String? = nil
         var photoIndex: Int? = nil
+        var photoIdentifier: String? = nil
         if let path = inputs.sourcePath, !path.isEmpty {
             guard inScope(path, roots: roots) else {
                 return .refused(outsideScopeMessage(roots: roots))
@@ -536,7 +555,19 @@ enum ActionProposal {
             guard let name = inputs.libraryPhotoName else {
                 return .refused("There aren't that many recent photos in the library.")
             }
-            photoIndex = index
+            // Review finding 14: when the runtime resolved a
+            // stable identifier at proposal time, the proposal
+            // carries ONLY it — the index is dropped, so a photo
+            // added/removed/imported while approval is pending
+            // cannot shift what the index means. The index survives
+            // solely for inputs that arrived without an identifier
+            // (and for old persisted plans, which the executor
+            // still honors by index).
+            if let identifier = inputs.sourcePhotoIdentifier {
+                photoIdentifier = identifier
+            } else {
+                photoIndex = index
+            }
             sourceName = name
         } else {
             return .refused("Resizing a photo needs either a recent photo (index) or an image file's path (path).")
@@ -561,7 +592,9 @@ enum ActionProposal {
         let summary = "Resize “\(sourceName)” → “\(PathDisplay.fileName(destination))” in \(PathDisplay.shortened(PathDisplay.parentPath(destination), home: home)) (at most \(inputs.maxWidthPx) px wide, under \(sizeText))"
         return .proposed(PlannedAction(
             kind: .resizePhoto, sourcePath: sourcePath,
-            sourcePhotoIndex: photoIndex, destinationPath: destination,
+            sourcePhotoIndex: photoIndex,
+            sourcePhotoIdentifier: photoIdentifier,
+            destinationPath: destination,
             maxWidthPx: inputs.maxWidthPx, byteCeiling: inputs.byteCeiling,
             summary: summary))
     }
@@ -934,6 +967,14 @@ struct ExecutedActionItem: Codable, Sendable, Equatable {
     var trashResultPath: String?
     /// What undo did with this item, once undo has run.
     var undoNote: String?
+    /// Whether undo already reversed this item (review finding
+    /// 18). A partially failed undo leaves the plan retryable, and
+    /// a retry must NOT re-run steps that already succeeded — a
+    /// move-back already done would fail on retry ("isn't where
+    /// the change left it") and could mask the step that actually
+    /// still needs undoing. `ActionUndo.steps` skips items flagged
+    /// here, so a retry attempts only what is still outstanding.
+    var undoSucceeded: Bool = false
     /// Phase 9: the substance of what happened, beyond the one-line
     /// note — a command's output (tail-capped for the model) or an
     /// MCP call's result text. Shown on the decided card and quoted
@@ -944,7 +985,8 @@ struct ExecutedActionItem: Codable, Sendable, Equatable {
     init(action: PlannedAction, outcome: Outcome, resultNote: String,
          artifactPath: String? = nil, artifactBytes: Int? = nil,
          backupPath: String? = nil, trashResultPath: String? = nil,
-         undoNote: String? = nil, modelDetail: String? = nil) {
+         undoNote: String? = nil, undoSucceeded: Bool = false,
+         modelDetail: String? = nil) {
         self.action = action
         self.outcome = outcome
         self.resultNote = resultNote
@@ -953,6 +995,7 @@ struct ExecutedActionItem: Codable, Sendable, Equatable {
         self.backupPath = backupPath
         self.trashResultPath = trashResultPath
         self.undoNote = undoNote
+        self.undoSucceeded = undoSucceeded
         self.modelDetail = modelDetail
     }
 
@@ -988,6 +1031,7 @@ enum ActionPlanRules {
             existing.kind == candidate.kind
                 && existing.sourcePath == candidate.sourcePath
                 && existing.sourcePhotoIndex == candidate.sourcePhotoIndex
+                && existing.sourcePhotoIdentifier == candidate.sourcePhotoIdentifier
                 && existing.destinationPath == candidate.destinationPath
                 && existing.editText == candidate.editText
                 && existing.appendEdit == candidate.appendEdit
@@ -1028,6 +1072,48 @@ struct UndoStep: Equatable, Sendable {
     let description: String
 }
 
+/// Review finding 18: one undo step's structured outcome —
+///
+/// - `.succeeded`: the reversal happened (or was already done,
+///   e.g. the folder was already gone — the goal state holds).
+/// - `.notReversible`: the step can never be reversed (a command
+///   that ran, a Trash landing that wasn't recorded). This does
+///   NOT block a plan counting as undone — there was never
+///   reversible work here to protect.
+/// - `.failed`: reversible work that did NOT happen (scope
+///   revoked, destination occupied, I/O error, backup gone).
+///   This DOES block `undoneAt`: the plan stays undoable, its
+///   backups stay retained, and the user can fix the condition
+///   and retry.
+enum UndoStepOutcome: Equatable, Sendable {
+    case succeeded
+    case notReversible
+    case failed
+}
+
+/// One undo step's result: the note the card shows, plus the
+/// structured outcome above. Undo steps used to return only text,
+/// so the engine could not tell success from failure — it stamped
+/// `undoneAt` even when every step failed, permanently consuming
+/// undo eligibility and letting the next startup's retention sweep
+/// delete still-needed backups.
+struct UndoStepResult: Equatable, Sendable {
+    let note: String
+    let outcome: UndoStepOutcome
+}
+
+/// Whether a plan counts as fully undone from its steps'
+/// outcomes: yes unless any REVERSIBLE step failed.
+/// Non-reversible steps never block it; cancelled runs are the
+/// engine's separate case (nothing is stamped at all).
+enum UndoCompletion {
+
+    static func isFullyUndone(
+        outcomes: [UndoStepOutcome]) -> Bool {
+        !outcomes.contains(.failed)
+    }
+}
+
 /// Builds the undo plan for an executed plan record: one step per
 /// successful item, in REVERSE order (the last thing done is the
 /// first thing undone — a rename-then-move chain only unwinds that
@@ -1037,6 +1123,10 @@ enum ActionUndo {
     static func steps(for items: [ExecutedActionItem], home: String) -> [UndoStep] {
         items.reversed().compactMap { item in
             guard item.outcome == .done else { return nil }
+            // Review finding 18: already-reversed items are not
+            // stepped again — a retry attempts only outstanding
+            // work (see `undoSucceeded` on the item).
+            guard !item.undoSucceeded else { return nil }
             let action = item.action
             func name(_ path: String?) -> String {
                 path.map { "“\(PathDisplay.fileName($0))”" } ?? "the item"

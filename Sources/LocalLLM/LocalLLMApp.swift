@@ -58,6 +58,14 @@ struct LocalLLMApp: App {
         // The id lets the quick panel front (or recreate) this
         // window with `openWindow` when the user picks "Open in
         // main window".
+        //
+        // Review finding 16: every window gets its OWN ContentView
+        // and therefore its own ChatEngine and settings/server
+        // stores — that per-window ownership is deliberate, and it
+        // is safe only because no proposal routing is shared:
+        // each engine hands its tool runtimes a sink bound to
+        // itself (`ChatEngine.proposalSink()`), so a proposal from
+        // one window can never land in another window's engine.
         WindowGroup(id: "main") {
             ContentView(hudCoordinator: hudCoordinator,
                         persistentStoreFailed: persistentStoreFailed)

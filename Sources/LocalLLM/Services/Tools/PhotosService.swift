@@ -59,6 +59,52 @@ enum PhotosService {
 
     // MARK: - Phase 6: shared fetch points for the resize tool
 
+    /// The asset with a stable `PHAsset.localIdentifier`, or nil
+    /// when no such asset exists anymore (deleted since the
+    /// proposal, or an identifier that never existed).
+    ///
+    /// Review finding 14: this is the execution-time existence
+    /// check for approved library resizes — the identifier the
+    /// proposal captured is looked up again, never reinterpreted
+    /// through a possibly-shifted recent-photos index.
+    static func asset(withLocalIdentifier identifier: String) -> PHAsset? {
+        PHAsset.fetchAssets(withLocalIdentifiers: [identifier],
+                            options: nil).firstObject
+    }
+
+    /// Whether an asset with this identifier still exists.
+    static func assetExists(localIdentifier identifier: String) -> Bool {
+        asset(withLocalIdentifier: identifier) != nil
+    }
+
+    /// A recent photo's stable identifier AND its original file
+    /// name, resolved in ONE fetch — so the proposal's name and
+    /// identifier can never describe two different photos (two
+    /// separate fetches could straddle an import). Nil when the
+    /// library has fewer photos than the index.
+    ///
+    /// Review finding 14: the resize proposal resolves the model's
+    /// recent-photo index to this identifier immediately, at
+    /// proposal time; from then on the identifier — not the
+    /// index — is what approval and execution carry.
+    static func recentPhotoIdentity(index: Int)
+        -> (identifier: String, filename: String?)? {
+        guard let asset = asset(atRecentIndex: index) else { return nil }
+        let filename = PHAssetResource.assetResources(for: asset)
+            .first?.originalFilename
+        return (identifier: asset.localIdentifier, filename: filename)
+    }
+
+    /// A recent photo's image data by stable identifier — nil when
+    /// the asset is gone or is iCloud-only (local copies only, as
+    /// with every other reader here).
+    static func imageData(forLocalIdentifier identifier: String) async -> Data? {
+        guard let asset = asset(withLocalIdentifier: identifier) else {
+            return nil
+        }
+        return await imageData(for: asset)
+    }
+
     /// The asset at a "recent" index (0 = most recent), or nil when
     /// the library has fewer photos than that.
     static func asset(atRecentIndex index: Int) -> PHAsset? {

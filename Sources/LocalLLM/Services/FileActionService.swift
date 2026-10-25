@@ -280,7 +280,8 @@ enum FileActionService {
     // MARK: - Photo resize (the brief's reference pipeline)
 
     /// Loads the source photo (a scoped file, or a library photo by
-    /// recent index), walks the pure attempt ladder until a JPEG
+    /// stable identifier — by recent index only for pre-identifier
+    /// plans), walks the pure attempt ladder until a JPEG
     /// fits the byte ceiling, writes the winner as a NEW file (never
     /// overwriting), and puts it on the clipboard — file URL and
     /// image data both, so it pastes into uploaders and editors
@@ -292,7 +293,22 @@ enum FileActionService {
         let sourceData: Data?
         if let sourcePath = action.sourcePath {
             sourceData = try? Data(contentsOf: URL(fileURLWithPath: sourcePath))
+        } else if let identifier = action.sourcePhotoIdentifier {
+            // Review finding 14: the identifier wins over any
+            // index — it names the exact asset approved, and its
+            // existence is verified HERE, at execution time, so a
+            // photo deleted while approval was pending fails
+            // plainly instead of silently resizing whatever the
+            // old index now points at.
+            guard PhotosService.assetExists(localIdentifier: identifier) else {
+                return failed(action, "That photo isn't in the library anymore — it may have been deleted since you approved the resize, so nothing was resized.")
+            }
+            sourceData = await PhotosService.imageData(
+                forLocalIdentifier: identifier)
         } else if let index = action.sourcePhotoIndex {
+            // Legacy fallback only: plans proposed before stable
+            // identifiers existed. New proposals never reach this
+            // branch with an identifier present.
             sourceData = await PhotosService.imageData(atRecentIndex: index)
         } else {
             sourceData = nil
@@ -352,57 +368,81 @@ enum FileActionService {
     /// symlink after execution would have been followed blindly.
     static func executeUndoStep(_ step: UndoStep,
                                 roots: [String]) -> String {
+        executeUndoStepResult(step, roots: roots).note
+    }
+
+    /// Review finding 18: the structured form of the step above.
+    /// The note alone could not tell the engine success from
+    /// failure, so every attempt — even an all-failed one —
+    /// consumed undo eligibility. The outcome here is what the
+    /// engine stamps (or refuses to stamp) `undoneAt` from, and
+    /// what keeps failed steps' backups retained.
+    static func executeUndoStepResult(_ step: UndoStep,
+                                      roots: [String]) -> UndoStepResult {
+        func failed(_ note: String) -> UndoStepResult {
+            UndoStepResult(note: note, outcome: .failed)
+        }
+        func done(_ note: String) -> UndoStepResult {
+            UndoStepResult(note: note, outcome: .succeeded)
+        }
         guard UndoStepScope.isAllowed(
             step, roots: roots, home: NSHomeDirectory(),
             resolve: { FileAccessService.resolvedPath($0) ?? $0 })
         else {
-            return "Couldn't undo — that path is no longer inside a shared folder."
+            return failed("Couldn't undo — that path is no longer inside a shared folder.")
         }
         let fileManager = FileManager.default
         switch step.kind {
         case .notUndoable(let reason):
-            return "Couldn't undo: \(reason)."
+            return UndoStepResult(note: "Couldn't undo: \(reason).",
+                                  outcome: .notReversible)
         case .moveBack(let from, let to):
             guard fileManager.fileExists(atPath: from) else {
-                return "Couldn't undo — the item isn't where the change left it."
+                return failed("Couldn't undo — the item isn't where the change left it.")
             }
             guard !fileManager.fileExists(atPath: to) else {
-                return "Couldn't undo — something is at the original place now, and undo never overwrites it."
+                return failed("Couldn't undo — something is at the original place now, and undo never overwrites it.")
             }
             do {
                 try fileManager.moveItem(atPath: from, toPath: to)
-                return "Undone — it's back where it was."
+                return done("Undone — it's back where it was.")
             } catch {
-                return "Couldn't undo — \(error.localizedDescription)"
+                return failed("Couldn't undo — \(error.localizedDescription)")
             }
         case .trashFile(let path):
             guard fileManager.fileExists(atPath: path) else {
-                return "Couldn't undo — the file isn't there anymore."
+                return failed("Couldn't undo — the file isn't there anymore.")
             }
             do {
                 try fileManager.trashItem(at: URL(fileURLWithPath: path),
                                           resultingItemURL: nil)
-                return "Undone — moved to the Trash."
+                return done("Undone — moved to the Trash.")
             } catch {
-                return "Couldn't undo — \(error.localizedDescription)"
+                return failed("Couldn't undo — \(error.localizedDescription)")
             }
         case .removeFolderIfEmpty(let path):
             guard fileManager.fileExists(atPath: path) else {
-                return "Undone already — the folder is gone."
+                // Already in the goal state — counts as done, so a
+                // re-run (or a plan whose only step this is) is not
+                // blocked by work that no longer exists.
+                return done("Undone already — the folder is gone.")
             }
             let contents = (try? fileManager.contentsOfDirectory(atPath: path)) ?? []
             guard contents.isEmpty else {
-                return "Left in place — the folder isn't empty anymore."
+                // Reversible work that did NOT happen: the folder
+                // gained contents since creation. Failed, not
+                // "done" — the user can empty it and retry.
+                return failed("Left in place — the folder isn't empty anymore.")
             }
             do {
                 try fileManager.removeItem(atPath: path)
-                return "Undone — the empty folder was removed."
+                return done("Undone — the empty folder was removed.")
             } catch {
-                return "Couldn't undo — \(error.localizedDescription)"
+                return failed("Couldn't undo — \(error.localizedDescription)")
             }
         case .restoreBackup(let backupPath, let targetPath):
             guard fileManager.fileExists(atPath: backupPath) else {
-                return "Couldn't undo — the backup of the old contents is gone."
+                return failed("Couldn't undo — the backup of the old contents is gone.")
             }
             do {
                 // The edited version goes to the Trash first, so undo
@@ -414,9 +454,9 @@ enum FileActionService {
                 }
                 try fileManager.copyItem(atPath: backupPath, toPath: targetPath)
                 try? fileManager.removeItem(atPath: backupPath)
-                return "Undone — the earlier contents are back (the edited version went to the Trash)."
+                return done("Undone — the earlier contents are back (the edited version went to the Trash).")
             } catch {
-                return "Couldn't undo — \(error.localizedDescription)"
+                return failed("Couldn't undo — \(error.localizedDescription)")
             }
         }
     }

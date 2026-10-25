@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
+<!--
+  Blink.entitlements — entitlements for the packaged app, applied
+  by Scripts/make-app.sh at signing time (main app only, never the
+  nested dependency bundles).
+
+  Review finding 21: the script enabled hardened runtime but
+  supplied no entitlements file, so the quick panel's Apple events
+  to Finder — a different signing identity — had no
+  com.apple.security.automation.apple-events entitlement and were
+  denied, which the capture code then swallowed as an empty
+  selection. NSAppleEventsUsageDescription in Info.plist only
+  supplies the prompt wording; it does not grant anything under
+  hardened runtime. This file grants the entitlement, so macOS
+  prompts once for Automation permission and honors an Allow;
+  a denial is now surfaced distinctly (see HUDContextCapture)
+  instead of looking like "Finder has nothing selected".
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.automation.apple-events</key>
+	<true/>
+</dict>
+</plist>

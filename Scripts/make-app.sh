@@ -149,7 +149,17 @@ find "$APP_DIR" -depth \( -name "*.bundle" -o -name "*.framework" \) -print0 \
         echo "    Signing nested: $nested"
         codesign --force --options runtime --sign "$SIGN_WITH" "$nested"
     done
-codesign --force --options runtime --sign "$SIGN_WITH" "$APP_DIR"
+# Review finding 21: the MAIN app signs with Blink.entitlements,
+# which carries com.apple.security.automation.apple-events — the
+# entitlement the quick panel's Apple events to Finder need under
+# hardened runtime. (NSAppleEventsUsageDescription in Info.plist
+# only words the prompt; it grants nothing.) Nested bundles sign
+# without it: the entitlement belongs to the app, not its
+# dependencies. Ad-hoc signing accepts --entitlements the same way;
+# the first Finder probe still prompts, as it should.
+codesign --force --options runtime \
+    --entitlements "$SCRIPT_DIR/Blink.entitlements" \
+    --sign "$SIGN_WITH" "$APP_DIR"
 codesign --verify --verbose=2 "$APP_DIR" || \
     echo "!! codesign verify reported problems (see above); the app may still run."
 

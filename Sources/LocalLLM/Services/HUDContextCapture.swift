@@ -15,9 +15,12 @@ import Foundation
 ///   another app and is only reachable through Apple Events. It runs
 ///   on a dedicated background queue because an AppleScript round
 ///   trip can block (and the first call can sit behind macOS's
-///   Automation permission prompt). Any failure — permission denied,
-///   Finder not running, nothing selected — delivers an empty list:
-///   the chip is simply absent. It is NEVER an error dialog.
+///   Automation permission prompt). Finder not running or nothing
+///   selected delivers an empty list: the chip is simply absent.
+///   A DENIED Automation permission is different (review finding
+///   21) — it delivers `.denied` through the detailed probe, so the
+///   panel shows a "Finder access denied" chip instead of silently
+///   looking like nothing was selected. It is NEVER an error dialog.
 ///
 /// The Finder probe only runs when the Files source toggle is on:
 /// with it off, no Apple event is sent at all, so the app doesn't
@@ -69,22 +72,67 @@ enum HUDContextCapture {
     private static let scriptQueue = DispatchQueue(
         label: "LocalLLM.FinderProbe", qos: .userInitiated)
 
+    /// One Finder probe's outcome, kept distinct on purpose.
+    ///
+    /// Review finding 21: a denied Automation permission used to
+    /// collapse into the same empty list as "Finder has nothing
+    /// selected" (and as Finder not running), so a user who
+    /// declined the prompt — or whose packaged app lacked the
+    /// entitlement entirely — saw no chip and no reason. Now:
+    /// `.denied` is surfaced as its own chip in the panel (see
+    /// `HUDContextSnapshot.finderAutomationDenied`), while
+    /// `.unavailable` (Finder not running, script failure) still
+    /// means simply no chip.
+    enum FinderProbeOutcome: Equatable, Sendable {
+        case selection([String])
+        case denied
+        case unavailable
+    }
+
+    /// The AppleScript error number macOS reports when Automation
+    /// permission for Finder is denied (errAEEventNotPermitted):
+    /// the user declined the prompt, or the app was never granted
+    /// it. This is the one failure mode that gets its own surface.
+    static let automationDeniedErrorNumber = -1743
+
+    /// Maps a probe's AppleScript error number to its outcome
+    /// class — the testable seam (the live probe below feeds it
+    /// the number from the script's error dictionary).
+    static func outcomeForErrorNumber(
+        _ number: Int?) -> FinderProbeOutcome {
+        number == automationDeniedErrorNumber ? .denied : .unavailable
+    }
+
     /// Asks Finder for its selected items' POSIX paths and delivers
     /// them via `completion` (called on the probe queue — hop to the
-    /// main actor before touching UI state). Empty on ANY failure,
-    /// by design.
+    /// main actor before touching UI state). Empty on failure, as
+    /// before — callers that need to tell denial apart from
+    /// "nothing selected" use `probeFinderSelectionDetailed`.
     static func probeFinderSelection(
         completion: @escaping @Sendable ([String]) -> Void
     ) {
+        probeFinderSelectionDetailed { outcome in
+            if case .selection(let paths) = outcome {
+                completion(paths)
+            } else {
+                completion([])
+            }
+        }
+    }
+
+    /// The distinguishing probe: delivers `.selection`, `.denied`,
+    /// or `.unavailable` (called on the probe queue).
+    static func probeFinderSelectionDetailed(
+        completion: @escaping @Sendable (FinderProbeOutcome) -> Void
+    ) {
         scriptQueue.async {
-            completion(finderSelectionPaths())
+            completion(finderSelectionOutcome())
         }
     }
 
     /// The blocking probe itself. Kept separate so its failure modes
-    /// are all in one place: every path out of here that isn't a
-    /// clean answer is an empty list.
-    private static func finderSelectionPaths() -> [String] {
+    /// are all in one place.
+    private static func finderSelectionOutcome() -> FinderProbeOutcome {
         let source = """
             tell application "Finder"
                 set thePaths to {}
@@ -96,12 +144,16 @@ enum HUDContextCapture {
                 return thePaths
             end tell
             """
-        guard let script = NSAppleScript(source: source) else { return [] }
+        guard let script = NSAppleScript(source: source) else {
+            return .unavailable
+        }
         var errorInfo: NSDictionary?
         let result = script.executeAndReturnError(&errorInfo)
-        // A denied Automation permission, a missing Finder, anything
-        // at all — the answer is the same: no chip.
-        guard errorInfo == nil else { return [] }
+        if let errorInfo {
+            let number = (errorInfo["NSAppleScriptErrorNumber"]
+                          as? NSNumber)?.intValue
+            return outcomeForErrorNumber(number)
+        }
         var paths: [String] = []
         if result.numberOfItems > 0 {
             for index in 1...result.numberOfItems {
@@ -113,6 +165,6 @@ enum HUDContextCapture {
         } else if let single = result.stringValue, !single.isEmpty {
             paths.append(single)
         }
-        return paths
+        return .selection(paths)
     }
 }
